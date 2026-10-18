@@ -184,6 +184,9 @@ function M.filter_paths(paths)
   end, paths)
 end
 
+--- Rows before a queried range scanned by is_cloaked() for multi-line rules (a 4096-bit PEM key is ~50 lines).
+M.LOOKBACK = 200
+
 local PEM_BEGIN = "^%s*%-%-%-%-%-BEGIN [%u%d ]*PRIVATE KEY%-%-%-%-%-"
 local PEM_END = "^%s*%-%-%-%-%-END [%u%d ]*PRIVATE KEY%-%-%-%-%-"
 
@@ -320,16 +323,65 @@ function M.redact_text(text, path)
 end
 
 --- Redact a unified git diff: sections of blocked files are omitted entirely, other content lines are
---- redacted with that file's providers.
+--- redacted with that file's providers. Each hunk is redacted as a whole (old side = context + "-" lines,
+--- new side = context + "+" lines), so multi-line rules such as PEM key bodies apply inside diffs.
 ---@param diff string
 ---@return string diff, integer n
 function M.redact_diff(diff)
   ensure()
   local out, n = {}, 0
   local path, skipping, in_hunk = nil, false, false
+  local hunk = {} ---@type {sign: string, body: string}[]
+  local ph = M.placeholder()
+  local function count(str, needle)
+    local c, init = 0, 1
+    while true do
+      local a, b = str:find(needle, init, true)
+      if not a then
+        return c
+      end
+      c, init = c + 1, b + 1
+    end
+  end
+
+  local function side(keep)
+    local idx, bodies = {}, {}
+    for i, e in ipairs(hunk) do
+      if e.sign == " " or e.sign == keep then
+        idx[#idx + 1], bodies[#bodies + 1] = i, e.body
+      end
+    end
+    local red = M.redact_lines(path, bodies, 0)
+    local res = {}
+    for j, i in ipairs(idx) do
+      res[i] = red[j]
+    end
+    return res
+  end
+
+  local function flush()
+    if #hunk == 0 then
+      return
+    end
+    local old, new = side("-"), side("+")
+    for i, e in ipairs(hunk) do
+      if e.sign then
+        local red = (e.sign == "-" and old[i]) or new[i]
+        if red ~= e.body then
+          n = n + math.max(count(red, ph) - count(e.body, ph), 1)
+        end
+        out[#out + 1] = e.sign .. red
+      else
+        out[#out + 1] = e.body
+      end
+    end
+    hunk = {}
+  end
+
   for _, l in ipairs(vim.split(diff, "\n", { plain = true })) do
     local b = l:match("^diff %-%-git a/.- b/(.+)$")
     if b then
+      flush()
       path, in_hunk = b, false
       skipping = M.is_blocked(b)
       out[#out + 1] = l
@@ -339,6 +391,7 @@ function M.redact_diff(diff)
       end
     elseif not skipping then
       if l:match("^@@") then
+        flush()
         in_hunk = true
         out[#out + 1] = l
       elseif not in_hunk then
@@ -357,15 +410,14 @@ function M.redact_diff(diff)
       else
         local sign, body = l:match("^([+%- ])(.*)$")
         if sign then
-          local red, k = M.redact_lines(path, { body }, 0)
-          out[#out + 1] = sign .. red[1]
-          n = n + k
+          hunk[#hunk + 1] = { sign = sign, body = body }
         else
-          out[#out + 1] = l
+          hunk[#hunk + 1] = { body = l } -- "\\ No newline at end of file" etc.
         end
       end
     end
   end
+  flush()
   return table.concat(out, "\n"), n
 end
 
@@ -385,14 +437,16 @@ function M.is_cloaked(buf, range)
   if range then
     srow, scol, erow, ecol = range[1], range[2], range[3], range[4]
   end
-  local lines = vim.api.nvim_buf_get_lines(buf, srow, erow + 1, false)
-  local by_row = collect(path, lines, srow)
+  -- Look back a little so multi-line rules (PEM bodies) whose start lies before the range still apply.
+  local from = math.max(0, srow - M.LOOKBACK)
+  local lines = vim.api.nvim_buf_get_lines(buf, from, erow + 1, false)
+  local by_row = collect(path, lines, from)
   for i, spans in pairs(by_row) do
-    local row = srow + i - 1
+    local row = from + i - 1
     for _, s in ipairs(spans) do
       local lo = row == srow and scol or 0
       local hi = row == erow and ecol or math.huge
-      if s[2] > lo and s[1] < hi then
+      if row >= srow and s[2] > lo and s[1] < hi then
         return true
       end
     end

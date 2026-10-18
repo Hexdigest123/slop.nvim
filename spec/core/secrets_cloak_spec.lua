@@ -86,6 +86,45 @@ describe("secrets v2", function()
     assert.equal(2, calls)
   end)
 
+  it("redact_diff applies multi-line rules per hunk (PEM body in a non-blocked file)", function()
+    local diff = table.concat({
+      "diff --git a/deploy/key.txt b/deploy/key.txt",
+      "--- a/deploy/key.txt",
+      "+++ b/deploy/key.txt",
+      "@@ -1,2 +1,6 @@",
+      " note",
+      "-old",
+      "+-----BEGIN OPENSSH PRIVATE KEY-----",
+      "+MIIEsecretbody1",
+      "+MIIEsecretbody2",
+      "+-----END OPENSSH PRIVATE KEY-----",
+      "\\ No newline at end of file",
+    }, "\n")
+    local out, n = secrets.redact_diff(diff)
+    assert.falsy(out:find("MIIE", 1, true))
+    assert.truthy(out:find("+-----BEGIN OPENSSH PRIVATE KEY-----\n+<redacted>\n+<redacted>\n", 1, true))
+    assert.truthy(out:find(" note\n-old\n", 1, true))
+    assert.truthy(out:find("\\ No newline at end of file", 1, true))
+    assert.equal(2, n)
+  end)
+
+  it("is_cloaked catches a range inside a PEM body whose BEGIN/END lie outside it", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buf, "/p/notes.md")
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "intro",
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "MIIEaaaa",
+      "MIIEbbbb",
+      "-----END RSA PRIVATE KEY-----",
+      "outro",
+    })
+    assert.is_true(secrets.is_cloaked(buf, { 3, 0, 3, 4 }))
+    assert.is_true(secrets.is_cloaked(buf, { 2, 2, 3, 1 }))
+    assert.is_false(secrets.is_cloaked(buf, { 0, 0, 0, 5 }))
+    assert.is_false(secrets.is_cloaked(buf, { 5, 0, 5, 5 }))
+  end)
+
   describe("with the cloak provider", function()
     it("a query before cloak is loaded still applies cloak rules (capability lazy-load)", function()
       local registry = require("slop.core.registry")
