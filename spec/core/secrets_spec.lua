@@ -9,6 +9,8 @@ describe("secrets", function()
   end)
 
   it("blocks the built-in default globs with no provider registered", function()
+    -- cloak is a lazily-loaded secrets provider; disable it to test the bare default path.
+    require("slop.config").setup({ cloak = false })
     for _, p in ipairs({
       "/p/.env",
       "/p/.env.local",
