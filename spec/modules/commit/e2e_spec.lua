@@ -30,7 +30,7 @@ ai.chat = function(req)
   end, 20)
   return { cancel = function() end, is_active = function() return false end }
 end
-require("slop").setup({ commit = { style = "conventional" } })
+require("slop").setup({ commit = { style = "conventional", unstaged_fallback = false } })
 vim.api.nvim_create_autocmd("User", {
   pattern = "SlopCommitGenerated",
   callback = function()
