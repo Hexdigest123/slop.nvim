@@ -42,8 +42,9 @@ below the scissors line, so slop sees exactly that diff, whatever you ran
 1. On |FileType| `gitcommit` the buffer is attached. The message area
    counts as empty when it holds only comment lines and blank lines. The
    scissors section is ignored. If `auto` is set and the message is empty, a
-   message is generated. Buffers that already have a message are left alone; use
-   `<leader>ac` there. Examples are `--amend`, merge, reword and squash.
+   message is generated. Buffers that already have a message are left
+   alone; use `<leader>ac` there. Examples are `--amend`, merge, reword and
+   squash.
 2. The context is gathered in parallel, without blocking:
    - the diff:
      - the verbose section below the scissors line, if there is one;

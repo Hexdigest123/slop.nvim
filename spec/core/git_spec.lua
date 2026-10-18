@@ -1,5 +1,8 @@
 local h = require("helpers")
 
+vim.env.GIT_CONFIG_GLOBAL = "/dev/null" -- isolate from the user's git config (hooks, templates, verbose)
+vim.env.GIT_CONFIG_NOSYSTEM = "1"
+
 --- Run git synchronously (tests only).
 local function sh(dir, args, env)
   local cmd = { "git", "-c", "core.quotepath=off" }
