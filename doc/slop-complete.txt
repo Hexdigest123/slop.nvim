@@ -1,0 +1,355 @@
+*slop-complete.txt*  AI fill-in-the-middle completion as ghost text
+
+==============================================================================
+CONTENTS                                              *slop-complete-contents*
+
+  1. Overview ............................ |slop-complete-overview|
+  2. Keys ................................ |slop-complete-keys|
+  3. Configuration ....................... |slop-complete-config|
+  4. Providers (ai service) .............. |slop-complete-providers|
+  5. Context ............................. |slop-complete-context|
+  6. Commands ............................ |slop-complete-commands|
+  7. Lua API ............................. |slop-complete-api|
+  8. nvim-cmp ............................ |slop-complete-cmp|
+  9. Events and highlights ............... |slop-complete-events|
+ 10. Core building blocks ................ |slop-complete-core|
+ 11. Credits ............................. |slop-complete-credits|
+
+==============================================================================
+1. OVERVIEW                                           *slop-complete-overview*
+
+While you type in Insert mode, complete asks a fill-in-the-middle (FIM) model
+for the text at the cursor and shows it as ghost text. The first line is drawn
+inline, further lines below it. It replaces minuet-ai.nvim.
+
+- The module loads on the first |InsertEnter|. Buffers that were open before
+  that work too, because the checks run again on every request.
+- Requests are debounced (250 ms, trailing: the last keystroke always counts).
+  Each buffer has its own request, and a new keystroke cancels the old one.
+  Leaving Insert mode or the buffer cancels it too.
+- Responses are streamed: the ghost text grows as tokens arrive, and
+  generation stops early at the end of the block or after `max_lines`.
+- Typing what the suggestion shows keeps it (no new request), and so does a
+  partial accept. A prefix cache serves positions you return to, even after
+  backspacing.
+- One candidate is fetched by default. <C-n>/<C-p> fetch alternatives lazily
+  and show a counter "(i/n)".
+- Never active in buffers blocked by |slop-secrets| (".env*", "*.pem", ...),
+  in cloaked lines, in buffers with `vim.b.completion = false` (set by cloak),
+  in special buffer types, or in files that are too large. All context passes
+  through core.secrets before it is sent.
+- <Tab> is never mapped.
+
+Quick start (Codestral, key in $MISTRAL_API_KEY by default): >lua
+  require("slop").setup({
+    ai = { providers = { codestral = { api_key = "MISTRAL_API_KEY_NVIM" } } },
+  })
+<
+==============================================================================
+2. KEYS                                                   *slop-complete-keys*
+
+Insert-mode keys. When no suggestion is visible, each key falls through to
+the mapping it replaced (for example nvim-cmp's) or to the native key.
+
+  key       action                                   config name ~
+  <C-y>     accept the whole suggestion              keymaps.accept
+  <M-l>     accept one line (repeat to walk lines)   keymaps.accept_line
+  <M-n>     accept N lines (type a digit after it,   keymaps.accept_n_lines
+            e.g. <M-n>3; any other key = 1 line)
+  <M-w>     accept one word                          keymaps.accept_word
+  <C-n>     next candidate (fetches more lazily)     keymaps.next
+  <C-p>     previous candidate                       keymaps.prev
+  <C-e>     dismiss (no new request until you type)  keymaps.dismiss
+  <M-\>     request a suggestion now                 keymaps.trigger
+
+Normal mode:
+  <leader>at  toggle automatic suggestions           keymaps.toggle
+
+Each accept is one undo step. Set any key to `false` to disable it. If you
+already mapped a key yourself, slop leaves it alone.
+
+The ghost text also shows while the nvim-cmp menu is open
+(`show_with_cmp_menu`). nvim-cmp maps its keys per buffer, so those
+mappings win over the global ones above while cmp is active. To give slop
+priority inside your cmp mappings, use |slop-complete-cmp_map()|.
+
+==============================================================================
+3. CONFIGURATION                                        *slop-complete-config*
+
+Defaults (`opts.complete`): >lua
+  complete = {
+    enabled = true,
+    provider = "codestral",       -- name in ai.providers (FIM or chat)
+    frontend = "virtualtext",     -- "virtualtext" | "cmp" | "both"
+    debounce = 250,               -- ms
+    timeout = 10000,              -- ms per request
+    max_tokens = 256,
+    stop = { "\n\n" },
+    temperature = false,          -- false = provider default
+    stream = true,
+    candidates = 1,               -- fetched right away
+    max_candidates = 3,           -- upper bound for <C-n> fetching
+    multiline = "auto",           -- true | false | "auto": one line when
+                                  -- text follows the cursor
+    mid_line = "closers",         -- request mid-line only before closers
+                                  -- like ) ] } " ; ("always" | "never")
+    max_lines = 20,
+    cache = true,
+    condition = false,            -- fun(buf): boolean, auto requests only
+    filetypes = { "*" },
+    exclude = {
+      filetypes = { "help", "gitrebase", "fzf", "TelescopePrompt", "oil",
+        "slopterm", "slopprompt", "DressingInput", "Trouble", "trouble",
+        "dap-repl", "dapui_*" (each), "lazy", "mason", "prompt", "qf",
+        "toggleterm" },
+      buftypes = { "acwrite", "nofile", "prompt", "quickfix", "terminal",
+        "help" },
+      max_filesize = 512 * 1024,  -- bytes on disk
+      max_lines = 5000,
+    },
+    show_with_cmp_menu = true,
+    context = { scope = true, neighbors = true, recent_edits = true,
+                ring = true, diagnostics = true, budget = "auto" },
+    keymaps = { accept = "<C-y>", accept_line = "<M-l>",
+      accept_n_lines = "<M-n>", accept_word = "<M-w>", next = "<C-n>",
+      prev = "<C-p>", dismiss = "<C-e>", trigger = "<M-\\>",
+      toggle = "<leader>at" },
+  }
+<
+`budget` is the prompt size in characters. "auto" means 16000, roughly 4k
+tokens. Use a smaller value, such as 4000, for local models.
+
+Per buffer: `vim.b.slop_complete = false` turns automatic suggestions off for
+that buffer. Manual requests (<M-\>) still work.
+
+==============================================================================
+4. PROVIDERS (ai service)                            *slop-complete-providers*
+
+Providers are shared by all slop AI features and live in `opts.ai.providers`.
+Each one has a `kind`: "fim" for native fill-in-the-middle endpoints, or
+"chat" for chat models. A chat provider can also serve completions: slop then
+prompts it to fill in the middle, and it may return several alternatives.
+This is slower than a FIM endpoint.
+
+  field          meaning ~
+  kind           "fim" | "chat"
+  service        "mistral", "openai", "anthropic", "gemini", "deepseek",
+                 "openrouter", "ollama", "llamacpp", "groq", ...
+  url            endpoint
+  model          model name
+  api_key        env var NAME (string), function returning the key, or false
+                 (no key, e.g. local servers). Default: <SERVICE>_API_KEY,
+                 e.g. MISTRAL_API_KEY. Literal keys are rejected.
+  format         dialect override: "mistral" | "openai" | "anthropic" |
+                 "gemini" | "llamacpp" (default derived from `service`;
+                 unknown services use "openai")
+  params         table deep-merged into the request body (top_p, reasoning
+                 settings, ollama `options`, ...)
+  headers        extra request headers
+  transform      fun(http_request, info) -> http_request (rewrite url/body,
+                 or set `proxy` / `extra_args` for curl)
+  fim_template   for /completions endpoints without a `suffix` field: false
+                 | "qwen" | "deepseek" | "codellama" | "starcoder" |
+                 "codestral" | fun(prefix, suffix): string
+  chat_fim       chat-FIM prompt overrides { system?, input?, few_shots?,
+                 vars? } (templates may use {{lang}} {{indent}} {{n}}
+                 {{prefix}} {{suffix}} and your own vars)
+  stream         false disables streaming
+  timeout        default request timeout (ms)
+
+Recipes: >lua
+  ai = { providers = {
+    -- Codestral FIM (shipped default), user key variable
+    codestral = { api_key = "MISTRAL_API_KEY_NVIM" },
+    -- DeepSeek FIM (beta)
+    deepseek = { kind = "fim", service = "deepseek", model = "deepseek-chat",
+      url = "https://api.deepseek.com/beta/completions" },
+    -- Ollama (OpenAI-compatible /v1/completions with suffix)
+    ollama = { kind = "fim", service = "ollama", api_key = false,
+      url = "http://localhost:11434/v1/completions",
+      model = "qwen2.5-coder:7b" },
+    -- llama.cpp native infill endpoint
+    llama = { kind = "fim", service = "llamacpp", api_key = false,
+      url = "http://127.0.0.1:8012/infill", model = "local" },
+    -- llama.cpp /v1/completions with Qwen FIM tokens
+    llama_qwen = { kind = "fim", service = "ollama", api_key = false,
+      url = "http://127.0.0.1:8012/v1/completions", model = "local",
+      fim_template = "qwen" },
+    -- chat models
+    openrouter = { kind = "chat", service = "openrouter",
+      url = "https://openrouter.ai/api/v1/chat/completions",
+      model = "google/gemini-3.1-flash-lite",
+      params = { reasoning = { effort = "none" } } },
+    claude = { kind = "chat", service = "anthropic",
+      model = "claude-haiku-5-5",
+      url = "https://api.anthropic.com/v1/messages" },
+    gemini = { kind = "chat", service = "gemini", model = "gemini-2.0-flash",
+      url = "https://generativelanguage.googleapis.com/v1beta/models" },
+  } },
+  complete = { provider = "ollama" },
+<
+`:checkhealth slop` lists every provider and whether its key variable is set.
+It never shows the key's value.
+
+==============================================================================
+5. CONTEXT                                             *slop-complete-context*
+
+The prompt is assembled like Copilot's. It starts with context blocks, written
+as comments in the file's language:
+
+  Path: <relative path>
+  Enclosing scope signatures (treesitter) that are cut off above the prefix
+  Diagnostics near the cursor
+  Snippets from similar open buffers (Jaccard over 60-line windows, best last)
+  Recent edits as unified diffs
+  "Ring" snippets: recently yanked, visited and saved code
+
+After the context comes the text before the cursor; the text after the cursor
+is the suffix. The budget is split 35% prefix, 15% suffix, 35% stable context
+and 15% volatile context. Unused shares go to the prefix, then to the suffix.
+Cuts land on line boundaries.
+
+Single or multiple lines: in "auto" mode, completion is single-line when text
+follows the cursor, and multi-line otherwise. Generation stops when the block
+the cursor is in ends.
+
+Post-processing, ported from Copilot (MIT):
+- remove what already follows the cursor on the line, and closing brackets
+  that are already in the document;
+- drop suggestions that duplicate the next line, and repetitive output;
+- normalise indentation to 'expandtab' / 'tabstop'.
+
+==============================================================================
+6. COMMANDS                                           *slop-complete-commands*
+
+:Slop complete [status]            provider, auto state, why it's inactive here
+:Slop complete toggle [buffer]     toggle automatic suggestions
+:Slop complete enable [buffer]
+:Slop complete disable [buffer]
+:Slop complete provider [name]     switch the provider (runtime only)
+:Slop complete cache               clear the prefix cache
+
+==============================================================================
+7. LUA API                                                 *slop-complete-api*
+
+`local c = require("slop").complete` (loads the module on first use):
+
+c.is_visible() -> boolean          a complete suggestion is shown
+c.accept() / c.accept_word() / c.accept_line() -> boolean
+c.accept_n_lines(n?) -> boolean     n default: a digit typed right after
+c.next() / c.prev() -> boolean     cycle; next fetches alternatives
+c.dismiss() -> boolean
+c.trigger() -> boolean             request now (manual)
+c.toggle(scope?) / c.enable(scope?) / c.disable(scope?)  scope "buffer"
+c.is_enabled(buf?) -> boolean
+c.status(buf?) -> { state = "idle"|"loading"|"shown", index?, total?,
+                    provider }     (for statuslines)
+c.items(buf?) -> string[]          candidates at the cursor
+c.set_provider(name)
+
+All actions return false when nothing is visible, so they compose with other
+mappings.
+
+                                                     *slop-complete-cmp_map()*
+c.cmp_map(action, otherwise?) -> fun(fallback)
+    Helper for nvim-cmp mappings: run slop's {action} when a suggestion is
+    visible, else `otherwise(fallback)` (or `fallback()`). >lua
+      mapping = {
+        ["<C-y>"] = require("slop").complete.cmp_map("accept",
+                      cmp.mapping.confirm({ select = true })),
+        ["<C-n>"] = require("slop").complete.cmp_map("next",
+                      cmp.mapping.select_next_item()),
+        ["<C-p>"] = require("slop").complete.cmp_map("prev",
+                      cmp.mapping.select_prev_item()),
+        ["<C-e>"] = require("slop").complete.cmp_map("dismiss",
+                      cmp.mapping.abort()),
+        ["<M-l>"] = require("slop").complete.cmp_map("accept_line"),
+        ["<M-n>"] = require("slop").complete.cmp_map("accept_n_lines"),
+      }
+<
+==============================================================================
+8. NVIM-CMP                                                *slop-complete-cmp*
+
+With `frontend = "cmp"` or `"both"`, a cmp source named "slop" is registered
+once nvim-cmp is loaded. Add it to your sources: >lua
+  sources = cmp.config.sources({ { name = "nvim_lsp" }, { name = "slop" } })
+<
+- "both": the source offers the suggestion the ghost text already shows, with
+  no extra request.
+- "cmp": no ghost text; the source sends its own requests.
+
+The source asks only on trigger characters or a manual complete (its keyword
+pattern never matches), so the menu never waits on the model during normal
+typing.
+
+==============================================================================
+9. EVENTS AND HIGHLIGHTS                                 *slop-complete-events*
+
+User events (|slop-events|):
+  SlopCompleteRequestStarted   { buf, provider, id, n }
+  SlopCompleteRequestFinished  { buf, provider, id, items, ok, error?, ms }
+  SlopCompleteAccepted         { buf, kind, chars, id }
+
+Highlights (default links):
+  SlopCompleteGhost    -> SlopGhost -> Comment
+  SlopGhostCounter     -> SlopDim   (the "(i/n)" counter)
+  SlopCompleteCmpKind  -> CmpItemKind
+
+==============================================================================
+10. CORE BUILDING BLOCKS                                   *slop-complete-core*
+
+Other slop modules use these; they are documented here for module authors.
+
+core.http ~                                                    *slop-http*
+  http.request({ url, method?, headers?, query?, body? (table = JSON),
+    timeout?, stream? = "sse"|"ndjson"|"raw", on_chunk?, on_done,
+    follow_redirects?, cookie_jar?, http_version?, proxy?, extra_args? })
+    -> handle { cancel(), is_active() }
+  curl runs through |vim.system()|. The body goes over stdin, never argv.
+  Metadata comes from `-w %{json}`. on_done(res, err) is called exactly once,
+  on the main loop. err.kind is one of: timeout, cancelled, curl, http
+  (status >= 400), spawn, decode.
+  http.curl(args, opts) runs raw curl. http.build_args(opts) is pure. Also:
+  http.sse_decoder, http.ndjson_decoder, http.parse_headers.
+
+core.ui.ghost ~                                               *slop-ghost*
+  ghost.show(buf, row, col, text, { id?, hl?, counter?, loading?,
+    on_accept?, on_clear? }), ghost.get(buf) -> { row, col, text, id, ... },
+  ghost.clear(buf), ghost.accept/accept_word/accept_line/accept_n_lines.
+  Each accept is one undo step, and partial accepts keep the rest visible.
+
+core.ts ~                                                        *slop-ts*
+  ts.scope(buf, {row, col}?) -> { kind, name, range, header }  (or nil)
+  ts.scopes(buf, pos?) (outermost first)  ts.in_empty_block(buf, pos?)
+  ts.lang(buf)  ts.has_parser(buf)
+
+services.ai ~                                                    *slop-ai*
+  ai.chat({ provider, messages, system?, max_tokens?, temperature?,
+    on_chunk?(delta, text), on_done(text, err) }) -> handle
+  ai.complete_fim({ provider, prompt, suffix, max_tokens?, stop?,
+    on_chunk?, on_done(items, err) }) -> handle
+  Missing keys never throw: on_done gets { kind = "config", message }.
+  Callers must redact text with core.secrets first.
+
+services.ai.context ~                                    *slop-ai-context*
+  context.fim(buf, row, col, opts) -> { prompt, suffix, parts, blocked?,
+    meta }  (redacted)
+  context.files(root?)  context.file(path, opts?)
+  context.rules(root?, names, { from? })
+
+==============================================================================
+11. CREDITS                                            *slop-complete-credits*
+
+These are ported from microsoft/vscode-copilot-chat (MIT, (c) Microsoft
+Corporation):
+- the FIM context format and budget split;
+- the Jaccard neighbour snippets;
+- the middle-of-line gate;
+- the repetition filter, bracket de-duplication, rest-of-line handling and
+  prefix cache.
+
+The accept-word pattern and the ghost text layout come from
+zbirenbaum/copilot.lua (MIT, (c) Zach Birenbaum). The chat-FIM prompts are
+original.
+
+ vim:tw=78:ts=8:ft=help:norl:
