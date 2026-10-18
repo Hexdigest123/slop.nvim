@@ -14,6 +14,9 @@ local api = vim.api
 local manifest = require("slop.manifest")
 local group = api.nvim_create_augroup("slop.bootstrap", { clear = true })
 
+-- Neovim has no *.rest mapping; treat it as http so `ft` triggers fire.
+vim.filetype.add({ extension = { rest = "http" } })
+
 -- 1. Core highlight groups. default = true so colorschemes and users win.
 --    Modules declare their own groups (Slop<Module><Thing>) in spec.highlights.
 local core_hl = {
