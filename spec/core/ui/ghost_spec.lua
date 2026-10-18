@@ -1,0 +1,157 @@
+local h = require("helpers")
+
+describe("core.ui.ghost", function()
+  local ghost, buf, ns
+  local api = vim.api
+
+  local function marks()
+    return api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })
+  end
+
+  local function lines()
+    return api.nvim_buf_get_lines(buf, 0, -1, false)
+  end
+
+  before_each(function()
+    h.reset()
+    vim.notify = function() end
+    ghost = require("slop.core.ui.ghost")
+    ns = require("slop.core.util").ns("ghost")
+    vim.cmd("enew!")
+    buf = api.nvim_get_current_buf()
+    vim.bo[buf].undolevels = 1000
+    vim.keymap.set("i", "<F2>", function()
+      ghost.accept()
+    end)
+    vim.keymap.set("i", "<F3>", function()
+      ghost.accept_word()
+    end)
+    vim.keymap.set("i", "<F4>", function()
+      ghost.accept_line()
+    end)
+    vim.keymap.set("i", "<F5>", function()
+      ghost.accept_n_lines(2)
+    end)
+  end)
+
+  it("renders inline virt_text + virt_lines with hl_mode combine and a counter", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "local x = ", "" })
+    ghost.show(buf, 0, 10, "foo(\n\tbar)\nbaz", { counter = { 1, 3 }, id = "t1" })
+    local m = marks()
+    assert.equal(1, #m)
+    local d = m[1][4]
+    assert.equal(0, m[1][2])
+    assert.equal(10, m[1][3])
+    assert.equal("inline", d.virt_text_pos)
+    assert.equal("combine", d.hl_mode)
+    assert.equal("foo(", d.virt_text[1][1])
+    assert.equal("SlopGhost", d.virt_text[1][2])
+    assert.equal(2, #d.virt_lines)
+    assert.equal(string.rep(" ", vim.bo[buf].tabstop) .. "bar)", d.virt_lines[1][1][1])
+    assert.equal(" (1/3)", d.virt_lines[2][2][1])
+    assert.equal("SlopGhostCounter", d.virt_lines[2][2][2])
+    local st = ghost.get(buf)
+    assert.equal("t1", st.id)
+    assert.equal("foo(\n\tbar)\nbaz", st.text)
+    assert.is_true(ghost.is_visible(buf))
+    -- replacing keeps one mark
+    ghost.show(buf, 0, 10, "zzz", { counter = "[x]", loading = true })
+    assert.equal(1, #marks())
+    assert.equal(" [x] …", marks()[1][4].virt_text[2][1])
+  end)
+
+  it("clear removes the mark and calls on_clear once", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "a" })
+    local reasons = {}
+    ghost.show(buf, 0, 1, "bc", {
+      on_clear = function(r)
+        reasons[#reasons + 1] = r
+      end,
+    })
+    ghost.clear(buf)
+    ghost.clear(buf)
+    assert.equal(0, #marks())
+    assert.is_false(ghost.is_visible(buf))
+    assert.are.same({ "clear" }, reasons)
+    assert.is_false(ghost.accept(buf))
+    assert.is_false(ghost.accept_word(buf))
+  end)
+
+  it("position follows edits before the mark", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two" })
+    ghost.show(buf, 1, 3, "!")
+    api.nvim_buf_set_lines(buf, 0, 0, false, { "zero" })
+    local st = ghost.get(buf)
+    assert.equal(2, st.row)
+    assert.equal(3, st.col)
+  end)
+
+  it("split_len: word / line / lines", function()
+    assert.equal(4, ghost.split_len("foo bar", "word"))
+    assert.equal(6, ghost.split_len("  .foo\n bar", "word"))
+    assert.equal(3, ghost.split_len("foo\nbar", "lines", 1))
+    assert.equal(4, ghost.split_len("\nbar\nbaz", "lines", 1))
+    assert.equal(7, ghost.split_len("foo\nbar\nbaz", "lines", 2))
+    assert.equal(11, ghost.split_len("foo\nbar\nbaz", "lines", 9))
+    assert.equal(5, ghost.split_len("hello", "all"))
+  end)
+
+  it("accept (insert mode) inserts at the mark, moves the cursor, is one undo step", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "foo)" })
+    api.nvim_win_set_cursor(0, { 1, 3 })
+    local accepted
+    vim.keymap.set("i", "<F6>", function()
+      ghost.show(buf, 0, vim.fn.col(".") - 1, "(a,\n  b", {
+        on_accept = function(text, kind)
+          accepted = { text, kind, vim.fn.mode() }
+        end,
+      })
+    end)
+    h.feed("i x<BS><F6><F2>Z<Esc>")
+    assert.are.same({ "foo (a,", "  bZ)" }, lines())
+    assert.are.same({ "(a,\n  b", "all", "i" }, accepted)
+    assert.is_false(ghost.is_visible(buf))
+    vim.cmd("normal! u")
+    assert.are.same({ "foo )" }, lines())
+  end)
+
+  it("partial accepts keep the remainder at the cursor", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+    local snaps = {}
+    vim.keymap.set("i", "<F6>", function()
+      ghost.show(buf, 0, 0, "local foo = 1\nlocal bar = 2\nreturn foo", {})
+    end)
+    vim.keymap.set("i", "<F9>", function()
+      local st = ghost.get(buf)
+      snaps[#snaps + 1] = { lines(), st and st.text or false, api.nvim_win_get_cursor(0) }
+    end)
+    h.feed("i<F6><F3><F3><F9><F4><F9><F4><F9><F5><F9><Esc>")
+    assert.are.same({ { "local foo " }, "= 1\nlocal bar = 2\nreturn foo", { 1, 10 } }, snaps[1])
+    assert.are.same({ { "local foo = 1" }, "\nlocal bar = 2\nreturn foo", { 1, 13 } }, snaps[2])
+    assert.are.same({ { "local foo = 1", "local bar = 2" }, "\nreturn foo", { 2, 13 } }, snaps[3])
+    assert.are.same({ { "local foo = 1", "local bar = 2", "return foo" }, false, { 3, 10 } }, snaps[4])
+  end)
+
+  it("accepts in normal mode (commit message at line 1)", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "", "# comment" })
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    ghost.show(buf, 0, 0, { "feat: x", "", "body" }, { id = "commit" })
+    assert.is_true(ghost.accept(buf))
+    assert.are.same({ "feat: x", "", "body", "# comment" }, lines())
+    assert.same({ 3, 3 }, api.nvim_win_get_cursor(0))
+    vim.cmd("normal! u")
+    assert.are.same({ "", "# comment" }, lines())
+  end)
+
+  it("empty text clears; invalid buffers are ignored", function()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "x" })
+    ghost.show(buf, 0, 1, "y")
+    ghost.show(buf, 0, 1, "")
+    assert.is_false(ghost.is_visible(buf))
+    local other = api.nvim_create_buf(false, true)
+    ghost.show(other, 0, 0, "q")
+    api.nvim_buf_delete(other, { force = true })
+    assert.is_false(ghost.is_visible(other))
+    ghost.show(other, 0, 0, "q")
+  end)
+end)
