@@ -60,7 +60,7 @@ local function setup(cfg)
   end
   vim.api.nvim_create_autocmd({ "BufWritePost", "BufNewFile", "BufDelete", "BufFilePost" }, {
     group = group,
-    pattern = pattern,
+    pattern = vim.list_extend({ "http-client.env.json", "http-client.private.env.json" }, pattern),
     desc = "slop: rest invalidate discovery cache",
     callback = function(ev)
       require("slop.modules.rest.discover").invalidate(nil, ev.match)
