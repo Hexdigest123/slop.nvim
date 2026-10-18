@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Run the test-suite: ./scripts/test [spec/path_or_file ...]
+# Each *_spec.lua file runs in its own headless `nvim --clean -u NONE` process.
+cd "$(dirname "$0")/.." || exit 1
+exec "${NVIM:-nvim}" --headless --clean -u NONE -l spec/runner.lua "$@"

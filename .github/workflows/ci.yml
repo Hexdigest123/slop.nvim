@@ -1,0 +1,48 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  stylua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v2.1.0
+          args: --check lua plugin spec lazy.lua
+
+  selene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NTBBloodbath/selene-action@v1.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: 0.28.0
+          args: lua plugin spec
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+      - name: Tests
+        run: ./scripts/test
+      - name: Help tags
+        run: nvim --headless --clean -u NONE -c "helptags doc" -c "qa!"
+      - name: Health
+        run: |
+          nvim --headless --clean --cmd "set rtp^=$PWD" -c "checkhealth slop" -c "w! health.txt" -c "qa!"
+          cat health.txt
+          ! grep -q "ERROR" health.txt

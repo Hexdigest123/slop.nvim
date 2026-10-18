@@ -1,0 +1,5 @@
+-- Optional: lets `busted` (with nlua) run the same specs. The default runner is spec/runner.lua.
+return {
+  _all = { coverage = false, lpath = "lua/?.lua;lua/?/init.lua;spec/?.lua", lua = "nlua" },
+  default = { verbose = true, ROOT = { "spec" }, pattern = "_spec" },
+}

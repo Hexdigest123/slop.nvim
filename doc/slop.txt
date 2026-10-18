@@ -1,0 +1,193 @@
+*slop.txt*  A modular do-everything plugin                     *slop* *slop.nvim*
+
+==============================================================================
+CONTENTS                                                       *slop-contents*
+
+  1. Introduction ............................................ |slop-intro|
+  2. Install ................................................. |slop-install|
+  3. Configuration ........................................... |slop-config|
+  4. Commands ................................................ |slop-commands|
+  5. Keymaps ................................................. |slop-keymaps|
+  6. Highlights .............................................. |slop-highlights|
+  7. Events .................................................. |slop-events|
+  8. Project folder .......................................... |slop-project|
+  9. Secrets ................................................. |slop-secrets|
+ 10. Health .................................................. |slop-health|
+ 11. Writing a module ........................................ |slop-module|
+ 12. Modules
+      term ................................................... |slop-term|
+      cloak .................................................. |slop-cloak|
+      complete ............................................... |slop-complete|
+      commit ................................................. |slop-commit|
+      rest ................................................... |slop-rest|
+      edit ................................................... |slop-edit|
+      hello .................................................. |slop-hello|
+
+==============================================================================
+1. INTRODUCTION                                                   *slop-intro*
+
+slop.nvim is a single plugin made of small modules. Each module lives in
+`lua/slop/modules/<name>/` and loads lazily: at startup only a tiny manifest
+is read. Requires Neovim 0.12+. No dependencies.
+
+==============================================================================
+2. INSTALL                                                      *slop-install*
+
+lazy.nvim: >lua
+    return { "hexdigest123/slop.nvim" }
+<
+The shipped `lazy.lua` makes lazy call `require("slop").setup({})`.
+
+vim.pack: >lua
+    vim.pack.add({ "https://github.com/hexdigest123/slop.nvim" })
+    require("slop").setup({})   -- optional
+<
+==============================================================================
+3. CONFIGURATION                                  *slop-config* *slop.setup()*
+
+`require("slop").setup(opts)` only stores options; it may be called any
+number of times, before or after the plugin is loaded. Options can also be
+given as `vim.g.slop` (a table or a function returning one).
+
+Precedence: defaults < `vim.g.slop` < `setup(opts)`.
+
+Core options: >lua
+    {
+      ui      = { border = "rounded", spinner = "dots", picker = "auto" },
+      log     = { level = "warn", max_entries = 2000 },
+      project = { root_markers = { ".git" }, dir = ".nvim" },
+      secrets = {
+        block = { ".env*", "*.pem", "*.key", "*.p12", "*.pfx",
+                  "*secret*", "*credential*", "*private-key*" },
+        placeholder = "<redacted>",
+        agent_reads = "deny",
+      },
+    }
+<
+Every module is configured under its name, e.g. `opts.term = { ... }`.
+`opts.<module> = false` (or `{ enabled = false }`) disables it.
+User modules: `opts.modules = { mine = require("my.slop_module") }`.
+
+AI providers (service `ai`) read their API key from `<SERVICE>_API_KEY`
+(e.g. `MISTRAL_API_KEY`). Override per provider with `api_key`, either the
+name of another environment variable or a function returning the key: >lua
+    ai = { providers = { codestral = { api_key = "MISTRAL_API_KEY_NVIM" } } }
+<
+Invalid options are reported with their path (e.g. `term.layout`), unknown
+options are reported as typos. See |slop-health|.
+
+==============================================================================
+4. COMMANDS                                                  *:Slop* *slop-commands*
+
+:[range]Slop {module} [subcommand] [args]
+        Run a module subcommand (the module loads on first use).
+:Slop health                                         Run `:checkhealth slop`.
+:Slop log [clear]                        Open the log (`q` closes) or clear it.
+:Slop modules [enable|disable {name}]     List modules or toggle one.
+
+==============================================================================
+5. KEYMAPS                                                      *slop-keymaps*
+
+Every module action is a `<Plug>(slop-<module>-<action>)` mapping. Default
+keys map to those, only when the key is free and you have not mapped the
+`<Plug>` yourself. Change or disable a default key in the module's
+`keymaps` table: >lua
+    require("slop").setup({ term = { keymaps = { toggle = "<C-\\>", split = false } } })
+<
+slop never maps <Tab> by default.
+
+==============================================================================
+6. HIGHLIGHTS                                                *slop-highlights*
+
+All groups are defined with `default = true` (your colorscheme wins):
+SlopNormal SlopBorder SlopTitle SlopFooter SlopGhost SlopDim SlopSpinner
+SlopDiffAdd SlopDiffDelete SlopDiffChange SlopDiffText SlopMatch SlopSelected
+SlopRedacted, plus module groups named `Slop<Module><Thing>`.
+
+==============================================================================
+7. EVENTS                                                        *slop-events*
+
+slop fires `User` autocmds named `Slop<Module><Event>` with `ev.data`, e.g.
+`SlopTermOpen`. Core events: `SlopConfigChanged`, `SlopModuleLoaded`
+`{ name }`, `SlopModuleDisabled` `{ name }`.
+
+==============================================================================
+8. PROJECT FOLDER                                               *slop-project*
+
+The project root is found with `vim.fs.root()` and `project.root_markers`,
+falling back to the current directory. `<root>/.nvim/` holds project files:
+hand-written ones (`commit.md`, `rules.md`) and generated state in
+`<root>/.nvim/state/` (a `.nvim/.gitignore` containing `state/` is written
+when that folder is first created).
+
+==============================================================================
+9. SECRETS                                                      *slop-secrets*
+
+Text sent to an AI provider or agent always passes through slop's redaction.
+Files matching `secrets.block` are never sent; cloaked values are replaced by
+`<redacted>`. Hiding/revealing cloaks on screen never turns redaction off.
+
+==============================================================================
+10. HEALTH                                                       *slop-health*
+
+`:checkhealth slop` checks Neovim, `git`/`curl`, the configuration of every
+namespace, each enabled module and service (e.g. which API key environment
+variable is used and whether it is set; values are never printed).
+
+==============================================================================
+11. WRITING A MODULE                                             *slop-module*
+
+Add `lua/slop/modules/<name>/init.lua` returning a spec: >lua
+    return {
+      name = "mine",
+      description = "what it does",
+      defaults = { enabled = true, keymaps = { run = "<leader>xm" } },
+      schema = function(cfg, check) check("keymaps", cfg.keymaps, "table") end,
+      setup = function(cfg) end,          -- once, on first use
+      commands = { run = { impl = function(args, cmd) end } },
+      keymaps = { run = { mode = "n", desc = "run mine", rhs = function() end } },
+      health = function() vim.health.ok("fine") end,
+      api = {},                           -- require("slop").mine
+    }
+<
+See `lua/slop/modules/hello/` for a complete example.
+
+==============================================================================
+12. MODULES
+
+------------------------------------------------------------------------------
+TERM                                                               *slop-term*
+
+Toggled float/split terminal. See |slop-term.txt|.
+
+------------------------------------------------------------------------------
+CLOAK                                                             *slop-cloak*
+
+Mask secrets on screen; feeds |slop-secrets|. See |slop-cloak.txt|.
+
+------------------------------------------------------------------------------
+COMPLETE                                                       *slop-complete*
+
+AI fill-in-the-middle completion as ghost text. See |slop-complete.txt|.
+
+------------------------------------------------------------------------------
+COMMIT                                                           *slop-commit*
+
+AI commit messages in gitcommit buffers. See |slop-commit.txt|.
+
+------------------------------------------------------------------------------
+REST                                                               *slop-rest*
+
+HTTP client for `.http` files. See |slop-rest.txt|.
+
+------------------------------------------------------------------------------
+EDIT                                                               *slop-edit*
+
+AI edits of a selection through an ACP agent. See |slop-edit.txt|.
+
+------------------------------------------------------------------------------
+HELLO                                                             *slop-hello*
+
+Example module (disabled by default): `:Slop hello greet [target]`.
+
+ vim:tw=78:ts=8:noet:ft=help:norl:
