@@ -1,0 +1,261 @@
+*slop-commit.txt*  AI commit messages as ghost text for slop.nvim
+
+==============================================================================
+CONTENTS                                                *slop-commit-contents*
+
+  1. Introduction ............................ |slop-commit-intro|
+  2. How it works ............................ |slop-commit-flow|
+  3. Keymaps ................................. |slop-commit-keymaps|
+  4. Commands ................................ |slop-commit-commands|
+  5. Configuration ........................... |slop-commit-config|
+  6. Project conventions ..................... |slop-commit-conventions|
+  7. Privacy ................................. |slop-commit-privacy|
+  8. Lua API ................................. |slop-commit-api|
+  9. Highlights and events ................... |slop-commit-highlights|
+ 10. core.git ................................ |slop-commit-git|
+ 11. Credits ................................. |slop-commit-credits|
+
+==============================================================================
+1. INTRODUCTION                                            *slop-commit-intro*
+
+When a `gitcommit` buffer opens with an empty message, the `commit` module
+asks an AI chat provider (default `mistral_chat`) for a commit message and
+shows it as ghost text on line 1. Press `<C-y>` (the completion accept key) to
+insert it, `<C-e>` to dismiss it, `<C-n>`/`<C-p>` to cycle variants and
+`<leader>ac` to regenerate.
+
+It works with plain `git commit` (`EDITOR=nvim` / `core.editor = nvim`) and
+with vim-fugitive (`:Git commit`, `cc` in the status window). The module is
+loaded lazily on the first `gitcommit` buffer. It does not need the `complete`
+module.
+
+Recommended: >sh
+    git config --global commit.verbose true
+<
+With a verbose commit, git writes the exact diff that will be committed
+below the scissors line, so slop sees exactly that diff, whatever you ran
+(`-a`, pathspecs, `--amend`, fugitive).
+
+==============================================================================
+2. HOW IT WORKS                                             *slop-commit-flow*
+
+1. On |FileType| `gitcommit` the buffer is attached. The message area
+   counts as empty when it holds only comment lines and blank lines. The
+   scissors section is ignored. If `auto` is set and the message is empty, a
+   message is generated. Buffers that already have a message are left alone; use
+   `<leader>ac` there. Examples are `--amend`, merge, reword and squash.
+2. The context is gathered in parallel, without blocking:
+   - the diff:
+     - the verbose section below the scissors line, if there is one;
+     - else `git diff --cached`, which honours a `GIT_INDEX_FILE` exported
+       by `git commit -a` or `git commit <paths>`;
+     - else, when nothing is staged, unstaged tracked changes
+       (`unstaged_fallback`).
+   - the branch name,
+   - the last `recent` subjects of your own commits (`user.email`) and of the
+     repository, used to match the style,
+   - `<root>/.nvim/commit.md` (|slop-commit-conventions|) and `instructions`.
+3. Amend is detected from:
+   - the verbose diff (already exact),
+   - the parent `git commit --amend` process (Linux),
+   - or a pre-filled message that equals HEAD's.
+   The amend diff is taken against the amended commit's parent, and the old
+   message is sent as a reference.
+4. The diff is redacted (|slop-commit-privacy|) and fitted into
+   `max_diff_chars`:
+   - lock files and generated files (`summarize`) are reduced to a
+     `+added -removed` summary;
+   - the remaining budget is shared per file: small files are kept whole,
+     big ones are truncated, and tiny shares become summaries;
+   - a changed-files list is added whenever something was cut.
+5. The reply is streamed into the ghost text at line 1, column 0:
+   - the ```` ```text ```` block is extracted;
+   - comment lines are dropped, because git would strip them;
+   - the body is wrapped at 'textwidth' (default 72) when `wrap` is set.
+6. If you type a message while a request is running, the request is cancelled
+   and its result discarded. Accepting inserts the text above git's comment
+   block as one undo step.
+
+==============================================================================
+3. KEYMAPS                                               *slop-commit-keymaps*
+
+All keys are buffer-local in `gitcommit` buffers. Set any of them to `false`
+under `commit.keymaps` to disable it. The defaults are the same as the
+`complete` module's keys. These keys only act on a commit suggestion; with no
+suggestion visible they fall through to the previous mapping or the native
+key (for example scrolling, or insert-mode completion).
+
+  Mode  Key           Name        Action ~
+  n,i   `<C-y>`         accept      insert the suggestion (one undo step)
+  n,i   `<C-e>`         dismiss     hide the suggestion / cancel the request
+  n,i   `<C-n>`         next        next variant; past the last, a new one
+  n,i   `<C-p>`         prev        previous variant (wraps)
+  n     `<leader>ac`    regenerate  new variant; replaces a typed message
+
+Regenerating raises the temperature on each attempt, as VS Code does:
+`min(temperature * (1 + attempt), max_temperature)`. Variants are kept for
+the buffer and the ghost text shows `(i/n)`.
+
+To use other keys, set them in the config (they are buffer-local, so there
+are no `<Plug>` mappings), or map the Lua API (|slop-commit-api|) yourself in
+an `ftplugin/gitcommit.lua`.
+
+==============================================================================
+4. COMMANDS                                             *slop-commit-commands*
+
+:Slop commit [generate]                                *:Slop-commit-generate*
+:Slop commit! [generate]
+        Generate a message for the current gitcommit buffer. Without `!`,
+        an existing message is kept. With `!`, it is replaced (one undo
+        step).
+
+:Slop commit regenerate                              *:Slop-commit-regenerate*
+        Same as `<leader>ac`.
+
+:Slop commit accept                                     *:Slop-commit-accept*
+:Slop commit dismiss                                   *:Slop-commit-dismiss*
+:Slop commit next                                         *:Slop-commit-next*
+:Slop commit prev                                         *:Slop-commit-prev*
+        Same as the keys.
+
+==============================================================================
+5. CONFIGURATION                                          *slop-commit-config*
+
+Defaults: >lua
+    require("slop").setup({
+      commit = {
+        enabled = true,
+        provider = "mistral_chat",  -- a `chat` provider from ai.providers
+        style = "auto",             -- "auto" | "conventional" | "plain"
+        auto = true,                -- generate when the message is empty
+        stream = true,
+        recent = 5,                 -- recent subjects (yours + repo's)
+        branch = true,              -- send the branch name
+        conventions = "commit.md",  -- <root>/.nvim/<file>, false = off
+        instructions = "",          -- extra prompt instructions
+        max_diff_chars = 24000,     -- diff budget (characters)
+        summarize = { "*.lock", "package-lock.json", "npm-shrinkwrap.json",
+                      "pnpm-lock.yaml", "yarn.lock", "go.sum",
+                      "*.min.js", "*.min.css", "*.map" },
+        unstaged_fallback = true,   -- nothing staged: use tracked changes
+        temperature = 0.3,
+        max_temperature = 1.0,
+        max_tokens = 512,
+        timeout = 30000,            -- ms
+        wrap = true,                -- wrap the body at 'textwidth'
+        keymaps = {
+          regenerate = "<leader>ac",
+          accept = "<C-y>", dismiss = "<C-e>",
+          next = "<C-n>", prev = "<C-p>",
+        },
+      },
+    })
+<
+`style`:
+  `auto`          follow the recent repository commits (plain imperative
+                subject + optional body when there are none)
+  `conventional`  Conventional Commits `type(scope): subject`
+  `plain`         no type prefixes, capitalised imperative subject
+
+The API key comes from the provider (see |slop-config|), by default
+`$MISTRAL_API_KEY`. Example using a dedicated variable: >lua
+    ai = { providers = {
+      mistral_chat = { api_key = "MISTRAL_API_KEY_NVIM" },
+    } }
+<
+Disable the module with `commit = false`. Turn off only the automatic
+trigger with `commit = { auto = false }` and use `<leader>ac` instead.
+
+==============================================================================
+6. PROJECT CONVENTIONS                               *slop-commit-conventions*
+
+`<root>/.nvim/commit.md` is free text. It is added to the prompt as custom
+instructions, for example: >markdown
+    Use Conventional Commits. Scopes are module names (term, rest, core/git).
+    Subject in English, max 60 chars. Reference the ticket from the branch
+    name (ABC-123) in a `Refs:` trailer.
+<
+The file is redacted like everything else. It is skipped when it matches a
+secret glob.
+
+==============================================================================
+7. PRIVACY                                               *slop-commit-privacy*
+
+Everything sent to the provider goes through |slop-secrets| first:
+- diff sections of blocked files (`.env*`, `*.pem`, `*.key`, …, and the cloak
+  rules) are replaced by `[slop: diff of <path> omitted]`;
+- secret spans in other files are replaced by `<redacted>`, including PEM
+  private-key blocks inside a hunk;
+- diff sections whose file path cannot be parsed (quoted names,
+  `diff.noprefix`) are dropped;
+- the branch, the recent subjects and `commit.md` are redacted too.
+Nothing else is read: only the diff is sent, never whole files.
+
+==============================================================================
+8. LUA API                                                   *slop-commit-api*
+
+`local commit = require("slop").commit` (the module loads on first use).
+
+commit.generate({buf}, {opts})                        *slop-commit.generate()*
+        Start a request. Returns `true` when started. {opts}:
+        `force` (replace a typed message), `amend` (override detection),
+        `fresh` (re-gather the context instead of reusing it).
+
+commit.regenerate({buf})                            *slop-commit.regenerate()*
+commit.accept({buf})                                    *slop-commit.accept()*
+commit.dismiss({buf})                                  *slop-commit.dismiss()*
+commit.next({buf})                                        *slop-commit.next()*
+commit.prev({buf})                                        *slop-commit.prev()*
+        Return `false` when there is no commit suggestion to act on.
+
+commit.is_visible({buf})                            *slop-commit.is_visible()*
+commit.state({buf})                                      *slop-commit.state()*
+        `{ status, variants, index, attempt, error?, source?, amend? }`, where
+        `status` is one of `idle` `gathering` `streaming` `done` `accepted`
+        `partial` `dismissed` `stale` `error`, and `source` is one of
+        `verbose` `index` `amend` `worktree`.
+
+==============================================================================
+9. HIGHLIGHTS AND EVENTS                              *slop-commit-highlights*
+
+`SlopCommitStatus`  "generating…" hint at the end of line 1 (-> `Comment`).
+The suggestion itself uses `SlopGhost` and `SlopGhostCounter` (core.ui.ghost).
+
+Events (|User| autocmds, see |slop-events|):
+  `SlopCommitGenerated`  `{ buf, variant, count }`  a variant finished
+  `SlopCommitAccepted`   `{ buf, variant }`         suggestion inserted
+
+==============================================================================
+10. CORE.GIT                                                 *slop-commit-git*
+
+`require("slop.core.git")` is the shared git layer, also used by other
+modules. All process calls go through |vim.system()| and call back on the
+main loop. The environment is inherited, so `GIT_INDEX_FILE` from
+`git commit` applies, and `GIT_OPTIONAL_LOCKS=0` is set so slop never
+competes with git for the index lock.
+
+  git.run(args, {cwd?, env?, stdin?, timeout?}, cb(res))
+  git.root(path|buf?)  git.git_dir(path|buf?)        sync, no process spawned
+  git.staged_diff({cwd?, amend?, worktree?, env?, context?, paths?},
+                  cb(diff?, err?))
+  git.branch({cwd?}, cb(name?))
+  git.log({cwd?, n?, author?}, cb(subjects?))
+  git.config_get(key, {cwd?}, cb(value?))   git.head_message({cwd?}, cb(msg?))
+  git.recent_commits({cwd?, n?}, cb({user, repo}))
+  git.parent_amend() -> boolean
+  git.parse_commit_buffer(lines, {comment_char?}) -> { message, empty,
+      comment_char, first_comment?, scissors?, diff?, diff_error? }
+  git.split_diff(diff) -> { path, old_path?, text, added, removed, binary }[]
+
+Diffs always use `a/` and `b/` prefixes, and their output is NOT redacted:
+pass it through `core.secrets.redact_diff()` before sending it anywhere.
+
+==============================================================================
+11. CREDITS                                              *slop-commit-credits*
+
+The prompt (system rules and tag layout) is adapted from Microsoft's VS Code
+Copilot Chat extension (`gitCommitMessagePrompt.tsx` in
+microsoft/vscode-copilot-chat), Copyright (c) Microsoft Corporation, MIT
+License. The full notice is in `lua/slop/modules/commit/prompt.lua`.
+
+ vim:tw=78:ts=8:ft=help:norl:
