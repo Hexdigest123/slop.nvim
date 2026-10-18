@@ -1,0 +1,294 @@
+*slop-cloak.txt*  Mask secrets on screen and keep them away from AI
+
+==============================================================================
+CONTENTS                                                 *slop-cloak-contents*
+
+  1. Introduction ............................ |slop-cloak-intro|
+  2. Keymaps ................................. |slop-cloak-keymaps|
+  3. Commands ................................ |slop-cloak-commands|
+  4. Configuration ........................... |slop-cloak-config|
+  5. Rules ................................... |slop-cloak-rules|
+  6. Rendering ............................... |slop-cloak-render|
+  7. Integrations ............................ |slop-cloak-integrations|
+  8. AI redaction (core.secrets) ............. |slop-cloak-secrets|
+  9. Lua API ................................. |slop-cloak-api|
+ 10. Highlights and events ................... |slop-cloak-highlights|
+ 11. Migrating from cloak.nvim ............... |slop-cloak-migrate|
+ 12. Limitations ............................. |slop-cloak-limitations|
+
+==============================================================================
+1. INTRODUCTION                                             *slop-cloak-intro*
+
+The `cloak` module replaces cloak.nvim. It does two things:
+
+- It masks secret values on screen, e.g. `KEY=value` in `.env` files shows as
+  `KEY=*****`. The buffer text, yanks and registers are unchanged.
+- It registers its rules with |slop-secrets|, so no slop AI feature
+  (complete, commit, edit, rest) ever sends those values. The AI sees
+  `<redacted>` instead.
+
+Hiding or revealing masks on screen NEVER turns AI redaction off.
+
+The module loads on the first file read (or the first fzf-lua/telescope
+preview, or the first secrets query). Masks are drawn by a decoration
+provider during the redraw that first shows the text, so there is no flash
+of raw values on open, paste, `:e!`, undo or reload.
+
+==============================================================================
+2. KEYMAPS                                                *slop-cloak-keymaps*
+
+Defaults (set them to `false` under `cloak.keymaps` to disable):
+
+  Mode  Key          Name           Action ~
+  n     `<leader>tp`   toggle         toggle the masks (all buffers)
+  n     `<leader>tl`   preview_line   reveal the cursor line ([count] lines)
+
+Plugs: `<Plug>(slop-cloak-toggle)`, `<Plug>(slop-cloak-preview-line)`.
+
+==============================================================================
+3. COMMANDS                                              *slop-cloak-commands*
+
+:Slop cloak [toggle] [buffer|global]                     *:Slop-cloak-toggle*
+        Toggle the masks. `global` (the default) acts on every buffer.
+        `buffer` (or `:Slop! cloak toggle`) acts on the current buffer only.
+
+:Slop cloak enable [buffer|global]                       *:Slop-cloak-enable*
+:Slop cloak disable [buffer|global]                     *:Slop-cloak-disable*
+        Show or hide the masks. A global enable/disable also clears the
+        per-buffer overrides.
+
+:Slop cloak preview_line [N]                      *:Slop-cloak-preview_line*
+        Reveal the cursor line (N lines from the cursor) in the current
+        window until the cursor leaves those lines, the window or the
+        buffer. This does nothing when the buffer is not cloaked or the
+        masks are off.
+
+:Slop cloak status                                        *:Slop-cloak-status*
+        Show the effective path, whether a rule applies, the display state,
+        whether the file is blocked for AI, the matching rules and the number
+        of masked spans.
+
+Unlike cloak.nvim, there are no `:Cloak*` aliases.
+
+==============================================================================
+4. CONFIGURATION                                           *slop-cloak-config*
+
+The keys are cloak.nvim's, so a cloak.nvim `setup{}` table can be pasted
+under `cloak = { ... }`. The slop additions are marked with (+).
+>lua
+  cloak = {
+    enabled = true,              -- module on/off (false: no masks, no rules)
+    cloak_character = "*",
+    highlight_group = "SlopCloakMask",   -- links to Comment
+    cloak_length = false,        -- number: every mask has exactly N chars
+    try_all_patterns = true,
+    cloak_telescope = true,
+    cloak_on_leave = false,      -- re-enable masks when a cloaked buffer
+                                 -- leaves its window
+    patterns = {                 -- your list REPLACES this default
+      { file_pattern = ".env*", cloak_pattern = "=.+" },
+    },
+    render = "overlay",          -- (+) "overlay" | "conceal"
+    nowrap = true,               -- (+) overlay: local 'nowrap' on cloaked
+                                 --     windows, restored afterwards
+    builtin_patterns = true,     -- (+) extra rules, see |slop-cloak-builtin|
+    exclude = {},                -- (+) globs never cloaked, e.g.
+                                 --     { ".env.example" }
+    disable_completion = true,   -- (+) see |slop-cloak-integrations|
+    fzf_lua = true,              -- (+) mask fzf-lua previews
+    keymaps = { toggle = "<leader>tp", preview_line = "<leader>tl" },
+  }
+<
+Invalid Lua patterns are reported with their path, e.g.
+`cloak.patterns[2].cloak_pattern[1]: invalid Lua pattern ...`; the module is
+then not loaded.
+
+==============================================================================
+5. RULES                                                    *slop-cloak-rules*
+
+A rule (cloak.nvim format):
+>lua
+  {
+    file_pattern = ".env*",        -- string or list of globs
+    cloak_pattern = "=.+",         -- Lua pattern, or a list (see below)
+    replace = nil,                 -- string.gsub repl: string|table|function
+    block = false,                 -- (+) true: never send the file to AI
+  }
+<
+`file_pattern`: a glob without `/` matches the file name; a glob with `/`
+matches the full path (also below any directory, e.g. `config/*.yaml`).
+Buffers, picker previews and pseudo-paths all use the same matcher (the
+one |slop-secrets| uses).
+
+`cloak_pattern` is a Lua pattern applied to each line. It may also be a list:
+>lua
+  cloak_pattern = {
+    "(a=).+", { "(b=).+" }, { "(c=).+", replace = "[inner] %1" },
+  },
+  replace = "[outer] %1",
+<
+Precedence of `replace`: the inner table's own `replace`, then
+`cloak_pattern.replace`, then the rule's `replace`. An inner TABLE without
+`replace` does not inherit (like cloak.nvim), so `b=` keeps the legacy look.
+
+Matching (identical to cloak.nvim):
+- Several matches per line. At each step the earliest match wins, and ties
+  go to the longest (`try_all_patterns = true`). With `false`, the first
+  pattern in list order that matches anywhere wins.
+- Without `replace` (or without capture groups), the first character of the
+  match stays visible (`KEY=*****` keeps the `=`).
+- With capture groups and `replace`, the gsub result is a prefix. A prefix
+  equal to the original text stays as real text and only the rest is masked:
+  `"(token: ).+"` + `"%1"` shows `token: *****`. Any other prefix is drawn
+  over the original: `[outer] a=**`.
+
+Fixed compared to cloak.nvim:
+- Every rule matching a file applies; their masks are combined.
+- Single-character and empty matches no longer loop forever.
+- Previews and `/` globs behave the same as normal buffers.
+
+Builtin rules (`builtin_patterns = true`)                 *slop-cloak-builtin*
+They are kept even when you set your own `patterns`:
+- `http-client.env.json`, `http-client.private.env.json`,
+  `*.private.env.json`: string values.
+- `.npmrc`, `.yarnrc*`: `*Token=`, `_auth=`, `_password=` values.
+- `.netrc`: `password` values (blocked for AI).
+- `.aws/credentials`: access key, secret and session token (blocked).
+- `.nvim/state/**`: whole lines, e.g. the rest cookie jar (blocked).
+- `*.http`, `*.rest`: `Authorization:` (the scheme stays visible),
+  `Proxy-Authorization:`, `Cookie:` and `X-API-Key:` header values, and
+  `@...token... = value` variables.
+
+==============================================================================
+6. RENDERING                                               *slop-cloak-render*
+
+overlay (default) ~
+The cloak.nvim look: the mask is drawn over the text. It is sized by DISPLAY
+width, so tabs and wide characters are fully covered (cloak.nvim leaked
+them). An overlay cannot cover wrapped continuation rows, so windows showing
+a cloaked buffer get a window-local 'nowrap'. It is restored when the buffer
+is uncloaked (cloak.nvim never restored it). Set `nowrap = false` to keep
+'wrap' at the risk of leaking long values.
+
+conceal ~
+The value is concealed and replaced by inline virtual text, which works with
+'wrap'. `cloak_length` is exact both ways and never covers text after the
+value. The window gets 'conceallevel' 2 and 'concealcursor' "nvic", both
+restored later. Costs: the cursor is invisible while it is inside a value.
+A wrapped line keeps its original height, so a blank screen row may remain
+(Neovim limitation). 'conceallevel' also affects other conceal in that
+buffer. In this mode `preview_line` reveals the line in every window showing
+the buffer.
+
+Only visible rows are processed, with a per-row cache that is reset when the
+buffer changes.
+
+==============================================================================
+7. INTEGRATIONS                                      *slop-cloak-integrations*
+
+All of these are optional and guarded by pcall.
+
+fzf-lua ~
+Previews are masked. slop wraps the builtin previewer's `preview_buf_post`
+to tag each preview buffer with its file path. As a fallback, unnamed
+buffers in `w:fzf_lua_preview` windows are resolved from the selected
+entry. `:checkhealth slop` shows whether the patch is applied. fzf-lua
+grep RESULT lines are a terminal and cannot be masked. Consider excluding
+secret files, e.g. `grep = { rg_opts = "... --glob=!.env*" }`.
+
+telescope ~
+On `User TelescopePreviewerLoaded`, the preview buffer is tagged with its
+path (needs telescope newer than 0.1.x). There is no picker refresh hack.
+
+completion ~
+With `disable_completion = true`, cloaked buffers get:
+- `vim.b.completion = false` (blink.cmp and slop complete),
+- 'autocomplete' off,
+- nvim-cmp `cmp.setup.buffer({ enabled = false })`. If cmp is not loaded
+  yet, this happens on the buffer's first |InsertEnter|, before the first
+  keystroke.
+All of it is restored when the masks are turned off.
+
+Scratch / preview buffers ~
+Any buffer can carry a (pseudo-)path in `vim.b.slop_secret_path`; rules and
+|slop-secrets| then apply to it. See `require("slop").cloak.attach()`.
+
+==============================================================================
+8. AI REDACTION                                           *slop-cloak-secrets*
+
+cloak registers the provider "cloak" with |slop-secrets| (`core.secrets`):
+- `secrets.redact_text/redact_lines/redact_diff` replace cloaked spans with
+  `<redacted>` (config `secrets.placeholder`).
+- Rules with `block = true` add their globs to the block list: those files
+  are never sent at all, even redacted.
+- `secrets.is_cloaked(buf, range)` tells whether a range touches a secret.
+The provider is computed from the TEXT, so toggling or previewing masks has
+no effect on it. Only `cloak.enabled = false` or
+`:Slop modules disable cloak` removes it. Even then, the core block list
+(`secrets.block`, `.env*` included) still applies.
+
+The first secrets query loads cloak, so its rules exist before any AI
+request.
+
+Other modules or user code can register a `spans` provider with
+`display = true`; cloak then masks those spans on screen too.
+
+==============================================================================
+9. LUA API                                                    *slop-cloak-api*
+
+`local cloak = require("slop").cloak`
+
+cloak.toggle({scope})          `scope`: "global" (default) | "buffer"
+cloak.enable({scope})
+cloak.disable({scope})
+cloak.is_enabled({buf})        display state of a buffer
+cloak.preview_line({count})    reveal lines; returns false when nothing to do
+cloak.status({buf})            { buf, path, enabled, global, cloaked, blocked,
+                                 rules, spans, render }
+cloak.spans({buf}, {srow}, {erow})
+                               masked spans { row, col, end_col, prefix }
+cloak.refresh({buf})           recompute and redraw
+cloak.attach({buf}, {path})    set `vim.b.slop_secret_path` and redraw
+cloak.add_rules({name}, {rules})
+                               add a named set of cloak.nvim-style rules
+                               (screen + AI); replaces a set with that name
+cloak.remove_rules({name})
+
+Buffer variables: `vim.b.slop_secret_path` (input),
+`vim.b.slop_cloak_enabled` (per-buffer display override, true/false/nil).
+
+==============================================================================
+10. HIGHLIGHTS AND EVENTS                              *slop-cloak-highlights*
+
+`SlopCloakMask`   the mask (default link: Comment). `highlight_group`
+                  overrides it.
+
+`User SlopCloakToggled`   data `{ enabled, buf?, scope = "global"|"buffer" }`
+
+==============================================================================
+11. MIGRATING FROM CLOAK.NVIM                             *slop-cloak-migrate*
+
+1. Remove the cloak.nvim plugin spec (keeping both gives double masks;
+   `:checkhealth slop` warns about it).
+2. Move its `setup{}` table to `opts.cloak`. The default `.env*` rule and the
+   `<leader>tp` / `<leader>tl` keys are already slop defaults.
+3. `:CloakToggle` becomes `:Slop cloak toggle` and `:CloakPreviewLine`
+   becomes `:Slop cloak preview_line`.
+
+Behaviour differences: no flash on open, display-width masks, rules combine,
+'wrap' and completion are restored, `enable`/`disable` act on all buffers,
+preview_line is per window.
+
+==============================================================================
+12. LIMITATIONS                                       *slop-cloak-limitations*
+
+- Multi-line secrets (PEM blocks, multi-line quoted values) are not masked
+  on screen yet (planned for v2). PEM private-key bodies ARE redacted for
+  AI by |slop-secrets|, and `*.pem`/`*.key` files are blocked.
+- Yanks copy the real value (by design).
+- fzf-lua grep result lines are not masked.
+- ACP agents may read files with their OWN tools. slop refuses
+  permission-gated reads of blocked files, but you should also deny them
+  agent-side (e.g. Claude `permissions.deny: ["Read(./.env*)"]`).
+
+ vim:tw=78:ts=8:ft=help:norl:
