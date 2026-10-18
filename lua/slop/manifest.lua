@@ -40,7 +40,7 @@ return {
   },
 
   cloak = {
-    events = { "BufReadPre", "BufNewFile" },
+    events = { "BufReadPre", "BufNewFile", "FileType fzf", "User TelescopePreviewerLoaded" },
     provides = { "secrets" },
     cmd = true,
     keys = {
