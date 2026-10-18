@@ -1,0 +1,162 @@
+*slop-term.txt*  Toggled terminal (float, split, vsplit) for slop.nvim
+
+==============================================================================
+CONTENTS                                                   *slop-term-contents*
+
+  1. Introduction ............................ |slop-term-intro|
+  2. Keymaps ................................. |slop-term-keymaps|
+  3. Commands ................................ |slop-term-commands|
+  4. Configuration ........................... |slop-term-config|
+  5. Lua API ................................. |slop-term-api|
+  6. Highlights and events ................... |slop-term-highlights|
+  7. Core primitives ......................... |slop-term-core|
+
+==============================================================================
+1. INTRODUCTION                                               *slop-term-intro*
+
+The `term` module replaces toggleterm.nvim with one shell terminal:
+
+- a floating `'shell'` terminal at the project root (|slop-project| root of the
+  current buffer when it is first started),
+- toggled with `<leader>\`; the job and its scrollback survive while hidden,
+- starts in Terminal mode and remembers the mode you left it in,
+- hides when focus leaves the float,
+- closes when the shell exits,
+- sized to the editor minus 20 columns and 10 lines, `rounded` border, title,
+  resized on |VimResized|,
+- optional split / vsplit layouts, and sending the visual selection.
+
+The module is lazy-loaded: nothing is required until a key or `:Slop term` is
+used.
+
+==============================================================================
+2. KEYMAPS                                                  *slop-term-keymaps*
+
+Defaults (set any of them to `false` under `term.keymaps` to disable):
+
+  Mode  Key           Name          Action ~
+  n     `<leader>\`     toggle        toggle the terminal in `layout`
+  x     `<leader>\`     send          send the selection, then show the terminal
+  n     `<leader>|-`    split         toggle the terminal in a bottom split
+  n     `<leader>||`    vsplit        toggle the terminal in a right vsplit
+  t     `<esc><esc>`    normal_mode   leave Terminal mode (buffer-local)
+
+`<Plug>` mappings: `<Plug>(slop-term-toggle)`, `<Plug>(slop-term-send)`,
+`<Plug>(slop-term-split)`, `<Plug>(slop-term-vsplit)`.
+
+Toggle rules:
+- Plain toggle: hide when visible (in any layout), else show in `layout`.
+- Toggle with a layout (`split`/`vsplit` keys, `:Slop term toggle split`): show
+  it there; when it is visible in another layout it is MOVED (same job); when it
+  is already shown there it is hidden.
+- After sending, a float gets focus; a split keeps focus in your buffer.
+
+==============================================================================
+3. COMMANDS                                                *slop-term-commands*
+
+:Slop term [toggle] [float|split|vsplit]                     *:Slop-term-toggle*
+        Toggle the terminal (default subcommand, so `:Slop term split` works).
+
+:[range]Slop term send [text]                                  *:Slop-term-send*
+        Send the lines of [range], or [text], or the current line.
+
+:Slop term exec {cmd}                                          *:Slop-term-exec*
+        Run {cmd} in the terminal (|expandcmd()| is applied, so `%` works) and
+        show it.
+
+:Slop term kill                                                *:Slop-term-kill*
+        Stop the shell and wipe its buffer. The next toggle starts a new one.
+
+==============================================================================
+4. CONFIGURATION                                             *slop-term-config*
+
+Defaults: >lua
+  require("slop").setup({
+    term = {
+      enabled = true,
+      layout = "float",            -- "float" | "split" | "vsplit"
+      float = {
+        width = function() return vim.o.columns - 20 end,
+        height = function() return vim.o.lines - 10 end,
+        min_width = 20, min_height = 5,
+        title = true,              -- true = " <shell> ", a string, or false
+        title_pos = "center",
+        border = false,            -- false = ui.border (default "rounded")
+        winblend = 0,
+      },
+      split = { size = 0.3 },      -- rows
+      vsplit = { size = 0.4 },     -- columns
+      shell = vim.o.shell,         -- "zsh -l", { "zsh", "-l" } or a function
+      cwd = "root",                -- "root" | "cwd" | path | function
+      start_insert = true,
+      persist_mode = true,
+      hide_on_leave = true,        -- floats only
+      close_on_exit = true,        -- true | "success" (exit 0 only) | false
+      keymaps = {
+        toggle = "<leader>\\", send = "<leader>\\", normal_mode = "<esc><esc>",
+        split = "<leader>|-", vsplit = "<leader>||",
+      },
+    },
+  })
+<
+Sizes (`float.width`, `float.height`, `split.size`, `vsplit.size`): a number
+in (0, 1] is a fraction of the editor, a number > 1 is cells, a function
+`fun(columns, lines): integer` is computed (and re-evaluated on |VimResized|).
+Float sizes are the content size; the border is drawn around it.
+
+==============================================================================
+5. LUA API                                                      *slop-term-api*
+
+`local term = require("slop").term`
+
+term.toggle({layout})                                        *slop-term.toggle()*
+        Toggle (see |slop-term-keymaps|). Returns the |slop-term-core| object.
+term.show({layout}) / term.hide()                              *slop-term.show()*
+term.send({data}, {opts})                                      *slop-term.send()*
+        {data}: string or lines. {opts}: `submit` (default true, appends
+        <CR>), `paste` (`"auto"` default: bracketed paste for multi-line text,
+        `true`, `false`), `dedent` (default true: strip common indent).
+term.send_selection()                                *slop-term.send_selection()*
+term.exec({cmd})                                               *slop-term.exec()*
+term.kill()                                                    *slop-term.kill()*
+term.term()                                                    *slop-term.term()*
+        The live terminal object, or nil.
+
+==============================================================================
+6. HIGHLIGHTS AND EVENTS                                 *slop-term-highlights*
+
+  SlopTermNormal   -> Normal      (float background = editor background)
+  SlopTermBorder   -> SlopBorder
+  SlopTermTitle    -> SlopTitle
+
+Events (|User| autocmds, `ev.data` is a table):
+  `SlopTermOpen`  { id, name, owner }        a terminal job started
+  `SlopTermExit`  { id, name, owner, code }  a terminal job exited
+
+Terminal buffers have 'filetype' `slopterm` and `b:slop_term` = id.
+
+==============================================================================
+7. CORE PRIMITIVES                                             *slop-term-core*
+
+`require("slop.core.term")` is the reusable primitive (any module may use it):
+>lua
+  local core = require("slop.core.term")
+  local t = core.spawn({ cmd = { "lazygit" }, hidden = true, layout = "float",
+                         close_on_exit = true, hide_on_leave = true })
+  t:toggle()                 -- show / hide; the job keeps running
+  t:send({ "make test" })    -- bracketed paste for multi-line text
+  t:show({ layout = "split", enter = false })
+  t:kill()
+<
+spawn(spec) starts the job in a hidden buffer (`jobstart(cmd, {term = true})`)
+and returns the object (or nil, err). There is one window "slot" per layout
+per tabpage. Other functions: `show`, `hide`, `toggle`, `focus`, `send`,
+`kill`, `get(id|name)`, `list({hidden?, owner?})`, `last()`, `from_buf(buf)`,
+`encode(data, opts)`.
+
+`require("slop.core.ui.float")` opens every slop float: `open(opts)` returns a
+handle with `:close()`, `:update(opts)`, `:focus()`, `:is_valid()`; options
+include `width`/`height` sizes, `relative` = "editor" | "cursor" | "win" |
+"region", `title`, `footer`, `close_keys`, `close_on_leave`, `on_close`.
+
+ vim:tw=78:ts=8:ft=help:norl:
