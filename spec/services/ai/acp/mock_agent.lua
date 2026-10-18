@@ -56,6 +56,7 @@ local cancelled = {} -- sessionId -> true
 local turn_index = 0
 local sessions = 0
 local prompts = {} -- sessionId -> prompt text of the running turn
+local regions = {} -- sessionId -> first prompt text containing a <region> (for follow-up turns)
 
 local function resume(co, ...)
   local ok, err = coroutine.resume(co, ...)
@@ -127,6 +128,9 @@ local function run_turn(id, sid, actions)
       request(a.request.method, a.request.params)
     elseif a.replace_region then
       local region = region_of(prompts[sid] or "")
+      if not (prompts[sid] or ""):find("<region>", 1, true) then
+        region = region_of(regions[sid] or "")
+      end
       if a.replace_region == "upper" then
         region = region:upper()
       elseif a.replace_region == "lower" then
@@ -226,6 +230,9 @@ local function handle(msg)
       local sid = p.sessionId
       cancelled[sid] = nil
       prompts[sid] = text
+      if text:find("<region>", 1, true) then
+        regions[sid] = text
+      end
       local co = coroutine.create(run_turn)
       resume(co, msg.id, sid, actions)
     else
