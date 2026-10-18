@@ -85,4 +85,77 @@ describe("secrets v2", function()
     secrets.is_blocked("/p/a.lua")
     assert.equal(2, calls)
   end)
+
+  describe("with the cloak provider", function()
+    it("a query before cloak is loaded still applies cloak rules (capability lazy-load)", function()
+      local registry = require("slop.core.registry")
+      assert.is_false(registry.is_loaded("cloak"))
+      local out, n = secrets.redact_lines("/p/api.http", { "GET /x", "Authorization: Bearer abc.def" })
+      assert.is_true(registry.is_loaded("cloak"))
+      assert.are.same({ "GET /x", "Authorization: Bearer <redacted>" }, out)
+      assert.equal(1, n)
+    end)
+
+    it("block = true rules and core globs block whole files", function()
+      assert.is_true(secrets.is_blocked("/p/.nvim/state/rest/cookies.txt"))
+      assert.is_true(secrets.is_blocked("/home/u/.netrc"))
+      assert.is_true(secrets.is_blocked("/home/u/.aws/credentials"))
+      assert.is_false(secrets.is_blocked("/p/api.http"))
+      assert.is_false(secrets.is_blocked("/p/http-client.env.json"))
+    end)
+
+    it("redact_diff redacts cloak spans of non-blocked files", function()
+      local diff = table.concat({
+        "diff --git a/api.http b/api.http",
+        "--- a/api.http",
+        "+++ b/api.http",
+        "@@ -1,2 +1,2 @@",
+        " GET https://x",
+        "-Authorization: Bearer old",
+        "+Authorization: Bearer new",
+        "diff --git a/.nvim/state/rest/cookies.txt b/.nvim/state/rest/cookies.txt",
+        "@@ -1 +1 @@",
+        "+x\tsid\tabc",
+      }, "\n")
+      local out = secrets.redact_diff(diff)
+      assert.truthy(out:find("+Authorization: Bearer <redacted>", 1, true))
+      assert.truthy(out:find("-Authorization: Bearer <redacted>", 1, true))
+      assert.truthy(out:find("[slop: diff of .nvim/state/rest/cookies.txt omitted]", 1, true))
+      assert.falsy(out:find("sid", 1, true))
+    end)
+
+    it("display toggles never disable redaction; is_cloaked follows text", function()
+      require("slop").cloak.disable()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.b[buf].slop_secret_path = "/p/api.http"
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "GET /x", "Cookie: sid=1" })
+      assert.is_true(secrets.is_cloaked(buf))
+      assert.is_true(secrets.is_cloaked(buf, { 1, 8, 1, 10 }))
+      assert.is_false(secrets.is_cloaked(buf, { 0, 0, 0, 6 }))
+      assert.is_false(secrets.is_cloaked(buf, { 1, 0, 1, 7 }), "header name is not secret")
+      assert.equal("GET /x\nCookie: <redacted>", (secrets.redact_text("GET /x\nCookie: sid=1", buf)))
+    end)
+
+    it("user rules (cloak.patterns) and add_rules() feed redaction", function()
+      require("slop").setup({
+        cloak = { patterns = { { file_pattern = "*.yaml", cloak_pattern = "(password: ).+", replace = "%1" } } },
+      })
+      assert.are.same({ "password: <redacted>" }, (secrets.redact_lines("/p/a.yaml", { "password: x" })))
+      assert.are.same({ "A=1" }, (secrets.redact_lines("/p/x.envish", { "A=1" })))
+      require("slop").cloak.add_rules(
+        "mine",
+        { { file_pattern = "*.ini", cloak_pattern = "(key=).+", replace = "%1" } }
+      )
+      assert.are.same({ "key=<redacted>" }, (secrets.redact_lines("/p/a.ini", { "key=v" })))
+      require("slop").cloak.remove_rules("mine")
+      assert.are.same({ "key=v" }, (secrets.redact_lines("/p/a.ini", { "key=v" })))
+    end)
+
+    it("cloak disabled in config -> no cloak provider (core block list still applies)", function()
+      require("slop").setup({ cloak = { enabled = false } })
+      assert.are.same({ "Cookie: sid=1" }, (secrets.redact_lines("/p/api.http", { "Cookie: sid=1" })))
+      assert.is_true(secrets.is_blocked("/p/.env"))
+      assert.is_false(require("slop.core.registry").is_loaded("cloak"))
+    end)
+  end)
 end)
