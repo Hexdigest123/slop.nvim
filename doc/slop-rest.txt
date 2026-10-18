@@ -1,0 +1,307 @@
+*slop-rest.txt*  HTTP client for .http files across the project (slop.nvim)
+
+==============================================================================
+CONTENTS                                                   *slop-rest-contents*
+
+  1. Introduction ............................ |slop-rest-intro|
+  2. Keymaps ................................. |slop-rest-keymaps|
+  3. Commands ................................ |slop-rest-commands|
+  4. Syntax .................................. |slop-rest-syntax|
+  5. Variables and environments .............. |slop-rest-variables|
+  6. Chaining and cookies .................... |slop-rest-chaining|
+  7. Result view ............................. |slop-rest-result|
+  8. AI: generate and fix .................... |slop-rest-ai|
+  9. Configuration ........................... |slop-rest-config|
+ 10. Lua API ................................. |slop-rest-api|
+ 11. Highlights and events ................... |slop-rest-highlights|
+ 12. Core primitives: picker and scratch ..... |slop-rest-core|
+
+==============================================================================
+1. INTRODUCTION                                               *slop-rest-intro*
+
+The `rest` module replaces rest.nvim with something much smaller:
+
+- every `*.http` / `*.rest` file under the project root (|slop-project|) is
+  found, including gitignored ones such as a personal `requests.http`;
+- one picker runs any request in the repo, recent requests first;
+- `<CR>` runs the request under the cursor in `.http` buffers;
+- requests can depend on each other (`# @depends`, `{{login.response...}}`)
+  and missing dependencies run first;
+- a per-project curl cookie jar keeps sessions;
+- an unresolved `{{variable}}` never gets sent: the request is blocked and the
+  error names the variable;
+- the response opens in a reused vsplit with the body in its real filetype,
+  pretty-printed, status/time/size in the winbar and `H` for the headers;
+- AI can generate requests (from a description, a route handler or an OpenAPI
+  file) and fix a failed one, previewed as an inline diff.
+
+Requirements: `curl` 7.75+. Optional: `jq` (JSON formatting that keeps key
+order), `xmllint` (XML formatting), fzf-lua (picker with preview).
+
+The module loads on the first `http` buffer, a rest key or `:Slop rest`.
+
+==============================================================================
+2. KEYMAPS                                                  *slop-rest-keymaps*
+
+Defaults (set any of them to `false` under `rest.keymaps` to disable):
+
+  Mode  Key           Name          Action ~
+  n     `<leader>rr`    run           request under the cursor in `.http`
+                                    buffers, else the picker
+  n     `<leader>rp`    pick          picker over every request in the repo
+  n     `<leader>rl`    last          re-read the file and rerun the last request
+  n     `<leader>re`    env           pick the env (http-client.env.json)
+  n     `<leader>ra`    gen           AI: generate requests |slop-rest-ai|
+  n     `<leader>rx`    fix           AI: fix the last failed request
+  n     `<CR>`          run_cursor    (`http` buffers) run the request under
+                                    the cursor
+  n     `H`             headers       (result buffer) toggle response headers
+  n     `q`             close         (result buffer) close the result window
+  n     `r`             rerun         (result buffer) rerun the shown request
+
+`<leader>rn` is deliberately not used (LSP rename). Every key is also
+available as `<Plug>(slop-rest-<name>)`.
+
+Picker keys: `<CR>` runs, `<C-e>` jumps to the request, `<C-v>` opens it in
+a vsplit. See |slop-rest-picker| for the builtin picker keys.
+
+==============================================================================
+3. COMMANDS                                                *slop-rest-commands*
+
+:Slop rest [pick]                 Picker over every request (default).
+:Slop rest run [name]             Run a request by `@name` (completed), else
+                                  the request under the cursor / the picker.
+:Slop rest last                   Rerun the last request (re-read from disk).
+:Slop rest env [name|none]        Select the env; no argument opens a picker.
+:Slop rest cookies [clear]        Open or clear the project cookie jar.
+:Slop rest refresh                Re-scan the project for `.http` files.
+:Slop rest cancel                 Cancel the request in flight.
+:Slop rest open                   Show the last result again.
+:[range]Slop rest gen [desc|code|openapi [path]] [text]
+                                  AI-generate requests |slop-rest-ai|.
+:Slop rest fix                    AI-fix the last failed request.
+
+==============================================================================
+4. SYNTAX                                                     *slop-rest-syntax*
+
+A JetBrains / VS Code compatible subset: >http
+
+    @baseUrl = http://localhost:3000/api
+
+    ### Authenticate
+    # @name login
+    POST {{baseUrl}}/users/auth
+    Content-Type: application/json
+
+    { "email": "ann@example.com", "password": "{{PASSWORD}}" }
+
+    ### Current user
+    # @name me
+    GET {{baseUrl}}/sessions/me
+    Authorization: Bearer {{login.response.body.$.token}}
+<
+Supported:
+
+- `###` separates requests; the rest of the line is the title (shown in the
+  picker, and the request name when there is no `@name`).
+- Directives in `#` or `//` comments before (or among) the headers:
+    `# @name x`              name used for chaining and `:Slop rest run x`
+    `# @depends a, b`        run `a` and `b` first when they have no response
+    `# @prompt var [desc]`   ask for `{{var}}` before sending
+    `# @no-cookie-jar`       do not use the cookie jar
+    `# @no-redirect`         do not follow redirects
+    `# @timeout 10s`         per-request timeout (`500ms`, `2m`, plain seconds)
+- File variables `@name = value` (outside bodies).
+- Request line `METHOD url [HTTP/1.1|HTTP/2|HTTP/3]`; a bare `https://...` or
+  `{{...}}` line means GET. Indented continuation lines starting with `/ ? & #`
+  are appended to the URL.
+- `Name: value` headers (order and duplicates kept), then a blank line, then
+  the body (until the next `###`; trailing blank lines are dropped).
+- Body lines `< ./file` splice a file in raw (path relative to the `.http`
+  file, no variable expansion).
+- `Authorization: Basic user:pass` (or `user pass`) is base64-encoded.
+- The body is sent as written: nothing blocks sending because of JSON syntax.
+  Parser warnings are shown as diagnostics.
+
+Not supported (ignored with a warning): `> {% %}` / `< {% %}` script blocks,
+`>> file` redirects, GraphQL and multipart helpers.
+
+==============================================================================
+5. VARIABLES AND ENVIRONMENTS                            *slop-rest-variables*
+
+`{{name}}` is resolved at run time, highest precedence first:
+
+  1. `@prompt` answers (the last answer is offered as the default)
+  2. file variables: the last declaration above the request, else the first
+     one below; values may reference other variables
+  3. the selected env from `http-client.env.json` and
+     `http-client.private.env.json` (JetBrains format, `$shared` included);
+     files are looked up from the `.http` file's directory up to the root and
+     the closest file wins
+  4. the nearest `.env` (option `env_file`) from the `.http` file up to the
+     root
+  5. the process environment (option `process_env`)
+
+Dynamic variables:
+  `{{$uuid}}` `{{$random.uuid}}`     random v4 UUID
+  `{{$timestamp}}`                  unix seconds
+  `{{$isoTimestamp}}`               UTC ISO 8601
+  `{{$randomInt [min max]}}`        integer (default 0..1000)
+  `{{$processEnv NAME}}`            process environment variable
+  `{{$dotenv NAME}}`                value from the nearest `.env`
+  plus your own: `dynamic = { name = function(args) return "..." end }`.
+
+Unresolved variables BLOCK the request: nothing is sent, an error such as
+"unresolved variables: {{token}}, {{userId}}" is shown and the request line
+gets a diagnostic.
+
+The env selection is per project and persisted. Without a selection, `dev` is
+used when it exists. `.env` values are never sent to AI.
+
+==============================================================================
+6. CHAINING AND COOKIES                                    *slop-rest-chaining*
+
+Reference another request's last response:
+  `{{login.response.body.$.token}}`      JSONPath-lite: `.key`, `['key']`, `[0]`
+  `{{login.response.body.*}}`            the raw body
+  `{{login.response.headers.Location}}`  a response header (case-insensitive)
+
+Dependencies are the `# @depends` list plus every request referenced this way
+(also through file variables). When you run a request, dependencies without a
+stored response run first, in topological order; cycles are reported
+("dependency cycle: a -> b -> a") and nothing is sent. Names are looked up in
+the same file first, then anywhere under the root. Responses are kept in
+memory only (per Neovim session).
+
+Cookies: curl's own jar at `<root>/.nvim/state/rest/cookies.txt` (`-b`/`-c`),
+unless `cookies = false` or `# @no-cookie-jar`. When a request sets `Cookie:`
+itself, the jar is only written to. The state folder is gitignored
+automatically (|slop-project|).
+
+Each request is ONE curl process: body on stdin (never in argv), `--globoff`,
+headers and body to temp files, status and timings from `-w '%{json}'`.
+
+==============================================================================
+7. RESULT VIEW                                               *slop-rest-result*
+
+The result buffer `slop://rest/result` is reused (a window already showing it
+is reused too). It holds only the body, with a filetype from Content-Type
+(json, xml, html, javascript, css, yaml, else text), pretty-printed with `jq`
+or `vim.json` (sorted keys) for JSON and `xmllint` for XML. Bodies over 1 MiB
+are not formatted; binary bodies are summarised.
+
+The winbar shows `✓ 200 OK · POST /users · 43 ms · 1.2 KiB · [env]`, or the
+curl error. `H` shows the status line and headers above the body, `r` reruns,
+`q` closes. Focus stays in the source window unless `result.focus = true`.
+
+==============================================================================
+8. AI: GENERATE AND FIX                                          *slop-rest-ai*
+
+`<leader>ra` / `:Slop rest gen` picks its input from where you are:
+- in an `.http` buffer: asks for a description;
+- in an OpenAPI / Swagger file: sends the spec (truncated to 60 KB);
+- in other code: the enclosing function (treesitter) or the `:range`, plus a
+  route hint derived from the path (SvelteKit `+server.ts`, Next.js `route.ts`
+  and `pages/api`).
+Force a mode with `:Slop rest gen desc|code|openapi [path] [text]`.
+
+`<leader>rx` / `:Slop rest fix` sends the failed request block, the parser
+warnings, the error or status, the response headers and the first 4 KiB of
+the body, and replaces the block.
+
+The answer is parsed; when it contains no request, it is shown raw in a split.
+Otherwise it is previewed with the inline diff (|slop-edit| keys: `ga`/`gr`
+hunk, `gA`/`gR` all) in the current `.http` buffer, else in
+`<root>/requests.http` (option `ai.target`).
+
+Backend: `ai.backend = "chat"` (default) uses the chat provider
+`ai.provider` (default `mistral_chat`); `"acp"` uses the ACP agent `ai.agent`
+(read-only permissions).
+
+Privacy: every text goes through |slop-secrets| (blocked files such as `.env*`
+are refused), and values of Authorization / Cookie / token / secret /
+password / key headers, JSON fields and file variables are replaced by
+`<redacted>`. Env files contribute variable NAMES only; `.env` values are
+never sent.
+
+==============================================================================
+9. CONFIGURATION                                             *slop-rest-config*
+
+Defaults: >lua
+
+  rest = {
+    enabled = true,
+    ai = { backend = "chat", provider = "mistral_chat", agent = "vibe",
+           target = "requests.http" },
+    env_file = ".env",          -- nearest file feeds {{VAR}}; false disables
+    process_env = true,         -- plain {{VAR}} falls back to the environment
+    cookies = true,             -- per-project curl cookie jar
+    follow_redirects = true,
+    insecure = false,           -- curl -k
+    timeout = 30000,            -- ms; per request: # @timeout
+    extensions = { "http", "rest" },
+    skip = {},                  -- extra directory names to skip
+    headers = {},               -- default headers when a request lacks them
+    dynamic = {},               -- { name = function(args) ... end }
+    result = { layout = "vsplit", format = true, focus = false, size = 0.5 },
+    keymaps = { run = "<leader>rr", pick = "<leader>rp", last = "<leader>rl",
+                env = "<leader>re", gen = "<leader>ra", fix = "<leader>rx",
+                run_cursor = "<CR>", headers = "H", close = "q", rerun = "r" },
+  }
+<
+`result.layout`: "vsplit" | "split" | "float" | "tab" | "current". Discovery
+always skips `.git node_modules vendor target dist build .venv venv
+.svelte-kit .next __pycache__ .cache .nvim`. `.gitignore` is NOT honoured.
+
+==============================================================================
+10. LUA API                                                     *slop-rest-api*
+
+`local rest = require("slop").rest`
+
+rest.run({name})        run by name, else under the cursor / picker
+rest.run_cursor()       run the request under the cursor
+rest.pick()             open the request picker
+rest.last()             rerun the last request
+rest.env({name})        select an env ("none" clears), no name: picker
+rest.current_env()      selected env name or nil
+rest.cancel()           cancel the request in flight
+rest.gen({opts})        `{ mode?, text?, path?, range? }`
+rest.fix()              AI-fix the last failed request
+rest.requests({root})   every parsed request under the root
+rest.parse({lines}, {file})  parse text (pure)
+rest.status()           "rest[env]" for statuslines, or ""
+
+==============================================================================
+11. HIGHLIGHTS AND EVENTS                                *slop-rest-highlights*
+
+Highlights (all `default = true` links):
+  SlopRestOk  SlopRestWarn  SlopRestError  SlopRestRunning  SlopRestMethod
+  SlopRestFile  SlopRestStatus  SlopRestHeaderName  SlopRestHeaderValue
+
+Events (|User| autocmds, data in `ev.data`):
+  `User SlopRestRequest`   { id, name, method }
+  `User SlopRestResponse`  { id, name, status, time_ms, ok }
+
+==============================================================================
+12. CORE PRIMITIVES: PICKER AND SCRATCH                        *slop-rest-core*
+
+                                                            *slop-rest-picker*
+`require("slop.core.ui.picker").pick(items, opts)` is the shared picker.
+Backend from `ui.picker`: "auto" (fzf-lua when installed, else builtin),
+"fzf", "builtin", "select" (|vim.ui.select|). Options: `prompt`, `title`,
+`format(item)` (string or `{ {text, hl}, ... }`), `preview(item)` (`{ lines,
+filetype }` or `{ path, lnum }`), `actions` (`{ ["<C-v>"] = "vsplit" }`),
+`multi`, `initial`, `on_select(item_or_nil, action)` (called exactly once).
+`items` may be a function `fun(cb)` that delivers the list later.
+
+Builtin picker keys (prompt, insert and normal mode): `<C-n>`/`<Down>`,
+`<C-p>`/`<Up>` move, `<CR>` select, `<Esc>`/`<C-c>` (and `q` in normal mode)
+cancel, `<C-d>`/`<C-u>` scroll the preview, `<C-Space>` marks (multi).
+
+`require("slop.core.ui.scratch")` manages named scratch buffers
+(`slop://<name>`): `get(name, opts)`, `find(name)`, `open(name, opts)` (layout
+vsplit/split/float/tab/current, reuses a window showing it, focus stays put
+unless `enter`), `win(name)`, `set_lines(buf, lines)`, `set_winbar(buf,
+text)` (re-applied to windows opened later), `close(name)`, `delete(name)`.
+
+ vim:tw=78:ts=8:ft=help:norl:

@@ -319,6 +319,19 @@ describe("rest module", function()
     assert.equal(6, vim.api.nvim_win_get_cursor(0)[1])
   end)
 
+  it("works with the real builtin picker (filter + <CR> runs)", function()
+    require("slop").setup({ ui = { picker = "builtin" } })
+    http_file("p.http", ("### Alpha\nGET %s/me\n### Beta login\nPOST %s/login\n\n{}"):format(srv.url, srv.url))
+    rest.pick()
+    local prompt = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(prompt, 0, -1, false, { "beta" })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = prompt })
+    run_and_wait(function()
+      h.feed("<CR>")
+    end)
+    assert.equal("/login", srv.requests[1].path)
+  end)
+
   it("<leader>rr outside http buffers opens the picker; keymaps never use <leader>rn", function()
     local called = false
     package.loaded["slop.core.ui.picker"] = {
