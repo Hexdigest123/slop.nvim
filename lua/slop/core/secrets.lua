@@ -27,18 +27,22 @@ local M = {}
 ---@field block? string[]                     extra file globs never sent to AI
 ---@field match_path? fun(path: string): boolean  provider applies to this path (default: all paths)
 ---@field spans? fun(path: string, lines: string[], first_row: integer): slop.secrets.Span[]  pure, text-based
+---@field display? boolean                    also mask this provider's spans on screen (cloak renders them)
 
 local providers = {} ---@type table<string, slop.secrets.Provider>
 local order = {} ---@type string[]
 local glob_cache = {} ---@type table<string, vim.lpeg.Pattern|false>
 local ensuring = false
+local ensured = false -- load_capability ran for the current config generation
 
 local function cfg()
   return require("slop.config").get("secrets")
 end
 
+--- Load secret providers (cloak) once per config generation. A later `setup()` (User SlopConfigChanged)
+--- may enable a provider, so the flag is reset then.
 local function ensure()
-  if ensuring or vim.in_fast_event() then
+  if ensured or ensuring or vim.in_fast_event() then
     return
   end
   ensuring = true
@@ -46,6 +50,16 @@ local function ensure()
     require("slop.core.registry").load_capability("secrets")
   end)
   ensuring = false
+  ensured = true
+  pcall(vim.api.nvim_create_autocmd, "User", {
+    group = vim.api.nvim_create_augroup("slop.secrets", { clear = true }),
+    pattern = "SlopConfigChanged",
+    once = true,
+    desc = "slop: re-check secret providers after setup()",
+    callback = function()
+      ensured = false
+    end,
+  })
 end
 
 --- Placeholder the AI sees instead of a secret.
@@ -177,8 +191,9 @@ local PEM_END = "^%s*%-%-%-%-%-END [%u%d ]*PRIVATE KEY%-%-%-%-%-"
 ---@param path string?
 ---@param lines string[]
 ---@param first_row integer
+---@param display_only? boolean  only providers with display = true, no built-in rule
 ---@return table<integer, {[1]: integer, [2]: integer}[]>
-local function collect(path, lines, first_row)
+local function collect(path, lines, first_row, display_only)
   local by_row = {}
   local function add(i, s, e)
     if e > s then
@@ -187,7 +202,7 @@ local function collect(path, lines, first_row)
     end
   end
   local in_pem = false
-  for i, l in ipairs(lines) do
+  for i, l in ipairs(display_only and {} or lines) do
     if l:match(PEM_BEGIN) then
       in_pem = true
     elseif l:match(PEM_END) then
@@ -197,7 +212,11 @@ local function collect(path, lines, first_row)
     end
   end
   for _, p in ipairs(M.providers()) do
-    if p.spans and (not p.match_path or (path and p.match_path(path))) then
+    if
+      p.spans
+      and (not display_only or p.display)
+      and (not p.match_path or (path and path ~= "" and p.match_path(path)))
+    then
       local ok, spans = pcall(p.spans, path or "", lines, first_row)
       if ok and type(spans) == "table" then
         for _, s in ipairs(spans) do
@@ -220,6 +239,28 @@ local function merge(spans)
       last[2] = math.max(last[2], s[2])
     else
       out[#out + 1] = { s[1], s[2] }
+    end
+  end
+  return out
+end
+
+--- All secret spans of `lines` (built-in PEM rule + every provider whose match_path accepts the source),
+--- merged per row and sorted. Rows are absolute (`first_row` + index). Blocked sources are not special-cased.
+---@param src string|integer|nil  path or buffer (effective path)
+---@param lines string[]
+---@param first_row? integer  0-based row of lines[1] (default 0)
+---@param opts? {display?: boolean}  display = only providers with `display = true` (no PEM rule)
+---@return slop.secrets.Span[]
+function M.spans(src, lines, first_row, opts)
+  ensure()
+  first_row = first_row or 0
+  local by_row = collect(to_path(src), lines, first_row, opts and opts.display)
+  local rows = vim.tbl_keys(by_row)
+  table.sort(rows)
+  local out = {}
+  for _, i in ipairs(rows) do
+    for _, s in ipairs(merge(by_row[i])) do
+      out[#out + 1] = { row = first_row + i - 1, col = s[1], end_col = s[2] }
     end
   end
   return out
