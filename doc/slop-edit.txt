@@ -1,0 +1,319 @@
+*slop-edit.txt*  AI edits of a region through an ACP agent, reviewed as an inline diff
+
+==============================================================================
+CONTENTS                                                   *slop-edit-contents*
+
+  1. Introduction ............................ |slop-edit-intro|
+  2. Workflow ................................ |slop-edit-workflow|
+  3. Keymaps ................................. |slop-edit-keymaps|
+  4. Commands ................................ |slop-edit-commands|
+  5. Presets ................................. |slop-edit-presets|
+  6. Context: rules and @file ................ |slop-edit-context|
+  7. Agents and the protocol ................. |slop-edit-agents|
+  8. Configuration ........................... |slop-edit-config|
+  9. Lua API ................................. |slop-edit-api|
+ 10. Highlights and events ................... |slop-edit-highlights|
+ 11. Core primitives (diff, input, spinner) .. |slop-edit-core|
+ 12. ACP client (services.ai.acp) ............ |slop-edit-acp|
+
+==============================================================================
+1. INTRODUCTION                                               *slop-edit-intro*
+
+The `edit` module sends a region of a buffer plus an instruction to an ACP
+agent (Agent Client Protocol: vibe, opencode, claude, ...) and shows the
+answer as an inline diff you accept or reject hunk by hunk.
+
+- The region is the visual selection, or (normal mode) the enclosing
+  treesitter function/class (fallback: 50 lines around the cursor).
+- The agent may READ files and search the project; it may not edit, delete,
+  move files or run commands. It answers with the replacement text and slop
+  applies it to your buffer (undoable in one step).
+- Requests run concurrently; each one shows its progress in the buffer and
+  can be cancelled on its own.
+- Everything sent to the agent passes through |slop-secrets|: blocked files
+  are never sent and secret values are replaced by `<redacted>`.
+
+==============================================================================
+2. WORKFLOW                                                *slop-edit-workflow*
+
+1. Select a region (or put the cursor in a function) and press `<leader>aa`.
+2. A prompt float opens next to the region. Type the instruction:
+     `<C-s>` (insert/normal) or `<CR>` (normal) submits,
+     `<Esc>` / `q` (normal) or `<C-c>` cancels, `<Up>`/`<Down>` (normal) walk
+     the prompt history. `#preset` and `@file` complete as you type
+     (also `<C-x><C-u>`).
+3. While the agent works the region is dimmed and a status line above it
+   shows a spinner, the agent's latest activity ("Read foo.lua", "thinking",
+   "writing") and the elapsed time. The statusline shows the native progress
+   message (|progress-message|) and the busy flag.
+4. The answer is applied as an inline diff: changed lines are real text
+   highlighted with `SlopDiffAdd`, the removed lines are shown above them as
+   virtual lines (`SlopDiffDelete`). Review with:
+     `ga` accept the hunk under the cursor     `gr` reject it
+     `gA` accept all hunks                     `gR` reject all
+     `]h` / `[h` next / previous hunk          `<C-r>` refine
+   The whole review is one undo step: `u` after accepting restores the
+   original text. Rejecting everything right away leaves the buffer exactly
+   as it was (not even 'modified'). The diff keys only exist while a diff is
+   shown and fall through to their normal meaning outside a hunk.
+5. `<C-r>` (refine) asks for changes in the same agent session: the shown
+   diff is withdrawn and the agent's new answer is shown instead.
+
+Conflict guard: if you change the region while the request is running, the
+answer is diffed against the current text, a warning line is shown and the
+diff is never applied automatically (even with `apply = "auto"`). If the
+region was deleted the answer goes to a scratch buffer instead.
+
+==============================================================================
+3. KEYMAPS                                                  *slop-edit-keymaps*
+
+Defaults (set any of them to `false` under `edit.keymaps` to disable):
+
+  Mode  Key           Name       Action ~
+  n x   `<leader>aa`    edit       prompt for an instruction and edit the region
+  n x   `<leader>ap`    preset     pick a preset and run it on the region
+  n     `<leader>ag`    agent      pick the agent for new requests
+  n     `<leader>as`    cancel     cancel the request under the cursor (or the
+                                 only running one, or pick one)
+
+Diff review keys live under `edit.keymaps.diff` (buffer-local while a diff is
+shown): `accept = "ga"`, `reject = "gr"`, `accept_all = "gA"`,
+`reject_all = "gR"`, `next = "]h"`, `prev = "[h"`, `refine = "<C-r>"`.
+
+<Plug> mappings: `<Plug>(slop-edit-edit)`, `<Plug>(slop-edit-preset)`,
+`<Plug>(slop-edit-agent)`, `<Plug>(slop-edit-cancel)`.
+
+==============================================================================
+4. COMMANDS                                                *slop-edit-commands*
+
+:[range]Slop edit [run] [instruction]                         *:Slop-edit*
+    Edit the [range] (whole lines), else the scope at the cursor. Without an
+    instruction the prompt float opens. `run` is the default subcommand, so
+    `:'<,'>Slop edit make this faster` works.
+
+:[range]Slop edit preset [name]
+    Run a preset (picker without a name).
+
+:Slop edit agent [name]
+    Switch the agent used by new requests for this session (picker without a
+    name). The configured default is `edit.agent`.
+
+:Slop edit cancel [all]
+    Cancel the request under the cursor / the only one / pick one, or all.
+
+:Slop edit list
+    List running and in-review requests.
+
+==============================================================================
+5. PRESETS                                                  *slop-edit-presets*
+
+Start the instruction with `#name` (completed in the prompt) or use
+`<leader>ap`. Built-in presets:
+
+  `explain`    explain the code; the answer opens in a float (nothing changes)
+  `fix`        fix the diagnostics of the region (they are sent along)
+  `docs`       add documentation comments
+  `tests`      write tests; the code opens in a scratch buffer
+               (`slop://edit/tests-N`) with the buffer's filetype
+  `refactor`   refactor for readability
+  `optimize`   optimize for performance
+
+Text after `#name` is added as extra instructions. Presets are data; add or
+override them in `edit.presets` (`false` removes one): >lua
+    edit = {
+      presets = {
+        explain = false,
+        types = { desc = "Add type annotations", prompt = "Add type annotations." },
+        review = { desc = "Review", prompt = "Review this code.", sink = "float",
+                   agent = "claude" },
+        rename = { desc = "Rename", prompt = "Rename as asked.", input = true },
+      },
+    }
+<
+Fields: `desc`, `prompt` (the instruction), `sink` (`"diff"` default,
+`"float"`, `"scratch"`), `diagnostics` (send the region's diagnostics),
+`input` (open the prompt prefilled with `#name` for extra text), `agent`.
+
+==============================================================================
+6. CONTEXT: RULES AND @FILE                                 *slop-edit-context*
+
+Each request contains: the file path and filetype, the region (exactly once),
+`edit.surrounding` lines (default 50) before and after it, the project rules
+files and the files you mention.
+
+Rules files: every existing file of `edit.rules_files` under the project root
+(default `.nvim/rules.md`, `AGENTS.md`, `CLAUDE.md`) is included.
+
+@file: `@path/to/file` in the instruction attaches that file (relative to the
+project root, or absolute). The live buffer content is used when the file is
+loaded; files over 100 KiB are truncated; blocked files (|slop-secrets|) are
+skipped with a warning. Agents that support embedded context receive the
+files as `resource` blocks, others inline.
+
+The region itself is refused when it contains secrets (the replacement would
+overwrite the real values with placeholders), and blocked buffers are never
+sent.
+
+==============================================================================
+7. AGENTS AND THE PROTOCOL                                   *slop-edit-agents*
+
+Agents are configured in `ai.agents` (|slop-config|); the shipped ones are: >lua
+    ai = { agents = {
+      vibe     = { cmd = { "vibe-acp" } },
+      opencode = { cmd = { "opencode", "acp" } },
+      claude   = { cmd = { "claude-agent-acp" } },
+    } }
+<
+Optional per-agent fields: `env` (added to the inherited environment),
+`auth_method` (an ACP auth method id sent with `authenticate`), `timeout`
+(ms, default request timeout, 30000), `init_timeout` (ms, 60000).
+
+One agent process per agent name is started on first use and kept running;
+each request gets its own session (`session/new`), so requests are independent
+and run concurrently. The process (its whole process group) is stopped when
+Neovim exits.
+
+Replacement-text protocol:
+- slop advertises only the `fs.readTextFile` client capability. Reads are
+  served from loaded buffers (unsaved text) or disk, redacted, and refused for
+  blocked files.
+- The prompt asks for exactly one `<slop:replacement>...</slop:replacement>`
+  block containing the new region text.
+- Permission requests: `read`, `search`, `fetch`, `think` tools are allowed;
+  `edit`, `delete`, `move`, `execute` and anything else are rejected, always
+  with the agent's own option id. Configure with `edit.permissions.allow`.
+- Fallbacks when the agent ignores the protocol: the diff of a rejected edit
+  of this file, then the last fenced code block, else an error and the raw
+  answer in a scratch buffer.
+- The replacement is validated: CRLF removed, a trailing newline of whole-line
+  regions dropped, the base indentation restored if the agent dropped it,
+  answers containing `<redacted>` (or nested tags) refused.
+
+Agents that write files themselves without asking (e.g. a "bypass
+permissions" mode) cannot be stopped by slop; slop warns when it sees such an
+edit of the buffer's file. Configure your agent to ask for permissions.
+
+==============================================================================
+8. CONFIGURATION                                              *slop-edit-config*
+
+Defaults: >lua
+    edit = {
+      enabled = true,
+      agent = "vibe",         -- default agent (a key of ai.agents)
+      apply = "diff",         -- "diff": review | "auto": accept all at once
+      context = "scope",      -- normal mode region: "scope" | "line"
+      surrounding = 50,       -- context lines before/after the region
+      presets = {},           -- see |slop-edit-presets|
+      rules_files = { ".nvim/rules.md", "AGENTS.md", "CLAUDE.md" },
+      permissions = { allow = { "read", "search", "fetch", "think" } },
+      keymaps = {
+        edit = "<leader>aa", preset = "<leader>ap", agent = "<leader>ag",
+        cancel = "<leader>as",
+        diff = { accept = "ga", reject = "gr", accept_all = "gA",
+                 reject_all = "gR", next = "]h", prev = "[h",
+                 refine = "<C-r>" },
+      },
+    }
+<
+==============================================================================
+9. LUA API                                                       *slop-edit-api*
+
+`local edit = require("slop").edit`
+
+edit.start({opts})                                          *slop-edit.start()*
+    Start a request. {opts}: `buf`, `range` (0-based charwise
+    `{srow, scol, erow, ecol}`, end exclusive), `lines` (0-based inclusive
+    `{first, last}`), `instruction` (skips the prompt float), `preset`,
+    `agent`. Returns the request id when started synchronously.
+
+edit.preset({name}, {opts})                                *slop-edit.preset()*
+    Run a preset (picker when {name} is nil).
+
+edit.agent({name})                                          *slop-edit.agent()*
+    Set the agent for new requests; returns the current one.
+
+edit.cancel({target})                                      *slop-edit.cancel()*
+    {target}: request id, `"all"`, or nil (under cursor / only one / picker).
+
+edit.requests()                                          *slop-edit.requests()*
+    `{ id, buf, agent, state, instruction }[]` of running/in-review requests.
+
+edit.presets()                                            *slop-edit.presets()*
+    Effective presets.
+
+==============================================================================
+10. HIGHLIGHTS AND EVENTS                                *slop-edit-highlights*
+
+  `SlopEditRegion`    in-flight region (-> `SlopDim`)
+  `SlopEditStatus`    status virt_lines (-> `Comment`)
+  `SlopEditSpinner`   spinner (-> `SlopSpinner`)
+  `SlopEditError`     error line (-> `DiagnosticError`)
+  `SlopDiffAdd`, `SlopDiffDelete`, `SlopDiffHint`, `SlopDiffTitle`,
+  `SlopDiffWarn`      inline diff (|slop-edit-diff|)
+  `SlopInputToken`    `#preset` / `@file` tokens in the prompt (-> `SlopMatch`)
+
+Events (|User| autocmds):
+  `SlopEditStart`  data `{ id, buf, agent }`
+  `SlopEditDone`   data `{ id, buf, result }`, result = `"accepted"` |
+                   `"rejected"` | `"partial"` | `"unchanged"` | `"cancelled"` |
+                   `"failed"` | `"explained"` | `"scratch"`
+
+==============================================================================
+11. CORE PRIMITIVES                                            *slop-edit-core*
+
+These are shared with other modules (rest uses the diff for AI gen/fix).
+
+                                                              *slop-edit-diff*
+`require("slop.core.ui.diff")`
+  show({buf}, {range}, {new_lines}, {opts}) -> handle
+      Applied preview of replacing rows `[range[1], range[2])` (0-based,
+      end-exclusive; equal = insertion) of any buffer. {opts}: `keymaps`,
+      `on_refine(handle)`, `on_done(result, handle)`, `conflict`, `title`,
+      `hints` (default true), `jump` (default false).
+  handle: `:hunks()`, `:accept(i?)`, `:reject(i?)`, `:accept_all()`,
+      `:reject_all()`, `:next()`, `:prev()`, `:close()` (rejects pending),
+      `:is_active()`, `:range()`, `:hunk_at(row)`.
+  compute({old}, {new}) -> hunks (pure)   list({buf})   close_all({buf}?)
+
+                                                             *slop-edit-input*
+`require("slop.core.ui.input")`
+  open({opts}) -> `{ buf, win, close(), text(), set_text() }`
+      {opts}: `on_submit(text)`, `on_cancel()`, `title`, `default`, `anchor`
+      (`{buf, row, end_row?, col?}`), `width`, `height`, `filetype`
+      ("slopprompt"), `history` (key), `complete(lead, line)`, `triggers`
+      (`{"#", "@"}`), `footer`. Exactly one of on_submit/on_cancel runs.
+  history({key}) -> entries, newest first
+      (stored in `<root>/.nvim/state/ui/input_history.json`).
+
+                                                           *slop-edit-spinner*
+`require("slop.core.ui.spinner")`
+  new({ style?, interval? (80), on_tick(frame) }) -> `:start() :stop()
+      :frame() :is_running()`; styles: dots (default, `ui.spinner`), line,
+      arc, circle, bounce, moon.
+  progress({ title?, message?, source? ("slop"), on_cancel? }) ->
+      `:update(msg, percent?) :finish(status?, msg?)` (native progress
+      messages; a UI "cancel" request calls on_cancel).
+
+==============================================================================
+12. ACP CLIENT                                                  *slop-edit-acp*
+
+`require("slop.services.ai.acp")` — a minimal ACP v1 client (NDJSON JSON-RPC
+over stdio) usable by any module:
+>lua
+    local acp = require("slop.services.ai.acp")
+    acp.client("vibe"):new_session({ cwd = root }, function(session, err)
+      session:prompt({ acp.text("hello") }, {
+        on_update = function(u) end,         -- raw session/update payloads
+        on_permission = function(req, respond) respond(acp.decide(req)) end,
+        on_done = function(stop_reason, err) session:close() end,
+      })
+    end)
+<
+Also: `acp.get(name)`, `acp.clients()`, `acp.stop_all()`,
+`acp.decide(req, policy?)`, `acp.read_text_file(params)`, `acp.text()`,
+`acp.resource()`, `acp.resource_link()`, `acp.block_text(block)`,
+`acp.tool_paths(tool_call)`. Unknown agent requests are answered with
+-32601, every request has a timeout (except prompts, which are cancellable),
+and a crashing agent fails everything that was pending with its stderr tail.
+
+ vim:tw=78:ts=8:ft=help:norl:
