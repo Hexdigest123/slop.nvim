@@ -322,8 +322,10 @@ function M.fim(buf, row, col, opts)
 
   -- raw window around the cursor, redacted with spans computed over the whole window
   local nlines = api.nvim_buf_line_count(buf)
-  local first = math.max(0, row - M.window.before)
-  local last = math.min(nlines - 1, row + M.window.after)
+  -- read only as many lines as the budget can use (≥ 8 chars per line on average), capped by M.window
+  local span = math.floor(B / 8) + 20
+  local first = math.max(0, row - math.min(M.window.before, span))
+  local last = math.min(nlines - 1, row + math.min(M.window.after, span))
   local raw = api.nvim_buf_get_lines(buf, first, last + 1, false)
   local spans = secrets.spans(buf, raw, first)
   local cur = raw[row - first + 1] or ""
