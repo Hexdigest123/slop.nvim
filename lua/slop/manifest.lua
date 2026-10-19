@@ -6,7 +6,7 @@
 
 ---@class slop.ManifestKey
 ---@field mode string|string[]   Mode(s) of the mapping.
----@field lhs string             Default lhs. MUST equal `spec.defaults.keymaps[<action>]` (contract-tested).
+---@field lhs string|false       Default lhs (false: only the <Plug> mapping). MUST equal `spec.defaults.keymaps[<action>]` (contract-tested).
 ---@field desc string            Description, shown by which-key / :map.
 ---@field expr? boolean          The `<Plug>` mapping is an expr mapping (rhs returns keys).
 
@@ -82,6 +82,26 @@ return {
       preset = { mode = { "n", "x" }, lhs = "<leader>ap", desc = "slop: AI edit preset" },
       agent = { mode = "n", lhs = "<leader>ag", desc = "slop: select AI agent" },
       cancel = { mode = "n", lhs = "<leader>as", desc = "slop: cancel AI edit" },
+    },
+  },
+
+  marks = {
+    cmd = true,
+    keys = {
+      add = { mode = "n", lhs = "<leader>h", desc = "slop: mark file" },
+      menu = { mode = "n", lhs = "<C-e>", desc = "slop: marks menu" },
+      select_1 = { mode = "n", lhs = "<leader>1", desc = "slop: go to mark 1" },
+      select_2 = { mode = "n", lhs = "<leader>2", desc = "slop: go to mark 2" },
+      select_3 = { mode = "n", lhs = "<leader>3", desc = "slop: go to mark 3" },
+      select_4 = { mode = "n", lhs = "<leader>4", desc = "slop: go to mark 4" },
+      select_5 = { mode = "n", lhs = "<leader>5", desc = "slop: go to mark 5" },
+      select_6 = { mode = "n", lhs = "<leader>6", desc = "slop: go to mark 6" },
+      select_7 = { mode = "n", lhs = "<leader>7", desc = "slop: go to mark 7" },
+      select_8 = { mode = "n", lhs = "<leader>8", desc = "slop: go to mark 8" },
+      select_9 = { mode = "n", lhs = "<leader>9", desc = "slop: go to mark 9" },
+      select_10 = { mode = "n", lhs = "<leader>0", desc = "slop: go to mark 10" },
+      next = { mode = "n", lhs = false, desc = "slop: next mark" },
+      prev = { mode = "n", lhs = false, desc = "slop: previous mark" },
     },
   },
 }
