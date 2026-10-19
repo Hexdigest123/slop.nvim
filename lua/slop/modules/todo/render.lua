@@ -483,7 +483,7 @@ local function on_win(_, win, buf, top, bot)
   return false
 end
 
---- Draw items of rows srow..erow (what on_win draws; for tests and :Slop todo status).
+--- Draw items of rows srow..erow (exactly what on_win draws; used by the specs).
 ---@param buf integer
 ---@param srow integer
 ---@param erow integer
