@@ -189,6 +189,7 @@ end
 ---@field indent? string                  hint for chat-FIM prompts ("Indentation: 2 spaces")
 ---@field on_chunk? fun(delta: string, text: string)  streamed text (first candidate), main loop
 ---@field on_done fun(items: string[]?, err: slop.ai.Error?)  exactly once; on timeout the partial text is passed too
+---@field source? string                 label for User SlopAiRequest* events (default: the calling slop module)
 
 ---@class slop.ai.ChatMessage
 ---@field role "system"|"user"|"assistant"
@@ -205,6 +206,7 @@ end
 ---@field stream? boolean                 default: true when on_chunk is given
 ---@field on_chunk? fun(delta: string, text: string)
 ---@field on_done fun(text: string?, err: slop.ai.Error?)  exactly once; on timeout the partial text is passed too
+---@field source? string                 label for User SlopAiRequest* events (default: the calling slop module)
 
 ---@class slop.ai.Error : slop.http.Error
 ---@field kind "timeout"|"cancelled"|"curl"|"http"|"spawn"|"decode"|"config"
@@ -228,6 +230,23 @@ end
 
 local function slog()
   return require("slop.core.log").scope("ai")
+end
+
+local request_id = 0
+
+--- The slop module that issued the request (`source` of the request events), from the call stack.
+---@return string?
+local function caller_module()
+  for level = 3, 10 do
+    local info = debug.getinfo(level, "S")
+    if not info then
+      return nil
+    end
+    local name = info.source:match("slop[/\\]modules[/\\]([%w_]+)[/\\]")
+    if name then
+      return name
+    end
+  end
 end
 
 ---@param kind "fim"|"chat"
@@ -373,6 +392,27 @@ local function run(kind, req, finish, on_text)
     slog().debug("%s %s done in %.0f ms (%d chars)", label, kind, ms, #text)
     finish(text, items, nil)
   end
+
+  -- User SlopAiRequestStarted / SlopAiRequestFinished (progress UI); `finish` is the upvalue used above.
+  local events = require("slop.core.events")
+  request_id = request_id + 1
+  local info = {
+    id = request_id,
+    kind = kind,
+    provider = label,
+    model = type(p.model) == "string" and p.model or nil,
+    source = type(req.source) == "string" and req.source or caller_module(),
+  }
+  local done = finish
+  finish = function(t, items, err)
+    local data = vim.tbl_extend("force", info, { ms = math.floor((vim.uv.hrtime() - t0) / 1e6) })
+    if err then
+      data.error = err.kind == "cancelled" and "cancelled" or tostring(err.message or err.kind)
+    end
+    events.emit("ai", "RequestFinished", data)
+    return done(t, items, err)
+  end
+  events.emit("ai", "RequestStarted", info)
   return require("slop.core.http").request(hreq)
 end
 
