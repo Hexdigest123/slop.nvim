@@ -130,8 +130,8 @@ return {
   end,
   setup = function(cfg)
     configure(cfg)
-    sources().start(cfg, function()
-      view().render()
+    sources().start(cfg, function(now)
+      view().request(now)
     end, function()
       view().render()
     end)

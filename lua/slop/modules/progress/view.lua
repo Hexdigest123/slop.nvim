@@ -16,6 +16,7 @@ local state = {
   visible = true,
   ticker = nil, ---@type slop.Spinner?
   queued = false,
+  drawn = nil, ---@type string?  last buffer content (skip identical redraws)
   sweep = nil, ---@type fun(): boolean?
 }
 
@@ -212,7 +213,7 @@ local function buffer()
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].undolevels = -1
   vim.bo[buf].filetype = "slopprogress"
-  state.buf = buf
+  state.buf, state.drawn = buf, nil
   return buf
 end
 
@@ -258,10 +259,15 @@ local function draw(lines)
     text[#text + 1] = line
   end
   local buf = buffer()
-  api.nvim_buf_set_lines(buf, 0, -1, false, text)
-  api.nvim_buf_clear_namespace(buf, NS, 0, -1)
-  for _, m in ipairs(marks) do
-    api.nvim_buf_set_extmark(buf, NS, m[1], m[2], { end_col = m[3], hl_group = m[4] })
+  local drawn = table.concat(text, "\n") .. "\0" .. vim.inspect(marks)
+  if drawn ~= state.drawn then
+    state.drawn = nil
+    api.nvim_buf_set_lines(buf, 0, -1, false, text)
+    api.nvim_buf_clear_namespace(buf, NS, 0, -1)
+    for _, m in ipairs(marks) do
+      api.nvim_buf_set_extmark(buf, NS, m[1], m[2], { end_col = m[3], hl_group = m[4] })
+    end
+    state.drawn = drawn
   end
   local win = state.win
   if win and api.nvim_win_is_valid(win) and api.nvim_win_get_tabpage(win) ~= api.nvim_get_current_tabpage() then
@@ -327,6 +333,16 @@ function M.render()
   if not ok then
     retry()
   end
+end
+
+--- The store changed: render now when an item appeared/finished (`now`) or nothing is shown yet, else
+--- leave it to the next tick (bursts of LSP reports are drawn at most once per `interval`).
+---@param now? boolean
+function M.request(now)
+  if not now and state.ticker and state.ticker:is_running() and M.win() then
+    return
+  end
+  M.render()
 end
 
 --- Show/hide the window (items are still tracked while hidden).
@@ -405,7 +421,7 @@ function M.stop()
   if state.buf and api.nvim_buf_is_valid(state.buf) then
     pcall(api.nvim_buf_delete, state.buf, { force = true })
   end
-  state.buf, state.visible, cfg = nil, true, nil
+  state.buf, state.visible, state.drawn, cfg = nil, true, nil, nil
 end
 
 return M

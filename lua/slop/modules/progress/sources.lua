@@ -7,7 +7,7 @@ local api = vim.api
 local store = require("slop.modules.progress.store")
 
 local cfg ---@type table
-local on_change = function() end
+local on_change = function(_) end
 local ids = {} ---@type integer[]
 local linked = {} ---@type table<integer, string>  AI request id -> native item key it was merged into
 local mopt = nil ---@type {saved: string, set: string}?
@@ -48,7 +48,7 @@ function M.lsp(ev)
   if value.kind == "end" then
     -- `end` of a task we never saw: nothing to show
     if store.get(key) and store.finish(key, "success", { message = value.message }) then
-      on_change()
+      on_change(true)
     end
     return
   end
@@ -60,8 +60,8 @@ function M.lsp(ev)
     fields.message = value.message
     fields.percent = value.percentage
   end
-  store.update(key, fields)
-  on_change()
+  local _, created = store.update(key, fields)
+  on_change(created)
 end
 
 --- Finish LSP items whose client stopped (no `end` will ever arrive).
@@ -113,9 +113,11 @@ function M.native(ev)
   }
   local key = "native:" .. tostring(d.id)
   local status = STATUS[d.status] or "running"
+  local created = false
   if status == "running" then
     fields.percent = (type(d.percent) == "number" and d.percent > 0) and d.percent or nil
-    local item, created = store.update(key, fields)
+    local item
+    item, created = store.update(key, fields)
     if created and source == "slop" then
       local t = item.started
       local ai = store.find(function(i)
@@ -131,7 +133,7 @@ function M.native(ev)
     end
     store.finish(key, status, fields)
   end
-  on_change()
+  on_change(status ~= "running" or created)
 end
 
 -- AI requests -------------------------------------------------------------------------------------
@@ -165,7 +167,7 @@ function M.ai_started(d)
     ai_id = d.id,
     detail = detail,
   })
-  on_change()
+  on_change(true)
 end
 
 ---@param d {id: integer, error?: string}
@@ -183,7 +185,7 @@ function M.ai_finished(d)
   end
   local status = d.error == nil and "success" or (d.error == "cancelled" and "cancel" or "failed")
   store.finish(key, status, d.error and status == "failed" and { message = d.error } or nil)
-  on_change()
+  on_change(true)
 end
 
 -- 'messagesopt' -----------------------------------------------------------------------------------
@@ -243,7 +245,7 @@ end
 
 --- Create the autocmds (in augroup "slop.progress", where the registry replays the lazy-load trigger).
 ---@param c table
----@param changed fun()        called after the store changed
+---@param changed fun(now: boolean?)  called after the store changed (now = an item appeared/finished)
 ---@param ui fun()             re-layout (VimResized / TabEnter / 'laststatus' / 'cmdheight')
 function M.start(c, changed, ui)
   M.configure(c)
@@ -281,7 +283,7 @@ function M.stop()
     pcall(api.nvim_del_autocmd, id)
   end
   ids, linked = {}, {}
-  on_change = function() end
+  on_change = function(_) end
   M.suppress_echo(false)
 end
 
