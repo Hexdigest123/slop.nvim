@@ -21,6 +21,11 @@ CONTENTS                                                       *slop-contents*
       commit ................................................. |slop-commit|
       rest ................................................... |slop-rest|
       edit ................................................... |slop-edit|
+      marks ................................................. |slop-marks|
+      todo ................................................... |slop-todo|
+      progress ........................................... |slop-progress|
+      context ............................................. |slop-context|
+      doc ..................................................... |slop-doc|
       hello .................................................. |slop-hello|
 
 ==============================================================================
@@ -184,6 +189,34 @@ HTTP client for `.http` files. See |slop-rest.txt|.
 EDIT                                                               *slop-edit*
 
 AI edits of a selection through an ACP agent. See |slop-edit.txt|.
+
+------------------------------------------------------------------------------
+MARKS                                                             *slop-marks*
+
+Per-project list of files to jump between (like harpoon).
+See |slop-marks.txt|.
+
+------------------------------------------------------------------------------
+TODO                                                               *slop-todo*
+
+Highlight and list TODO/FIX/HACK/... comments. See |slop-todo.txt|.
+
+------------------------------------------------------------------------------
+PROGRESS                                                       *slop-progress*
+
+LSP, Neovim and slop AI progress in a corner float.
+See |slop-progress.txt|.
+
+------------------------------------------------------------------------------
+CONTEXT                                                         *slop-context*
+
+Sticky enclosing-scope lines at the top of the window.
+See |slop-context.txt|.
+
+------------------------------------------------------------------------------
+DOC                                                                 *slop-doc*
+
+AI-written doc comments, reviewed as an inline diff. See |slop-doc.txt|.
 
 ------------------------------------------------------------------------------
 HELLO                                                             *slop-hello*

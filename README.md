@@ -12,6 +12,11 @@ My fun plugin where I just add slop features instead of relying on unmaintained 
 | `rest`     | Run requests from any `.http` file in the project                | `:h slop-rest`       |
 | `cloak`    | Mask secrets on screen and keep them away from the AI            | `:h slop-cloak`      |
 | `term`     | Floating terminal                                                | `:h slop-term`       |
+| `marks`    | Per-project file marks to jump between (like harpoon)            | `:h slop-marks`      |
+| `todo`     | Highlight and list TODO/FIX/HACK comments                        | `:h slop-todo`       |
+| `progress` | LSP and AI progress in a corner float (like fidget)              | `:h slop-progress`   |
+| `context`  | Sticky enclosing function/class lines at the top                 | `:h slop-context`    |
+| `doc`      | AI-written doc comments, reviewed as an inline diff              | `:h slop-doc`        |
 
 ## Requirements
 
