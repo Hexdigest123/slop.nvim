@@ -398,4 +398,30 @@ describe("services.ai providers", function()
     assert.are.same({}, cf.parse("  \n"))
     assert.equal("x", cf.first_partial("x\n<EN"))
   end)
+  it("reasoning models: content chunks keep only the text (non-streamed and streamed)", function()
+    local oa = require("slop.services.ai.providers.openai")
+    local body = {
+      choices = {
+        {
+          message = {
+            role = "assistant",
+            content = {
+              { type = "thinking", thinking = { { type = "text", text = "hmm" } }, closed = true },
+              { type = "text", text = "feat: " },
+              { type = "text", text = "add x" },
+            },
+          },
+        },
+      },
+    }
+    assert.equal("feat: add x", oa.parse_chat(body))
+    assert.equal("", oa.parse_chat({ choices = { { message = { content = { { type = "thinking" } } } } } }))
+    local think = vim.json.encode({
+      choices = { { delta = { content = { { type = "thinking", thinking = { { type = "text", text = "x" } } } } } } },
+    })
+    assert.is_nil((oa.delta({ data = think })))
+    local text = vim.json.encode({ choices = { { delta = { content = { { type = "text", text = "OK" } } } } } })
+    assert.equal("OK", (oa.delta({ data = text })))
+    assert.equal("OK", (oa.delta({ data = vim.json.encode({ choices = { { delta = { content = "OK" } } } }) })))
+  end)
 end)

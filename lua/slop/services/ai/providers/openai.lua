@@ -43,8 +43,22 @@ local function choice_text(c)
     return c.text
   end
   local m = c.message or c.delta
-  if type(m) == "table" and type(m.content) == "string" then
+  if type(m) ~= "table" then
+    return nil
+  end
+  if type(m.content) == "string" then
     return m.content
+  end
+  -- Reasoning models (e.g. Mistral's zai-glm, magistral) send content as chunks:
+  -- { {type="thinking", thinking={...}}, {type="text", text="..."} }. Keep only the text.
+  if type(m.content) == "table" then
+    local parts = {}
+    for _, chunk in ipairs(m.content) do
+      if type(chunk) == "table" and chunk.type == "text" and type(chunk.text) == "string" then
+        parts[#parts + 1] = chunk.text
+      end
+    end
+    return #parts > 0 and table.concat(parts) or nil
   end
   return nil
 end
