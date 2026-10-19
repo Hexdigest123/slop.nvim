@@ -104,4 +104,19 @@ return {
       prev = { mode = "n", lhs = false, desc = "slop: previous mark" },
     },
   },
+
+  progress = {
+    events = { "LspProgress", "Progress", "User SlopAiRequestStarted" },
+    cmd = true,
+  },
+
+  doc = {
+    cmd = true,
+    keys = {
+      generate = { mode = "n", lhs = "<leader>nd", desc = "slop: AI doc comment" },
+      func = { mode = "n", lhs = "<leader>nf", desc = "slop: AI doc comment (function)" },
+      class = { mode = "n", lhs = "<leader>nc", desc = "slop: AI doc comment (class)" },
+      type = { mode = "n", lhs = "<leader>nt", desc = "slop: AI doc comment (type)" },
+    },
+  },
 }
