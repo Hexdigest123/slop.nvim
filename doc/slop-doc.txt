@@ -1,0 +1,234 @@
+*slop-doc.txt*  AI-written doc comments for slop.nvim
+
+==============================================================================
+CONTENTS                                                   *slop-doc-contents*
+
+  1. Introduction ............................ |slop-doc-intro|
+  2. How it works ............................ |slop-doc-flow|
+  3. Keymaps ................................. |slop-doc-keymaps|
+  4. Commands ................................ |slop-doc-commands|
+  5. Configuration ........................... |slop-doc-config|
+  6. Styles .................................. |slop-doc-styles|
+  7. Languages ............................... |slop-doc-languages|
+  8. Privacy ................................. |slop-doc-privacy|
+  9. Lua API ................................. |slop-doc-api|
+
+==============================================================================
+1. INTRODUCTION                                               *slop-doc-intro*
+
+The `doc` module writes doc comments with an AI chat provider (default
+`mistral_chat`). It replaces neogen: neogen fills in a template, while `doc`
+writes the text as well. Put the cursor anywhere in a function, class or
+type and press `<leader>nd`. The comment is shown as an inline diff, and you
+keep it with `ga`/`gA` or drop it with `gr`/`gR`.
+
+If the item already has a doc comment, the model updates that comment and
+the diff replaces it. You never get a second comment.
+
+The module loads on its first key press or `:Slop doc`. It needs a
+treesitter parser for the buffer.
+
+==============================================================================
+2. HOW IT WORKS                                                *slop-doc-flow*
+
+1. Target. Treesitter finds the innermost item of the requested kind
+   (`func`, `class` or `type`; any kind for `generate`) that contains the
+   cursor. Two positions on the cursor line are tried: the cursor column
+   (or the first non-blank one) and the end of the line. The innermost
+   result wins, so `local M = {}` is found with the cursor on `local`.
+   - A cursor on a doc comment, a decorator or an attribute targets the item
+     below it.
+   - An anonymous function or table counts only as the value of a
+     declaration, for example `local f = function() end`,
+     `const f = () => {}` or `M.x = {}`. A callback passed as an argument
+     is skipped and the enclosing item is used instead.
+   - The item includes the wrappers that start on its line (`export`,
+     `local x =`, `type X struct`), its decorators and C++ `template <...>`
+     line, and the Rust `#[...]` attributes above it. The comment goes above
+     all of these.
+2. Existing doc comment. Comment lines, or one block comment, directly above
+   the item (no blank line in between, each comment on its own line) count
+   as its doc comment. A shebang line (`#!`) and Rust `//!` lines never do.
+   In Python the existing doc is the leading docstring of the body.
+3. Request. These are sent to the provider, all redacted (|slop-doc-privacy|):
+   - the relative path and the filetype;
+   - the kind and name of the item;
+   - some context: the first `context_lines / 2` lines of the file (usually
+     imports), up to `context_lines` lines before the item and
+     `context_lines / 2` lines after it;
+   - the code of the item, cut at `max_chars`;
+   - the existing doc comment.
+   The system prompt asks for the doc comment only, in the style for the
+   filetype (|slop-doc-styles|), plus `instructions`.
+4. Waiting. A spinner line appears above the item. The native progress
+   message shows it as well (the statusline, OSC 9;4 in the terminal) and
+   can be cancelled from there. `:Slop doc cancel` also cancels. Starting a
+   new request in the same buffer cancels the running one.
+5. Answer. `<think>` blocks and the code fence are removed. Code that the
+   model echoed after the comment is dropped (a line equal to or a prefix of
+   one of the item's lines). What is left must be comment lines, or one
+   docstring for Python. Anything else is reported as an error and nothing
+   is inserted. The raw answer is in `:Slop log`. The lines are then
+   re-indented to the item's indentation (Python: the body's).
+6. Review. |slop-edit-diff| applies the lines as a preview. Keys
+   (buffer-local, normal mode): `ga` accept the hunk, `gr` reject it,
+   `gA` / `gR` all, `]h` / `[h` next / previous hunk. The whole review is
+   one undo step. If
+   the lines being replaced changed while the request ran, the answer is
+   discarded with a warning. Lines added above the item are fine: the target
+   is tracked with an extmark.
+
+==============================================================================
+3. KEYMAPS                                                  *slop-doc-keymaps*
+
+Global, normal mode. These are the neogen keys, plus `<leader>nd`:
+
+  Key           Name       Action ~
+  `<leader>nd`    generate   innermost function/class/type at the cursor
+  `<leader>nf`    func       enclosing function or method
+  `<leader>nc`    class      enclosing class, struct, impl, trait, module
+  `<leader>nt`    type       enclosing type, interface, enum, typedef, alias
+
+Each key is also available as `<Plug>(slop-doc-<name>)`. Set a key to `false`
+under `doc.keymaps` to disable it.
+
+==============================================================================
+4. COMMANDS                                                *slop-doc-commands*
+
+:Slop doc [generate]                                      *:Slop-doc-generate*
+        Document the innermost item at the cursor.
+
+:Slop doc func                                                *:Slop-doc-func*
+:Slop doc class                                              *:Slop-doc-class*
+:Slop doc type                                                *:Slop-doc-type*
+        Document the enclosing item of that kind.
+
+:Slop doc cancel                                            *:Slop-doc-cancel*
+        Cancel the running request in the current buffer.
+
+==============================================================================
+5. CONFIGURATION                                             *slop-doc-config*
+
+Defaults: >lua
+    require("slop").setup({
+      doc = {
+        enabled = true,
+        provider = "mistral_chat",  -- a `chat` provider from ai.providers
+        max_tokens = 1024,
+        timeout = 30000,            -- ms
+        temperature = 0.2,
+        styles = {},                -- [filetype] = style name or text
+        instructions = "",          -- extra prompt instructions
+        context_lines = 30,         -- surrounding lines (0 = item only)
+        max_chars = 16000,          -- budget for the item's code
+        keymaps = {
+          generate = "<leader>nd",
+          func = "<leader>nf",
+          class = "<leader>nc",
+          type = "<leader>nt",
+        },
+      },
+    })
+<
+The API key comes from the provider (see |slop-config|), by default
+`$MISTRAL_API_KEY`. |:checkhealth| `slop` shows the provider and whether the
+key variable is set. It never shows the value.
+
+With a reasoning model, raise `max_tokens` (and `timeout`): the reasoning
+counts against the limit.
+
+Example: >lua
+    doc = {
+      provider = "openai_chat",     -- defined under ai.providers
+      styles = { lua = "Plain `--` prose, no annotations." },
+      instructions = "Write in British English. Keep it under 6 lines.",
+    }
+<
+==============================================================================
+6. STYLES                                                    *slop-doc-styles*
+
+`styles[<filetype>]` is either the name of a built-in style or free text that
+replaces the style instructions.
+
+  Filetype                        Style ~
+  lua                             `luals`      `---` + `@param` / `@return`
+  javascript(react), typescript(react), vue, svelte
+                                  `jsdoc`      `/** */` JSDoc
+  python                          `docstring`  PEP 257, inside the body
+  go                              `godoc`      `// Name ...`
+  rust                            `rustdoc`    `///`
+  java                            `javadoc`    `/** */` Javadoc
+  kotlin                          `kdoc`       `/** */` KDoc
+  c, cpp, objc                    `doxygen`    `/** */` Doxygen
+  php                             `phpdoc`     `/** */` PHPDoc
+  sh, bash, zsh                   `shell`      `#` block
+  ruby                            `yard`       `#` YARD tags
+  other                           line comments from 'commentstring'
+
+Example: document TypeScript like Java >lua
+    doc = { styles = { typescript = "javadoc" } }
+<
+The style only steers the prompt. Whatever the style, the answer is checked
+against the language's comment syntax: line leaders (`--`, `//`, `#`, ...)
+and block delimiters (`/* */`, `--[[ ]]`). Unknown filetypes use
+'commentstring'.
+
+==============================================================================
+7. LANGUAGES                                              *slop-doc-languages*
+
+Node-type tables for these treesitter languages: lua, python, javascript,
+typescript, tsx, go, rust, java, kotlin, c, cpp, php, bash and ruby. Other
+languages fall back to the generic classification in core.ts (`function` /
+`method` -> func, `class` / `struct` / `impl` / ... -> class, names that
+contain `interface`, `enum`, `type` or `alias` -> type).
+
+Kinds per language (abridged):
+  lua      func: function declarations and assigned functions; class: tables
+           assigned to a variable
+  python   func: def; class: class (decorators included)
+  js/ts    func: functions, methods, arrows assigned to a name; class: class;
+           type (ts): interface, type alias, enum
+  go       func: func, method; class/type: `type X ...` (a grouped spec on its
+           own)
+  rust     func: fn; class: struct, impl, trait, union, mod; type: enum, type
+  c/cpp    func: definitions and prototypes; class: struct, union, class
+           with a body; type: enum, typedef, using alias, concept
+
+==============================================================================
+8. PRIVACY                                                  *slop-doc-privacy*
+
+Everything sent to the provider goes through |slop-secrets| first:
+- a buffer matching a secret glob (`.env*`, `*.pem`, `*.key`, ..., and the
+  cloak rules) is refused: nothing is sent;
+- secret spans in the context, the code and the existing doc are replaced by
+  `<redacted>`, and the prompt tells the model never to guess them.
+Toggling the cloak display (`:Slop cloak toggle`) does not turn redaction
+off. Only the lines described in |slop-doc-flow| are sent, never the whole
+file.
+
+==============================================================================
+9. LUA API                                                      *slop-doc-api*
+
+`local doc = require("slop").doc` (the module loads on first use).
+
+doc.generate({kind}, {opts})                             *slop-doc.generate()*
+        Document the item at the cursor. {kind}: `"func"`, `"class"`,
+        `"type"`, or nil for the innermost item of any kind. {opts}:
+        `buf` (default current), `pos` (0-based `{row, col}`, default
+        cursor). Returns `true` when a request was sent. Otherwise it
+        notifies (nothing found, blocked file, ...) and returns `false`.
+
+doc.cancel({buf})                                          *slop-doc.cancel()*
+        Cancel the running request. Returns `false` if none was running.
+
+doc.is_running({buf})                                  *slop-doc.is_running()*
+
+doc.find({buf}, {pos}, {kind})                               *slop-doc.find()*
+        The target `generate()` would use, without sending anything:
+        `{ kind, type, lang, name?, signature, rows, range, indent, doc,
+        docstring }`. `rows` are the item's 0-based rows (inclusive),
+        `range` the 0-based rows `[s, e)` the comment replaces (`s == e`
+        inserts) and `doc` the existing doc lines. Returns `nil, err` when
+        nothing is found.
+
+ vim:tw=78:ts=8:ft=help:norl:
