@@ -17,6 +17,9 @@ local api = vim.api
 ---@field doc string[]                      existing doc comment / docstring lines (empty: none)
 ---@field docstring boolean                 python: the doc is a docstring inside the body
 
+-- filetypes whose parser has another name, when nothing registered it
+local FT_LANG = { sh = "bash", zsh = "bash", javascriptreact = "javascript", typescriptreact = "tsx" }
+
 local function line(buf, row)
   return api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
 end
@@ -85,11 +88,18 @@ local function probe(buf, tree, row, col)
     col = #l - 1
   end
   local ok, node = pcall(tree.named_node_for_range, tree, { row, col, row, col }, { ignore_injections = true })
-  if not ok or not node or not is_comment(node) then
+  if not ok or not node then
     return row, col
   end
   local lang = require("slop.modules.doc.langs").langs[tree:lang()] or {}
   local attrs = lang.attrs or {}
+  -- inside an attribute (`#[derive(Debug)]`): its node on this row
+  while node and not is_comment(node) and not attrs[node:type()] and node:parent() and node:parent():range() == row do
+    node = node:parent()
+  end
+  if not node or not (is_comment(node) or attrs[node:type()]) then
+    return row, col
+  end
   local cur = node
   local nxt = cur:next_named_sibling()
   while nxt and (is_comment(nxt) or attrs[nxt:type()]) and nxt:range() <= last_row(cur) + 1 do
@@ -240,13 +250,30 @@ local function search(tree, row, col, lang, kind)
   if not ok then
     return nil
   end
-  while node do
-    local k = match(node, lang, kind)
+  local function try(n)
+    local k = match(n, lang, kind)
     if k then
-      local anchor = lang and anchor_of(node, lang) or node
-      local anon = lang and lang.anon and lang.anon[node:type()]
-      if not anon or (anchor ~= node and lang.decl and lang.decl[anchor:type()]) then
-        return node, anchor, k
+      local anchor = lang and anchor_of(n, lang) or n
+      local anon = lang and lang.anon and lang.anon[n:type()]
+      if not anon or (anchor ~= n and lang.decl and lang.decl[anchor:type()]) then
+        return n, anchor, k
+      end
+    end
+  end
+  while node do
+    local n, anchor, k = try(node)
+    if n then
+      return n, anchor, k
+    end
+    -- on a decorator / template header: the item it wraps
+    if lang and lang.wrap_any and lang.wrap_any[node:type()] then
+      for child in node:iter_children() do
+        if child:named() then
+          n, anchor, k = try(child)
+          if n then
+            return n, anchor, k
+          end
+        end
       end
     end
     node = node:parent()
@@ -261,7 +288,11 @@ end
 ---@return slop.doc.Target? target, string? err
 function M.find(buf, pos, kind)
   buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
+  local ft = vim.bo[buf].filetype
   local ok, tree = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
+  if (not ok or not tree) and FT_LANG[ft] then
+    ok, tree = pcall(vim.treesitter.get_parser, buf, FT_LANG[ft], { error = false })
+  end
   if not ok or not tree then
     return nil, ("no treesitter parser for filetype '%s'"):format(vim.bo[buf].filetype)
   end
