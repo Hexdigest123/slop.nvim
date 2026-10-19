@@ -119,4 +119,12 @@ return {
       type = { mode = "n", lhs = "<leader>nt", desc = "slop: AI doc comment (type)" },
     },
   },
+
+  todo = {
+    events = { "BufReadPost", "BufNewFile" },
+    cmd = true,
+    keys = {
+      list = { mode = "n", lhs = "<leader>xt", desc = "slop: todo list" },
+    },
+  },
 }
