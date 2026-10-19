@@ -131,7 +131,11 @@ describe("rest module", function()
     run_and_wait(function()
       rest.run_cursor()
     end)
-    assert.equal(2, #vim.api.nvim_tabpage_list_wins(0))
+    -- (ignore floats: the progress module shows the request in one)
+    local splits = vim.tbl_filter(function(w)
+      return vim.api.nvim_win_get_config(w).relative == ""
+    end, vim.api.nvim_tabpage_list_wins(0))
+    assert.equal(2, #splits)
   end)
 
   it("chains: runs the missing dependency first, then uses its response and the cookie jar", function()
