@@ -184,8 +184,16 @@ describe("todo render", function()
   it("places signs for visible rows after the redraw; toggle clears and restores them", function()
     local buf = open("a.lua", LUA)
     assert.are.same({ { 0, "SlopTodoTodo" }, { 1, "SlopTodoFix" }, { 6, "SlopTodoHack" } }, signs(buf))
+    local events = {}
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "SlopTodoToggled",
+      callback = function(ev)
+        events[#events + 1] = ev.data.enabled
+      end,
+    })
     todo.disable()
     assert.is_false(todo.is_enabled())
+    assert.are.same({ false }, events)
     vim.cmd("redraw!")
     assert.are.same({}, signs(buf))
     todo.toggle()
@@ -269,6 +277,23 @@ describe("todo render", function()
     assert.are.same({ 2, 3 }, pos())
     vim.cmd("Slop todo prev")
     assert.are.same({ 1, 15 }, pos())
+  end)
+
+  it("next/prev are unmapped by default; mapped keys take a count", function()
+    open("a.lua", LUA)
+    for _, lhs in ipairs({ "]t", "[t", "]T", "[T" }) do
+      assert.falsy((vim.fn.maparg(lhs, "n", false, true).desc or ""):match("slop"), lhs)
+    end
+    assert.truthy(vim.fn.maparg("<Plug>(slop-todo-next)", "n") ~= "")
+    require("slop.core.registry").disable("todo")
+    require("slop").setup({ todo = { keymaps = { next = "]x", prev = "[x" } } })
+    require("slop.core.registry").enable("todo")
+    assert.matches("slop%-todo%-next", vim.fn.maparg("]x", "n"))
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("2]x")
+    assert.are.same({ 2, 3 }, api.nvim_win_get_cursor(0))
+    h.feed("[x")
+    assert.are.same({ 1, 15 }, api.nvim_win_get_cursor(0))
   end)
 
   it("configured colors replace the default links; new keywords get groups", function()

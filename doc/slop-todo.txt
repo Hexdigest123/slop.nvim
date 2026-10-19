@@ -1,0 +1,272 @@
+*slop-todo.txt*  Highlight, list and jump between TODO/FIX/HACK/... comments
+
+==============================================================================
+CONTENTS                                                  *slop-todo-contents*
+
+  1. Introduction ............................ |slop-todo-intro|
+  2. Keymaps ................................. |slop-todo-keymaps|
+  3. Commands ................................ |slop-todo-commands|
+  4. Configuration ........................... |slop-todo-config|
+  5. Keywords and colors ..................... |slop-todo-keywords|
+  6. Highlighting ............................ |slop-todo-highlighting|
+  7. Project search .......................... |slop-todo-search|
+  8. Lua API ................................. |slop-todo-api|
+  9. Highlights and events ................... |slop-todo-highlights|
+ 10. Migrating from todo-comments.nvim ....... |slop-todo-migrate|
+ 11. Limitations ............................. |slop-todo-limitations|
+
+==============================================================================
+1. INTRODUCTION                                              *slop-todo-intro*
+
+The `todo` module replaces todo-comments.nvim. It:
+
+- highlights todo comments such as `-- TODO: x`, `// FIX(alice): y` or
+  `# NOTE: z`, and shows an icon in the sign column;
+- lists the todos of the whole project in a picker or the quickfix list;
+- jumps to the next/previous todo of the buffer.
+
+A todo is a keyword at a word boundary followed by `:` or `(author)` (an
+optional `:` may follow the author). `TODO fix` (no colon) and `MYTODO:` are
+not todos. Highlighting, jumps and the project search all use this same rule.
+
+Only comments count: with a treesitter parser for the buffer the keyword
+must sit in a comment node; without one a 'commentstring' heuristic is used
+(|slop-todo-highlighting|).
+
+The module loads on the first file read. Highlights are drawn by a
+decoration provider for the visible rows only, in the redraw that first shows
+them: no flicker and no whole-buffer scans, also in big buffers.
+
+==============================================================================
+2. KEYMAPS                                                 *slop-todo-keymaps*
+
+Defaults (set them under `todo.keymaps`; `false` disables):
+
+  Mode  Key           Name   Action ~
+  n     `<leader>xt`    list   pick a todo of the project
+  n     (none)        next   jump to the next todo ([count])
+  n     (none)        prev   jump to the previous todo ([count])
+
+`next` and `prev` are unmapped by default (`]t`/`[t` are often taken, and
+`]T`/`[T` are Neovim's tag maps). Map them, for example:
+>lua
+  todo = { keymaps = { next = "]x", prev = "[x" } }
+<
+or use the API from your own mapping:
+>lua
+  vim.keymap.set("n", "]x", function() require("slop").todo.jump_next() end)
+<
+Plugs (created when the module loads): `<Plug>(slop-todo-list)`,
+`<Plug>(slop-todo-next)`, `<Plug>(slop-todo-prev)`.
+
+==============================================================================
+3. COMMANDS                                               *slop-todo-commands*
+
+KEYWORDS is a comma (or space) separated list, e.g. `TODO,FIX`. A group name
+selects the group with its aliases (`FIX` also finds `FIXME`, `BUG`, ...); an
+alias selects only itself. The todo-comments form `keywords=TODO,FIX` works
+too. Without KEYWORDS every keyword is used.
+
+:Slop todo [list] [KEYWORDS]                             *:Slop-todo-list*
+        Search the project (|slop-todo-search|) and pick a todo (fzf-lua
+        when installed, else the builtin picker; config `ui.picker`). <CR>
+        jumps to it, <C-v> / <C-s> / <C-t> open it in a vsplit / split / tab.
+
+:Slop todo qf [KEYWORDS]                                     *:Slop-todo-qf*
+        Put the project's todos in the quickfix list and open it.
+
+:Slop todo next [KEYWORDS]                                 *:Slop-todo-next*
+:Slop todo prev [KEYWORDS]                                 *:Slop-todo-prev*
+        Jump to the next / previous todo comment of the buffer.
+
+:Slop todo toggle                                        *:Slop-todo-toggle*
+:Slop todo enable                                        *:Slop-todo-enable*
+:Slop todo disable                                      *:Slop-todo-disable*
+        Show or hide the highlights and signs (all buffers). Jumps and the
+        project search keep working.
+
+==============================================================================
+4. CONFIGURATION                                            *slop-todo-config*
+>lua
+  todo = {
+    enabled = true,
+    signs = true,                -- icon in the sign column
+    sign_priority = 8,
+    keywords = { ... },          -- see |slop-todo-keywords|
+    colors = { ... },            -- see |slop-todo-keywords|
+    highlight = {
+      keyword = "wide",          -- "wide" | "bg" | "fg" | false
+      after = "fg",              -- "fg" | false: rest of the comment
+      multiline = true,          -- continue onto following comment lines
+      multiline_context = 10,    -- at most this many continuation lines
+      comments_only = true,      -- false: highlight keywords anywhere
+      max_line_len = 400,        -- longer lines are skipped
+      exclude = {},              -- filetypes never highlighted
+    },
+    max_filesize = 1024 * 1024,  -- bytes; bigger buffers are not
+                                 -- highlighted (false: no limit)
+    search = {
+      backend = "auto",          -- "auto" | "rg" | "git" | "lua"
+      args = {},                 -- extra rg arguments, e.g. { "--hidden" }
+    },
+    keymaps = { list = "<leader>xt", next = false, prev = false },
+  }
+<
+`highlight.keyword`:
+  "wide"  colored badge over the keyword, the author and the `:`, plus one
+          cell on each side (todo-comments' default)
+  "bg"    the same badge without the extra cells
+  "fg"    keyword in the group color only
+  false   no keyword highlight
+
+Buffers with a 'buftype' (help, terminal, quickfix, scratch, ...) are never
+highlighted.
+
+==============================================================================
+5. KEYWORDS AND COLORS                                    *slop-todo-keywords*
+
+The defaults are todo-comments.nvim's (icons need a Nerd Font):
+
+  Group  Aliases                          Color    Default link ~
+  FIX    FIXME BUG FIXIT ISSUE            error    DiagnosticError
+  TODO                                    info     DiagnosticInfo
+  HACK                                    warning  DiagnosticWarn
+  WARN   WARNING XXX                      warning  DiagnosticWarn
+  PERF   OPTIM PERFORMANCE OPTIMIZE       default  Identifier
+  NOTE   INFO                             hint     DiagnosticHint
+  TEST   TESTING PASSED FAILED            test     Identifier
+
+Each group is `{ icon = "...", color = "...", alt = { ... }, signs = true }`.
+Your entries are merged into the defaults: add a group, change one field, or
+remove a group with `false`:
+>lua
+  todo = {
+    keywords = {
+      TODO = { alt = { "LATER" } },            -- aliases are replaced
+      HACK = false,                            -- no HACK group
+      SAFETY = { icon = "! ", color = "warning" },
+      NOTE = { color = "#10B981", signs = false },
+    },
+  }
+<
+Keyword names and aliases are made of letters, digits and `_`, and are
+case sensitive.
+
+`color` is a name from `colors`, a highlight group, or `"#rrggbb"`.
+`colors` maps a name to a group, a "#hex" or a list of both (the first group
+that exists wins, then the hex):
+>lua
+  colors = {
+    error = { "DiagnosticError", "ErrorMsg", "#DC2626" },
+    warning = { "DiagnosticWarn", "WarningMsg", "#FBBF24" },
+    info = { "DiagnosticInfo", "#2563EB" },
+    hint = { "DiagnosticHint", "#10B981" },
+    default = { "Identifier", "#7C3AED" },
+    test = { "Identifier", "#FF00FF" },
+  }
+<
+==============================================================================
+6. HIGHLIGHTING                                       *slop-todo-highlighting*
+
+Comment check (`highlight.comments_only = true`):
+- With a treesitter parser (no need for treesitter highlighting to be on),
+  the keyword must be inside a node whose type contains "comment" (`comment`,
+  `line_comment`, `comment_content`, ...), injected languages included. The
+  comment text highlight stops where the comment node ends, e.g. before `*/`
+  in `/* TODO: x */ code`.
+- Without a parser, the 'commentstring' leader (`--`, `//`, `#`, ...) must
+  appear before the keyword on the same line, or the line must continue a
+  block comment (` * TODO: x`). The text highlight stops at the block end.
+
+Multiline: the lines after a todo continue it while they are comments, have
+only the comment leader and blanks before the keyword's column, and their
+text starts past that column:
+>lua
+  -- TODO: this is a long
+  --       todo over two lines     <- highlighted
+  -- unrelated comment             <- not highlighted
+<
+Signs are persistent extmarks, updated for the rows each window shows right
+after it is drawn. A change in rows that are not visible updates their signs
+when they scroll into view.
+
+==============================================================================
+7. PROJECT SEARCH                                           *slop-todo-search*
+
+`:Slop todo list` and `:Slop todo qf` search the project root
+(|slop-project|) of the current buffer. With `search.backend = "auto"`:
+
+1. `rg` when it is installed (respects .gitignore, skips hidden and binary
+   files; `search.args` are passed to it),
+2. else `git grep --untracked` inside a git repository,
+3. else an asynchronous Lua walk (skips hidden entries, node_modules, binary
+   files and files over 1 MiB).
+
+All backends find the same todos; the search does not check for comments
+(files are not parsed).
+
+==============================================================================
+8. LUA API                                                     *slop-todo-api*
+
+`local todo = require("slop").todo`
+
+todo.list({opts})              picker over the project's todos
+todo.qf({opts})                quickfix list (`opts.open = false`: don't
+                               open the window)
+todo.search({opts}, {cb})      async; `cb(results, err?)` with results
+                               { path, lnum, col, line, keyword, group,
+                                 author?, message }
+todo.jump_next({opts})         returns true when it jumped
+todo.jump_prev({opts})
+todo.toggle()
+todo.enable()
+todo.disable()
+todo.is_enabled()
+todo.keywords()                compiled groups { groups, order, by_word }
+
+list/qf/search {opts}: `keywords` (string or list, see
+|slop-todo-commands|), `root` (default: project root), `backend`.
+jump {opts}: `keywords`, `wrap` (default 'wrapscan'), `count` (default
+|v:count1|).
+
+==============================================================================
+9. HIGHLIGHTS AND EVENTS                                *slop-todo-highlights*
+
+`SlopTodo<Group>`       keyword and sign of a group, e.g. `SlopTodoFix`,
+                        `SlopTodoTodo`, `SlopTodoSafety` for your SAFETY
+                        group (default: link to the group's color)
+`SlopTodo<Group>Text`   comment text after the keyword (link: SlopTodo<Group>)
+`SlopTodoKeyword`       stacked on the keyword for the badge (bold, reverse)
+
+A configured `color` replaces the default link; otherwise colorschemes can
+set these groups.
+
+`User SlopTodoToggled`   data `{ enabled }`
+
+==============================================================================
+10. MIGRATING FROM TODO-COMMENTS.NVIM                      *slop-todo-migrate*
+
+1. Remove the todo-comments.nvim plugin spec (keeping both gives double
+   highlights and signs; `:checkhealth slop` warns about it).
+2. `opts = {}` needs nothing: the keywords, colors, "wide" keyword style,
+   signs and multiline continuation are the defaults.
+3. `:TodoQuickFix` becomes `:Slop todo qf`, `:TodoTelescope` / `:TodoFzfLua`
+   / Trouble's todo mode become `:Slop todo list` (`<leader>xt`).
+   `require("todo-comments").jump_next()` becomes
+   `require("slop").todo.jump_next()`.
+
+Differences: `merge_keywords = false` does not exist (remove groups with
+`false`); `TODO(author)` without `:` also counts; `gui_style`,
+`highlight.before`, `highlight.pattern` and `search.pattern` are not
+configurable.
+
+==============================================================================
+11. LIMITATIONS                                        *slop-todo-limitations*
+
+- Without a parser the comment check is a heuristic: a 'commentstring'
+  leader inside a string before the keyword passes.
+- Signs of rows changed while off screen are updated when they scroll into
+  view.
+- The project search does not check that a match is in a comment.
+
+ vim:tw=78:ts=8:ft=help:norl:

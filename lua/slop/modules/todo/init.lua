@@ -352,15 +352,15 @@ return {
     },
     next = {
       desc = "jump to the next todo [KEYWORDS,...]",
-      impl = function(args, cmd)
-        api.jump_next({ keywords = args, count = cmd and cmd.count and cmd.count > 0 and cmd.count or 1 })
+      impl = function(args)
+        api.jump_next({ keywords = args, count = 1 })
       end,
       complete = complete_keywords,
     },
     prev = {
       desc = "jump to the previous todo [KEYWORDS,...]",
-      impl = function(args, cmd)
-        api.jump_prev({ keywords = args, count = cmd and cmd.count and cmd.count > 0 and cmd.count or 1 })
+      impl = function(args)
+        api.jump_prev({ keywords = args, count = 1 })
       end,
       complete = complete_keywords,
     },
