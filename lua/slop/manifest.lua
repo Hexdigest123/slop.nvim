@@ -127,4 +127,12 @@ return {
       list = { mode = "n", lhs = "<leader>xt", desc = "slop: todo list" },
     },
   },
+
+  context = {
+    events = { "BufReadPost", "BufNewFile" },
+    cmd = true,
+    keys = {
+      jump = { mode = "n", lhs = false, desc = "slop: go to context" },
+    },
+  },
 }
