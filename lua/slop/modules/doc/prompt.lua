@@ -330,13 +330,28 @@ local function docstring_prefix(lines)
   return 0
 end
 
---- Does `l` echo the item's code (its trimmed text equals a non-trivial line of the item)?
 ---@param l string
----@param code table<string, true>
+---@return string
+local function norm(l)
+  return (vim.trim(l):gsub("[%s{;:]+$", ""))
+end
+
+--- Does `l` echo the item's code? Its text (without a trailing `{`, `;` or `:`) equals a line of the item, or
+--- one is a prefix of the other (`int f(int a);` for `int f(int a) { ... }`).
+---@param l string
+---@param code string[]  normalized item lines
 ---@return boolean
 local function echoed(l, code)
-  local t = vim.trim(l)
-  return #t > 2 and code[t] == true
+  local t = norm(l)
+  if #t < 3 then
+    return false
+  end
+  for _, c in ipairs(code) do
+    if c == t or (#t >= 6 and #c >= 6 and (c:sub(1, #t) == t or t:sub(1, #c) == c)) then
+      return true
+    end
+  end
+  return false
 end
 
 ---@param lines string[]
@@ -395,7 +410,10 @@ function M.parse(text, target, code, syntax)
   end
   local known = {}
   for _, l in ipairs(code) do
-    known[vim.trim(l)] = true
+    local n = norm(l)
+    if #n >= 3 then
+      known[#known + 1] = n
+    end
   end
   if target.docstring then
     -- an echoed `def ...:` header (and decorators) before the docstring
