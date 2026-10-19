@@ -174,6 +174,9 @@ describe("services.ai.acp", function()
       h.write(key, "x\n-----BEGIN RSA PRIVATE KEY-----\nSECRETBODY\n-----END RSA PRIVATE KEY-----\n")
       local env = dir .. "/.env"
       h.write(env, "TOKEN=abc\n")
+      local outside = h.tmpdir("acpfs-outside") .. "/other.txt"
+      h.write(outside, "not yours\n")
+      vim.cmd.cd(dir)
       vim.cmd.edit(file)
       api.nvim_buf_set_lines(0, 1, 2, false, { "TWO (unsaved)" })
       local log = mock.setup({
@@ -185,6 +188,7 @@ describe("services.ai.acp", function()
             { read = { path = env } },
             { read = { path = dir .. "/missing.txt" } },
             { read = { path = "relative.txt" } },
+            { read = { path = outside } },
           },
         },
       })
@@ -193,7 +197,7 @@ describe("services.ai.acp", function()
         return res.done
       end)
       local r = log.responses("fs/read_text_file")
-      assert.equal(6, #r)
+      assert.equal(7, #r)
       assert.equal("TWO (unsaved)\nthree", r[1].result.content)
       assert.equal("one\nTWO (unsaved)\nthree\nfour", r[2].result.content)
       assert.is_nil(r[3].result.content:find("SECRETBODY", 1, true))
@@ -201,6 +205,7 @@ describe("services.ai.acp", function()
       assert.matches("secrets policy", r[4].error.message)
       assert.equal(-32002, r[5].error.code)
       assert.equal(-32602, r[6].error.code)
+      assert.matches("outside the project root", r[7].error.message)
     end)
 
     it("applies the default permission policy with the agent's own optionIds", function()

@@ -176,7 +176,9 @@ Neovim exits.
 Replacement-text protocol:
 - slop advertises only the `fs.readTextFile` client capability. Reads are
   served from loaded buffers (unsaved text) or disk, redacted, and refused for
-  blocked files.
+  blocked files and for paths outside the project root (symlinks resolved).
+  Set `read_outside_root = true` on an agent in `ai.agents` to lift the root
+  limit for that agent.
 - The prompt asks for exactly one `<slop:replacement>...</slop:replacement>`
   block containing the new region text.
 - Permission requests: `read`, `search`, `fetch`, `think` tools are allowed;

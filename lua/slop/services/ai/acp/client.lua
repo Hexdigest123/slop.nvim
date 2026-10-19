@@ -234,7 +234,10 @@ function Client:_methods()
       end
       local session = self.sessions[params.sessionId]
       local reader = (session and session.read_text_file) or self._opts.read_text_file or acp.read_text_file
-      local text, err = reader(params)
+      local text, err = reader(params, {
+        root = (session and session.cwd) or self._opts.cwd,
+        read_outside_root = self._opts.read_outside_root or (self.config and self.config.read_outside_root),
+      })
       if text == nil then
         if type(err) ~= "table" then
           err = { code = rpc_mod.INTERNAL_ERROR, message = tostring(err or "cannot read file") }

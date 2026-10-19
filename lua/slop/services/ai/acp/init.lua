@@ -117,11 +117,25 @@ local function buffer_for(path)
   end
 end
 
+--- Is `path` inside `root`? Symlinks are resolved for both, so a link can't escape the root.
+---@param path string
+---@param root string
+---@return boolean
+local function inside(path, root)
+  local real = vim.uv.fs_realpath(path) or path
+  local base = vim.uv.fs_realpath(root) or root
+  base = base:gsub("/+$", "")
+  return real == base or real:sub(1, #base + 1) == base .. "/"
+end
+
 --- Default `fs/read_text_file` handler: live buffer first (unsaved state), else disk; `line` is 1-based,
---- `limit` a line count. Redacted with core.secrets; blocked paths are refused.
+--- `limit` a line count. Redacted with core.secrets; blocked paths and paths outside `opts.root`
+--- (default core.project.root()) are refused unless `opts.read_outside_root` is set.
 ---@param params {path: string, line?: integer, limit?: integer}
+---@param opts? {root?: string, read_outside_root?: boolean}
 ---@return string? text, table? err
-function M.read_text_file(params)
+function M.read_text_file(params, opts)
+  opts = opts or {}
   local path = params and params.path
   if type(path) ~= "string" or path == "" then
     return nil, { code = -32602, message = "path is required" }
@@ -129,6 +143,12 @@ function M.read_text_file(params)
   path = vim.fs.normalize(path)
   if path:sub(1, 1) ~= "/" and not path:match("^%a:[/\\]") then
     return nil, { code = -32602, message = "path must be absolute: " .. path }
+  end
+  if not opts.read_outside_root then
+    local root = opts.root or require("slop.core.project").root()
+    if not inside(path, root) then
+      return nil, { code = -32603, message = "slop: reading outside the project root is refused: " .. path }
+    end
   end
   local secrets = require("slop.core.secrets")
   if secrets.is_blocked(path) then
