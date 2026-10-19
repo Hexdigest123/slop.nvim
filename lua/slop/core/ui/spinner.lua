@@ -190,7 +190,7 @@ function M.progress(opts)
   }, Progress)
   if opts.on_cancel then
     local ok, au = pcall(vim.api.nvim_create_autocmd, "Progress", {
-      group = require("slop.core.util").augroup("progress"),
+      group = require("slop.core.util").augroup("ui.spinner"),
       pattern = source,
       desc = "slop: progress cancel",
       callback = function(ev)
