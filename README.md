@@ -70,8 +70,17 @@ mapping = {
 return { dir = "~/Projects/slop.nvim", opts = {} }
 ```
 
-## Check it
+## Help
 
-```vim
-:checkhealth slop
-```
+Everything is documented in Neovim's help:
+
+| Command              | Shows                                                                 |
+| -------------------- | --------------------------------------------------------------------- |
+| `:h slop`            | Setup, every config option, commands, keymaps, events, project folder |
+| `:h slop-<module>`   | One module: its keymaps, commands, options and examples               |
+| `:checkhealth slop`  | Per module: config errors, API keys (set or not), agents on `$PATH`   |
+| `:Slop modules`      | Which modules are enabled and loaded                                  |
+| `:Slop log`          | slop's log (raise detail with `opts = { log = { level = "debug" } }`) |
+
+Every keymap can be changed or turned off under the module's `keymaps` table, e.g.
+`opts = { term = { keymaps = { toggle = "<C-\\>" } } }` or `toggle = false` (see `:h slop-keymaps`).
