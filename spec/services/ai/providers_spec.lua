@@ -77,6 +77,48 @@ describe("services.ai providers", function()
     assert.is_false(body.stream)
   end)
 
+  it("provider timeout and max_tokens are floors for every request", function()
+    srv = mock.start(function(_, res)
+      res.json(200, { choices = { { message = { content = "ok" } } } })
+    end)
+    setup({
+      slow = {
+        kind = "chat",
+        service = "mistral",
+        url = srv.url .. "/v1/chat/completions",
+        model = "thinker",
+        api_key = api_key,
+        timeout = 120000,
+        max_tokens = 8192,
+      },
+    })
+    local http = require("slop.core.http")
+    local orig, timeouts = http.request, {}
+    http.request = function(r)
+      timeouts[#timeouts + 1] = r.timeout
+      return orig(r)
+    end
+    local ok, err = pcall(function()
+      for _, req in ipairs({ { max_tokens = 1024, timeout = 30000 }, { max_tokens = 16000, timeout = 200000 } }) do
+        wait_done(function(done)
+          ai.chat({
+            provider = "slow",
+            messages = { { role = "user", content = "hi" } },
+            max_tokens = req.max_tokens,
+            timeout = req.timeout,
+            stream = false,
+            on_done = done,
+          })
+        end)
+      end
+    end)
+    http.request = orig
+    assert(ok, err)
+    assert.are.same({ 120000, 200000 }, timeouts)
+    assert.equal(8192, vim.json.decode(srv.requests[1].body).max_tokens)
+    assert.equal(16000, vim.json.decode(srv.requests[2].body).max_tokens)
+  end)
+
   it("codestral FIM streams deltas (SSE) incrementally", function()
     srv = mock.start(function(_, res)
       res.stream(200, {

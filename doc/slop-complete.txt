@@ -155,7 +155,12 @@ This is slower than a FIM endpoint.
                  vars? } (templates may use {{lang}} {{indent}} {{n}}
                  {{prefix}} {{suffix}} and your own vars)
   stream         false disables streaming
-  timeout        default request timeout (ms)
+  timeout        minimum request timeout (ms) for every module using this
+                 provider (default 30000; a module's own `timeout` can only
+                 raise it)
+  max_tokens     minimum `max_tokens` for every chat request to this
+                 provider. Reasoning models spend tokens thinking before
+                 they answer: set e.g. 8192 here instead of per module
 
 Recipes: >lua
   ai = { providers = {

@@ -30,7 +30,8 @@ local M = {
 ---@field fim_template? false|"qwen"|"deepseek"|"codellama"|"starcoder"|"codestral"|fun(prompt: string, suffix: string): string
 ---@field chat_fim? table                 chat-model FIM prompt overrides (see services/ai/chat_fim.lua)
 ---@field stream? boolean                 false disables streaming for this provider
----@field timeout? integer                ms, default per request
+---@field timeout? integer                ms; minimum for every request to this provider (default 30000)
+---@field max_tokens? integer             minimum max_tokens for every chat request (reasoning models think first)
 ---@field name? string                    display name
 
 ---@class slop.ai.AgentConfig
@@ -82,6 +83,7 @@ function M.schema(cfg, check)
       check(pre .. ".chat_fim", p.chat_fim, "table", true)
       check(pre .. ".stream", p.stream, "boolean", true)
       check(pre .. ".timeout", p.timeout, "number", true)
+      check(pre .. ".max_tokens", p.max_tokens, "number", true)
       check(pre .. ".name", p.name, "string", true)
       check(pre .. ".fim_template", p.fim_template, function(v)
         return v == nil
@@ -289,11 +291,15 @@ local function run(kind, req, finish, on_text)
   end
   stream = stream and p.stream ~= false
   local areq = vim.tbl_extend("force", {}, req, { stream = stream })
+  -- provider limits are floors: a slow reasoning model needs them for every module's requests
+  if p.max_tokens and akind == "chat" then
+    areq.max_tokens = math.max(areq.max_tokens or 0, p.max_tokens)
+  end
   if chat_fim then
     local cf = require("slop.services.ai.chat_fim")
     areq = {
       messages = cf.messages(p, req),
-      max_tokens = req.max_tokens,
+      max_tokens = areq.max_tokens,
       temperature = req.temperature,
       stream = stream,
     }
@@ -308,7 +314,10 @@ local function run(kind, req, finish, on_text)
   if type(p.headers) == "table" then
     hreq.headers = vim.tbl_extend("force", hreq.headers or {}, p.headers)
   end
-  hreq.timeout = req.timeout or p.timeout or 30000
+  hreq.timeout = math.max(req.timeout or 0, p.timeout or 0)
+  if hreq.timeout == 0 then
+    hreq.timeout = 30000
+  end
   hreq.name = "ai:" .. label
   if type(p.transform) == "function" then
     local ok, r = pcall(p.transform, hreq, { name = pname, kind = akind, provider = p })
