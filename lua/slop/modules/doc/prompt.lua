@@ -406,7 +406,8 @@ end
 function M.parse(text, target, code, syntax)
   local lines = M.unfence(text)
   if #lines == 0 then
-    return nil, "the AI answer is empty"
+    return nil,
+      "the AI answer is empty (a reasoning model may have spent max_tokens thinking: raise the provider's max_tokens)"
   end
   local known = {}
   for _, l in ipairs(code) do
