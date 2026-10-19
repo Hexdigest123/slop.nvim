@@ -166,7 +166,8 @@ Agents are configured in `ai.agents` (|slop-config|); the shipped ones are: >lua
 <
 Optional per-agent fields: `env` (added to the inherited environment),
 `auth_method` (an ACP auth method id sent with `authenticate`), `timeout`
-(ms, default request timeout, 30000), `init_timeout` (ms, 60000).
+(ms, default request timeout, 30000), `init_timeout` (ms, 60000), `mode`
+(see |slop-edit-modes|), `read_outside_root` (see below).
 
 One agent process per agent name is started on first use and kept running;
 each request gets its own session (`session/new`), so requests are independent
@@ -191,9 +192,22 @@ Replacement-text protocol:
   regions dropped, the base indentation restored if the agent dropped it,
   answers containing `<redacted>` (or nested tags) refused.
 
-Agents that write files themselves without asking (e.g. a "bypass
-permissions" mode) cannot be stopped by slop; slop warns when it sees such an
-edit of the buffer's file. Configure your agent to ask for permissions.
+                                                             *slop-edit-modes*
+Permission modes: some agents start sessions in a mode that approves actions
+on its own (claude-agent-acp follows Claude Code's `permissions.defaultMode`,
+e.g. "auto" or "bypassPermissions"). Such actions never reach slop's policy.
+So every new session is switched to an ask-before-acting mode before the
+first prompt, via `session/set_config_option` (or legacy `session/set_mode`):
+- `mode = nil` (default): pick the agent's ask mode ("default", "ask",
+  "manual", or a mode described as asking before changes).
+- `mode = "<id>"`: switch to that mode id.
+- `mode = false`: leave the agent's mode alone.
+If the switch fails, or the agent only offers auto modes, the session still
+runs and slop warns. slop also warns when the agent later switches itself to
+an auto mode.
+
+Agents that still write files themselves without asking cannot be stopped by
+slop; slop warns when it sees such an edit of the buffer's file.
 
 ==============================================================================
 8. CONFIGURATION                                              *slop-edit-config*

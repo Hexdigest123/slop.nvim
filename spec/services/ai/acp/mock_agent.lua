@@ -9,6 +9,8 @@
 --     "by_prompt": { "<exact prompt text>": [action, ...] }   -- wins over "turns"
 --   }
 -- Actions:
+--   "session_new": {...} merged into the session/new result (modes / configOptions),
+--   "set_mode_error": true -> session/set_mode and session/set_config_option fail.
 --   {"chunk": "text"} {"thought": "text"} {"tool": {...toolCall}} {"tool_update": {...}} {"update": {...raw}}
 --   {"permission": {"toolCall": {...}, "options": [...]}}   -> session/request_permission, waits for the answer
 --   {"read": {"path": "...", "line": n, "limit": n}, "echo": true} -> fs/read_text_file, waits; echo = chunk back
@@ -217,7 +219,24 @@ local function handle(msg)
       end
     elseif m == "session/new" then
       sessions = sessions + 1
-      send({ id = msg.id, result = { sessionId = "mock-" .. sessions } })
+      send({
+        id = msg.id,
+        result = vim.tbl_extend("force", plan.session_new or {}, { sessionId = "mock-" .. sessions }),
+      })
+    elseif m == "session/set_mode" or m == "session/set_config_option" then
+      if plan.set_mode_error then
+        send({ id = msg.id, error = { code = -32602, message = "mode rejected" } })
+      elseif m == "session/set_config_option" then
+        local opts = vim.deepcopy((plan.session_new or {}).configOptions or {})
+        for _, o in ipairs(opts) do
+          if o.id == p.configId then
+            o.currentValue = p.value
+          end
+        end
+        send({ id = msg.id, result = { configOptions = opts } })
+      else
+        send({ id = msg.id, result = vim.empty_dict() })
+      end
     elseif m == "session/close" then
       send({ id = msg.id, result = vim.empty_dict() })
     elseif m == "session/prompt" then

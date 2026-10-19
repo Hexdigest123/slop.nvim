@@ -93,6 +93,9 @@ function M.schema(cfg, check)
   end
   for name, a in pairs(cfg.agents or {}) do
     check("agents." .. name .. ".cmd", type(a) == "table" and a.cmd or nil, "table")
+    check("agents." .. name .. ".mode", type(a) == "table" and a.mode or nil, function(v)
+      return v == nil or v == false or type(v) == "string"
+    end, true, "false|mode id")
   end
 end
 

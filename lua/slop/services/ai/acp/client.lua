@@ -13,6 +13,75 @@ local function log()
   return require("slop.core.log").scope("acp")
 end
 
+-- Permission modes ---------------------------------------------------------------------------------
+-- Agents may start sessions in a mode that approves actions on its own (e.g. claude-agent-acp follows
+-- Claude Code's `permissions.defaultMode`). Those actions never reach our permission policy, so every
+-- new session is switched to an "ask before acting" mode when the agent offers one.
+
+-- Preferred ask-mode ids, in order (claude-agent-acp: "default" = "Manual"; ACP docs: "ask").
+local ASK_IDS = { "default", "ask", "manual" }
+-- Modes known to act without asking the client.
+local AUTO_IDS = { auto = true, acceptEdits = true, bypassPermissions = true, dontAsk = true, yolo = true }
+
+---@class slop.acp.ModeState
+---@field kind "config"|"modes"       session config option (preferred by the spec) or legacy modes
+---@field config_id? string
+---@field current? string
+---@field available {id: string, name?: string, description?: string}[]
+
+--- Mode selector from a session/new result or a session/update payload.
+---@param t table
+---@return slop.acp.ModeState?
+local function mode_state(t)
+  for _, opt in ipairs(type(t.configOptions) == "table" and t.configOptions or {}) do
+    if type(opt) == "table" and opt.category == "mode" and opt.type == "select" and type(opt.id) == "string" then
+      local values = {}
+      for _, o in ipairs(type(opt.options) == "table" and opt.options or {}) do
+        for _, v in ipairs(type(o.options) == "table" and o.options or { o }) do
+          if type(v.value) == "string" then
+            values[#values + 1] = { id = v.value, name = v.name, description = v.description }
+          end
+        end
+      end
+      return { kind = "config", config_id = opt.id, current = opt.currentValue, available = values }
+    end
+  end
+  local m = t.modes
+  if type(m) == "table" and type(m.availableModes) == "table" then
+    local values = {}
+    for _, v in ipairs(m.availableModes) do
+      if type(v) == "table" and type(v.id) == "string" then
+        values[#values + 1] = { id = v.id, name = v.name, description = v.description }
+      end
+    end
+    return { kind = "modes", current = m.currentModeId, available = values }
+  end
+end
+
+---@param available {id: string, name?: string, description?: string}[]
+---@return string?
+local function pick_ask_mode(available)
+  local ids = {}
+  for _, v in ipairs(available) do
+    ids[v.id] = true
+  end
+  for _, id in ipairs(ASK_IDS) do
+    if ids[id] then
+      return id
+    end
+  end
+  for _, v in ipairs(available) do
+    local text = ((v.name or "") .. " " .. (v.description or "")):lower()
+    if
+      text:find("always ask", 1, true)
+      or text:find("ask before", 1, true)
+      or text:find("request permission", 1, true)
+    then
+      return v.id
+    end
+  end
+end
+
 ---@class slop.acp.PromptHandlers
 ---@field on_update? fun(update: table)
 ---@field on_permission? fun(req: table, respond: fun(option_id: string|nil))
@@ -29,6 +98,7 @@ end
 ---@field client slop.acp.Client
 ---@field cwd string
 ---@field read_text_file? fun(params: table): string?, (table|string)?
+---@field mode? string                       current permission mode id, when the agent reports one
 ---@field private _turn slop.acp.Turn?
 ---@field private _perms table<any, fun(option_id: string|nil)>
 ---@field private _closed boolean
@@ -255,6 +325,9 @@ end
 function Client:_on_notification(method, params)
   if method == "session/update" then
     local session = self.sessions[params.sessionId]
+    if session and type(params.update) == "table" then
+      self:_track_mode(session, params.update)
+    end
     local turn = session and session._turn
     if turn and turn.handlers.on_update and type(params.update) == "table" then
       local ok, err = pcall(turn.handlers.on_update, params.update)
@@ -424,9 +497,91 @@ function Client:new_session(opts, cb)
         _closed = false,
       }, Session)
       self.sessions[session.id] = session
-      cb(session, nil)
+      self:_apply_mode(session, result, function()
+        cb(session, nil)
+      end)
     end)
   end)
+end
+
+--- Switch a new session to an ask-before-acting mode (agent config `mode`: nil = pick one,
+--- string = that mode id, false = leave the agent's mode alone). Never fails the session.
+---@param session slop.acp.Session
+---@param result table session/new result
+---@param done fun()
+function Client:_apply_mode(session, result, done)
+  local want = self.config and self.config.mode
+  local state = mode_state(result)
+  session.mode = state and state.current or nil
+  if want == false or not state then
+    return done()
+  end
+  local target = type(want) == "string" and want or pick_ask_mode(state.available)
+  if not target then
+    if AUTO_IDS[session.mode] then
+      log().warn(
+        "agent %s runs in mode %q and offers no ask-before-acting mode; its actions may bypass slop (set ai.agents.%s.mode)",
+        self.agent,
+        session.mode,
+        self.agent
+      )
+    end
+    return done()
+  end
+  if target == state.current then
+    return done()
+  end
+  local offered = vim.tbl_contains(
+    vim.tbl_map(function(v)
+      return v.id
+    end, state.available),
+    target
+  )
+  if not offered then
+    log().warn("agent %s does not offer mode %q; staying in %q", self.agent, target, tostring(session.mode))
+    return done()
+  end
+  local method, params
+  if state.kind == "config" then
+    method, params = "session/set_config_option", { sessionId = session.id, configId = state.config_id, value = target }
+  else
+    method, params = "session/set_mode", { sessionId = session.id, modeId = target }
+  end
+  self:request(method, params, function(_, err)
+    if err then
+      log().warn(
+        "agent %s: could not switch to mode %q (%s); staying in %q",
+        self.agent,
+        target,
+        type(err) == "table" and err.message or tostring(err),
+        tostring(session.mode)
+      )
+    else
+      log().debug("agent %s: session %s mode %s -> %s", self.agent, session.id, tostring(session.mode), target)
+      session.mode = target
+    end
+    done()
+  end)
+end
+
+--- Follow mode changes the agent reports during a session; warn when it switches to an auto mode.
+---@param session slop.acp.Session
+---@param u table session/update payload
+function Client:_track_mode(session, u)
+  local new
+  if u.sessionUpdate == "current_mode_update" then
+    new = u.currentModeId
+  elseif u.sessionUpdate == "config_option_update" then
+    local st = mode_state(u)
+    new = st and st.current
+  end
+  if type(new) ~= "string" or new == session.mode then
+    return
+  end
+  session.mode = new
+  if AUTO_IDS[new] then
+    log().warn("agent %s switched to mode %q: it may act without asking slop", self.agent, new)
+  end
 end
 
 --- Raw request (agent must be running; use start() first).
