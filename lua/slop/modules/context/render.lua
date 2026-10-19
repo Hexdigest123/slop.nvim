@@ -569,13 +569,16 @@ function M.start(cfg)
   au({ "BufEnter", "WinEnter", "WinResized", "VimResized", "BufReadPost", "BufNewFile" }, function()
     vim.schedule(M.request)
   end)
-  au("OptionSet", function()
+  local function forced()
     vim.schedule(function()
       if S.cfg then
         M.update(nil, true)
       end
     end)
-  end, {
+  end
+  -- FileType: the parser / treesitter highlighter usually starts there, after the first BufEnter
+  au("FileType", forced)
+  au("OptionSet", forced, {
     pattern = {
       "number",
       "relativenumber",

@@ -135,11 +135,11 @@ The float buffer carries the source file's path (`vim.b.slop_secret_path`),
 so |slop-cloak| masks secrets in it like in the file.
 
 Updates follow CursorMoved(I), WinScrolled, WinResized, BufEnter, WinEnter,
-TextChanged(I) and gutter-related OptionSet. They run at once, then at most
-every 30 ms while you scroll; the last position is always drawn. A context
-that did not change is not redrawn. The context closes on WinLeave and is
-never shown in floating windows, special buffers ('buftype' not empty),
-buffers without a parser, or windows lower than `min_window_height`.
+TextChanged(I), FileType and gutter-related OptionSet. They run at once, then
+at most every 30 ms while you scroll; the last position is always drawn. A
+context that did not change is not redrawn. The context closes on WinLeave
+and is never shown in floating windows, special buffers ('buftype' not
+empty), buffers without a parser, or windows lower than `min_window_height`.
 
 ==============================================================================
 7. LUA API                                                  *slop-context-api*
