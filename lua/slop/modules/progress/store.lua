@@ -48,8 +48,13 @@ local FIELDS = { "group", "title", "message", "percent", "client_id", "ai_id", "
 ---@param fields table
 local function apply(item, fields)
   for _, f in ipairs(FIELDS) do
-    if fields[f] ~= nil then
-      item[f] = fields[f]
+    local v = fields[f]
+    if type(v) == "string" then
+      -- one window line per item: multi-line LSP/AI messages are flattened
+      v = vim.trim((v:gsub("%s*[\r\n]+%s*", " ")))
+    end
+    if v ~= nil then
+      item[f] = v
     end
   end
 end
