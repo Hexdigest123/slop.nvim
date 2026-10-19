@@ -1,0 +1,191 @@
+*slop-context.txt*  Sticky scope headers at the top of the window
+
+==============================================================================
+CONTENTS                                               *slop-context-contents*
+
+  1. Introduction ............................ |slop-context-intro|
+  2. Keymaps ................................. |slop-context-keymaps|
+  3. Commands ................................ |slop-context-commands|
+  4. Configuration ........................... |slop-context-config|
+  5. What is shown ........................... |slop-context-scopes|
+  6. Rendering ............................... |slop-context-render|
+  7. Lua API ................................. |slop-context-api|
+  8. Highlights .............................. |slop-context-highlights|
+  9. Migrating from nvim-treesitter-context .. |slop-context-migrate|
+ 10. Limitations ............................. |slop-context-limitations|
+
+==============================================================================
+1. INTRODUCTION                                           *slop-context-intro*
+
+The `context` module replaces nvim-treesitter-context. When the start of the
+function, class, `if`/`for`/`while` block or table literal you are in has
+scrolled out of view, its first line(s) stay pinned at the top of the window,
+with their real line numbers in the gutter:
+>
+    3 function M.outer(a,
+    4   b)
+    5   if a then
+   18     print(13)
+<
+It needs a treesitter parser for the buffer (from nvim-treesitter or bundled
+with Neovim: lua, c, vim, vimdoc, query, markdown). Buffers without one show
+no context. Nothing is parsed twice: the scopes come from the buffer's own
+parser, the colors from its treesitter highlighter, semantic tokens and
+other highlight extmarks.
+
+The module loads on the first file read. It shows one context float, over
+the current window; every window gets its own when it becomes current.
+
+==============================================================================
+2. KEYMAPS                                              *slop-context-keymaps*
+
+No default keys. Name `goto` (a LuaJIT keyword, so quote it):
+>lua
+  context = { keymaps = { ["goto"] = "[c" } }
+<
+  Mode  Name   Action ~
+  n     goto   jump to the start of the enclosing scope ([count] levels up)
+
+Plug: `<Plug>(slop-context-goto)`.
+
+==============================================================================
+3. COMMANDS                                            *slop-context-commands*
+
+:Slop context [toggle]                                  *:Slop-context-toggle*
+:Slop context enable                                    *:Slop-context-enable*
+:Slop context disable                                  *:Slop-context-disable*
+        Show or hide the context in every window.
+
+:Slop context goto [depth]                                *:Slop-context-goto*
+        Jump to the start of the enclosing scope, `depth` levels up
+        (default 1, or the count). Adds a jumplist entry, so |``| returns.
+        A scope whose header is on the cursor line is skipped, so repeated
+        jumps climb outwards.
+
+==============================================================================
+4. CONFIGURATION                                         *slop-context-config*
+>lua
+  context = {
+    enabled = true,
+    mode = "cursor",          -- "cursor": scopes around the cursor
+                              -- "topline": scopes of the first visible line
+    max_lines = 3,            -- max context rows; 0 = no limit
+    multiline_threshold = 20, -- max rows of one header (long signatures)
+    trim_scope = "outer",     -- more than max_lines: drop "outer" or
+                              -- "inner" scopes first
+    line_numbers = true,      -- cover the gutter with the real numbers
+    min_window_height = 0,    -- no context in lower windows
+    separator = false,        -- e.g. "─": a line under the context instead
+                              -- of the underline
+    zindex = 20,
+    node_types = {},          -- { lua = { "function_declaration", ... } }
+                              -- replaces the built-in list of a language
+    keymaps = { ["goto"] = false },
+  }
+<
+Per buffer: `vim.b.slop_context = false` turns the context off there.
+
+==============================================================================
+5. WHAT IS SHOWN                                         *slop-context-scopes*
+
+Scope nodes. Each language has its own list of node types (lua, c, cpp,
+python, javascript, typescript, tsx, go, rust, java, ruby, bash, vim,
+markdown sections, json, yaml, toml, html). Other languages fall back to the
+function/method/class kinds of slop's treesitter helpers plus generic
+`if`/`for`/`while`/`switch`/`case`/`try`/`match` types and object literals.
+Injected languages count too, e.g. a lua function in a markdown fence shows
+under its section heading. `node_types` replaces a language's list.
+
+Header. A scope shows from its first row up to the last row before its body,
+so a signature split over several lines is shown whole (at most
+`multiline_threshold` rows). When the cursor is inside the header, only the
+rows above the cursor are shown. Scopes that start on the same row show once.
+
+Which scopes. A scope shows when its first row is above the window's first
+line, or hidden under the context rows shown above it. In "cursor" mode
+these are the scopes around the cursor. In "topline" mode they are the
+scopes around the first line below the context. The context never covers
+the cursor line, and at least one line of the window stays visible.
+
+Trimming. With more than `max_lines` rows, whole scopes are dropped:
+outermost first with `trim_scope = "outer"`, innermost first with "inner".
+If one scope is still too tall, its header is cut.
+
+==============================================================================
+6. RENDERING                                             *slop-context-render*
+
+The context is a borderless float pinned at row 0 of the window, over the
+text area only. With `line_numbers`, a second float covers the gutter (the
+fold, sign and number columns) with the context lines' numbers: absolute
+with 'number', relative to the cursor with 'relativenumber', or the window's
+'statuscolumn' evaluated for that line.
+
+The float shows the source lines with the buffer's 'tabstop', 'list' and
+'listchars' and without wrapping. When the window is scrolled horizontally,
+the float scrolls by the same amount, so the text stays aligned. Lines
+longer than the window are cut at the edge.
+
+Highlights are copied, never recomputed: the treesitter captures of the
+buffer's active highlighter (|vim.treesitter.start()|; nvim-treesitter's
+`highlight` module does this) and every highlight extmark of the source rows
+(LSP semantic tokens, diagnostics, other plugins), keeping their priority
+order.
+
+The float buffer carries the source file's path (`vim.b.slop_secret_path`),
+so |slop-cloak| masks secrets in it like in the file.
+
+Updates follow CursorMoved(I), WinScrolled, WinResized, BufEnter, WinEnter,
+TextChanged(I) and gutter-related OptionSet. They run at once, then at most
+every 30 ms while you scroll; the last position is always drawn. A context
+that did not change is not redrawn. The context closes on WinLeave and is
+never shown in floating windows, special buffers ('buftype' not empty),
+buffers without a parser, or windows lower than `min_window_height`.
+
+==============================================================================
+7. LUA API                                                  *slop-context-api*
+>lua
+  local ctx = require("slop").context
+  ctx.toggle()  ctx.enable()  ctx.disable()  ctx.is_enabled()
+  ctx.go_to_context(depth?)  -- like treesitter-context's go_to_context()
+  ctx.refresh(win?)          -- recompute and redraw now
+  ctx.contexts(win?)         -- what is shown: { {row, col, rows}, ... }
+<
+Rows and columns are 0-based. `contexts()` lists the shown scopes, outermost
+first.
+
+==============================================================================
+8. HIGHLIGHTS                                        *slop-context-highlights*
+
+  SlopContext              the context float (links to NormalFloat)
+  SlopContextLineNumber    the gutter float (links to LineNr)
+  SlopContextBottom        the last context row (default: underline)
+  SlopContextSeparator     the `separator` line (links to FloatBorder)
+
+==============================================================================
+9. MIGRATING FROM NVIM-TREESITTER-CONTEXT               *slop-context-migrate*
+
+Remove nvim-treesitter-context. Its options map one to one:
+
+  treesitter-context            slop context ~
+  `enable`                        `enabled`
+  `mode`, `max_lines`, `trim_scope`, `multiline_threshold`,
+  `line_numbers`, `min_window_height`, `separator`, `zindex`   same names
+  `:TSContext toggle|enable|disable`   `:Slop context toggle|enable|disable`
+  `go_to_context(vim.v.count1)`   `require("slop").context.go_to_context()`
+                                or `keymaps = { ["goto"] = "[c" }`
+  `TreesitterContext*` groups    `SlopContext*` groups
+  `queries/<lang>/context.scm`    `node_types = { <lang> = { ... } }`
+  `on_attach`                     `vim.b.slop_context = false`
+
+Defaults differ: slop starts with `mode = "cursor"` and `max_lines = 3`.
+
+==============================================================================
+10. LIMITATIONS                                     *slop-context-limitations*
+
+- Concealed text ('conceallevel') is shown unconcealed in the float.
+- Rows are counted as screen rows: with 'wrap', a long wrapped line under
+  the context may be partly covered.
+- Semantic tokens of rows that were never drawn are not known yet; the
+  float picks them up on the next LspTokenUpdate.
+
+ vim:tw=78:ts=8:ft=help:norl:
