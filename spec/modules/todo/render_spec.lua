@@ -202,6 +202,31 @@ describe("todo render", function()
     )
   end)
 
+  it("covers buffers already open when the module loads; signs per window, unchanged signs kept", function()
+    local lines = { "-- TODO: top" }
+    for i = 2, 300 do
+      lines[i] = "local _ = " .. i
+    end
+    lines[200] = "-- FIX: far"
+    local path = dir .. "/pre.lua"
+    h.write(path, table.concat(lines, "\n") .. "\n")
+    vim.cmd.edit(vim.fn.fnameescape(path))
+    local buf = api.nvim_get_current_buf()
+    vim.cmd("redraw!")
+    load()
+    vim.cmd("split")
+    vim.cmd("normal! 200Gzz")
+    vim.cmd("redraw!")
+    local got = signs(buf)
+    assert.are.same({ { 0, "SlopTodoTodo" }, { 199, "SlopTodoFix" } }, got)
+    local ns = require("slop.core.util").ns("todo.signs")
+    local id = api.nvim_buf_get_extmarks(buf, ns, 0, 0, {})[1][1]
+    api.nvim_buf_set_lines(buf, 5, 6, false, { "local changed = true" })
+    vim.cmd("redraw!")
+    vim.wait(20)
+    assert.equal(id, api.nvim_buf_get_extmarks(buf, ns, 0, 0, {})[1][1], "sign not re-created")
+  end)
+
   it("signs = false and per-keyword signs = false", function()
     local buf = open("a.lua", LUA, { signs = false })
     assert.are.same({}, signs(buf))

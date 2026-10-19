@@ -35,8 +35,8 @@ local S = {
   enabled = true,
   active = false,
   bufs = {}, ---@type table<integer, slop.todo.BufState>
-  parsers = {}, ---@type table<integer, {ft: string, parser: vim.treesitter.LanguageTree|false}>
-  pending = {}, ---@type table<integer, {top: integer, bot: integer}>  sign updates waiting for the main loop
+  parsers = {}, ---@type table<integer, string>  buffer -> filetype without a treesitter parser
+  pending = {}, ---@type table<integer, table<integer, {[1]: integer, [2]: integer}>>  buf -> win -> rows to sign
   ns = nil, ---@type integer?
   ns_sign = nil, ---@type integer?
 }
@@ -62,14 +62,17 @@ end
 ---@param buf integer
 ---@return vim.treesitter.LanguageTree|false
 local function parser_of(buf)
+  -- only misses are cached (a failed lookup searches 'runtimepath'); get_parser() caches hits itself
   local ft = vim.bo[buf].filetype
-  local p = S.parsers[buf]
-  if not p or p.ft ~= ft then
-    local ok, parser = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
-    p = { ft = ft, parser = ok and parser or false }
-    S.parsers[buf] = p
+  if S.parsers[buf] == ft then
+    return false
   end
-  return p.parser
+  local ok, parser = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
+  if ok and parser then
+    return parser
+  end
+  S.parsers[buf] = ft
+  return false
 end
 
 --- Is (row, col) inside a treesitter comment node? Returns the comment's end column on `row` when it ends there.
@@ -334,45 +337,49 @@ end
 -- Signs ---------------------------------------------------------------------------------------
 
 ---@param buf integer
----@param srow? integer
----@param erow? integer
-local function clear_signs(buf, srow, erow)
-  if not api.nvim_buf_is_valid(buf) then
-    return
-  end
-  if not srow then
+local function clear_signs(buf)
+  if api.nvim_buf_is_valid(buf) then
     api.nvim_buf_clear_namespace(buf, ns_sign(), 0, -1)
-    return
-  end
-  for _, m in ipairs(api.nvim_buf_get_extmarks(buf, ns_sign(), { srow, 0 }, { erow or srow, -1 }, {})) do
-    api.nvim_buf_del_extmark(buf, ns_sign(), m[1])
   end
 end
 
+--- Wanted sign of a row (first hit whose group has signs), nil for none.
+---@param hits slop.todo.Hit[]|false
+---@return slop.todo.Group?
+local function sign_group(hits)
+  for _, hit in ipairs(hits or {}) do
+    if hit.group.signs and hit.group.icon ~= "" then
+      return hit.group
+    end
+  end
+  return nil
+end
+
 ---@param buf integer
-local function flush_signs(buf)
-  local p = S.pending[buf]
-  S.pending[buf] = nil
-  if not p or not S.active or not S.enabled or not (S.cfg and S.cfg.signs) or not api.nvim_buf_is_valid(buf) then
-    return
+---@param st slop.todo.BufState
+---@param top integer
+---@param bot integer
+local function reconcile_signs(buf, st, top, bot)
+  local nss = ns_sign()
+  local have = {} ---@type table<integer, {id: integer, hl: string?, invalid: boolean?}[]>
+  for _, m in ipairs(api.nvim_buf_get_extmarks(buf, nss, { top, 0 }, { bot, -1 }, { details = true })) do
+    have[m[2]] = have[m[2]] or {}
+    table.insert(have[m[2]], { id = m[1], hl = m[4].sign_hl_group, invalid = m[4].invalid })
   end
-  local st = M.buf_state(buf)
-  if not st.ok then
-    clear_signs(buf)
-    return
-  end
-  local bot = math.min(p.bot, api.nvim_buf_line_count(buf) - 1)
-  local first = first_row(p.top)
+  local first = first_row(top)
   local ctx = { buf = buf, first = first, last = bot }
   local get = lines_getter(buf, first, bot)
-  for row = p.top, bot do
+  for row = top, bot do
     if st.signed[row] ~= st.tick then
       st.signed[row] = st.tick
-      clear_signs(buf, row)
-      local b = base(st, ctx, row, get(row))
-      for _, hit in ipairs(b or {}) do
-        local g = hit.group
-        if g.signs and g.icon ~= "" then
+      local g = sign_group(base(st, ctx, row, get(row)))
+      local marks = have[row] or {}
+      local keep = g and #marks == 1 and marks[1].hl == g.hl and not marks[1].invalid
+      if not keep then
+        for _, m in ipairs(marks) do
+          api.nvim_buf_del_extmark(buf, nss, m.id)
+        end
+        if g then
           local opts = {
             sign_text = g.icon,
             sign_hl_group = g.hl,
@@ -380,11 +387,10 @@ local function flush_signs(buf)
             invalidate = true,
             undo_restore = false,
           }
-          if not pcall(api.nvim_buf_set_extmark, buf, ns_sign(), row, 0, opts) then
+          if not pcall(api.nvim_buf_set_extmark, buf, nss, row, 0, opts) then
             opts.sign_text = vim.fn.strcharpart(g.icon, 0, 1)
-            pcall(api.nvim_buf_set_extmark, buf, ns_sign(), row, 0, opts)
+            pcall(api.nvim_buf_set_extmark, buf, nss, row, 0, opts)
           end
-          break
         end
       end
     end
@@ -392,10 +398,32 @@ local function flush_signs(buf)
 end
 
 ---@param buf integer
+local function flush_signs(buf)
+  local ranges = S.pending[buf]
+  S.pending[buf] = nil
+  if not ranges or not S.active or not S.enabled or not (S.cfg and S.cfg.signs) or not api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local st = M.buf_state(buf)
+  if not st.ok then
+    clear_signs(buf)
+    return
+  end
+  local last = api.nvim_buf_line_count(buf) - 1
+  for _, r in pairs(ranges) do
+    if r[1] <= last then
+      reconcile_signs(buf, st, r[1], math.min(r[2], last))
+    end
+  end
+end
+
+--- Queue a sign update of the rows `win` shows (one per window, applied on the main loop).
+---@param win integer
+---@param buf integer
 ---@param st slop.todo.BufState
 ---@param top integer
 ---@param bot integer
-local function schedule_signs(buf, st, top, bot)
+local function schedule_signs(win, buf, st, top, bot)
   local need = false
   for row = top, bot do
     if st.signed[row] ~= st.tick then
@@ -408,10 +436,10 @@ local function schedule_signs(buf, st, top, bot)
   end
   local p = S.pending[buf]
   if p then
-    p.top, p.bot = math.min(p.top, top), math.max(p.bot, bot)
+    p[win] = { top, bot }
     return
   end
-  S.pending[buf] = { top = top, bot = bot }
+  S.pending[buf] = { [win] = { top, bot } }
   vim.schedule(function()
     flush_signs(buf)
   end)
@@ -419,7 +447,7 @@ end
 
 -- Decoration provider -------------------------------------------------------------------------
 
-local function on_win(_, _, buf, top, bot)
+local function on_win(_, win, buf, top, bot)
   if not S.enabled or not S.kw then
     return false
   end
@@ -450,7 +478,7 @@ local function on_win(_, _, buf, top, bot)
     end
   end
   if S.cfg.signs then
-    schedule_signs(buf, st, top, bot)
+    schedule_signs(win, buf, st, top, bot)
   end
   return false
 end
