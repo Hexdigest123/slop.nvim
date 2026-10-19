@@ -1,0 +1,216 @@
+*slop-marks.txt*  Per-project file marks with cursor memory for slop.nvim
+
+==============================================================================
+CONTENTS                                                  *slop-marks-contents*
+
+  1. Introduction ............................ |slop-marks-intro|
+  2. Keymaps ................................. |slop-marks-keymaps|
+  3. Quick menu .............................. |slop-marks-menu|
+  4. Commands ................................ |slop-marks-commands|
+  5. Configuration ........................... |slop-marks-config|
+  6. Storage ................................. |slop-marks-storage|
+  7. Lua API ................................. |slop-marks-api|
+  8. Highlights and events ................... |slop-marks-highlights|
+
+==============================================================================
+1. INTRODUCTION                                              *slop-marks-intro*
+
+The `marks` module replaces harpoon2: a short, ordered list of files per
+project that you jump to with one key each.
+
+- `<leader>h` marks the current file, `<leader>1` .. `<leader>0` open marks
+  1 .. 10, `<C-e>` toggles the quick menu,
+- every mark remembers its cursor position (updated when you leave the
+  buffer and when Neovim exits) and restores it when selected,
+- the quick menu is an editable buffer: reorder or delete marks by editing
+  lines; the list is saved when the menu closes,
+- one list per project, stored in the project's `.nvim/state/` folder
+  (already gitignored, see |slop-project|),
+- several Neovim instances can share a list: changes made by another instance
+  are picked up before every change.
+
+The module is lazy-loaded: nothing is required until a key, `:Slop marks` or
+`require("slop").marks` is used. Cursor positions are tracked from then on.
+
+==============================================================================
+2. KEYMAPS                                                 *slop-marks-keymaps*
+
+Defaults (set any of them to `false` under `marks.keymaps` to disable):
+
+  Mode  Key           Name          Action ~
+  n     `<leader>h`     add           mark the current file
+  n     `<C-e>`         menu          toggle the quick menu
+  n     `<leader>1`     select_1      open mark 1
+  ...   ...           ...           ...
+  n     `<leader>9`     select_9      open mark 9
+  n     `<leader>0`     select_10     open mark 10
+  n     (none)        next          open the next mark
+  n     (none)        prev          open the previous mark
+
+`<Plug>` mappings: `<Plug>(slop-marks-add)`, `<Plug>(slop-marks-menu)`,
+`<Plug>(slop-marks-select-1)` .. `<Plug>(slop-marks-select-10)`,
+`<Plug>(slop-marks-next)`, `<Plug>(slop-marks-prev)`.
+
+Example: map next/prev >lua
+  require("slop").setup({
+    marks = { keymaps = { next = "<C-S-N>", prev = "<C-S-P>" } },
+  })
+<
+`next` / `prev` move relative to the current file when it is marked, else
+relative to the last selected mark (or start at the first / last one). They
+wrap around unless `wrap = false`.
+
+==============================================================================
+3. QUICK MENU                                                 *slop-marks-menu*
+
+`<C-e>` opens a float with one path per line (relative to the project root).
+The right edge of each line shows its index and select key (`1  <leader>1`),
+and `missing` when the file no longer exists. The cursor starts on the
+current file.
+
+Edit the buffer like any other: `dd` deletes a mark, `ddp` moves it down,
+typing a new path adds one. Blank lines and duplicates are ignored. The list
+is saved when the menu closes: `q`, `<Esc>`, `<C-e>` again, leaving the
+window, or exiting Neovim. Nothing is written when the paths did not change.
+Edited marks keep their remembered cursor; new ones start at line 1.
+
+Keys in the menu (normal mode, buffer-local):
+
+  Key       Name          Action ~
+  `<CR>`      menu_open     open the mark under the cursor
+  `<C-v>`     menu_vsplit   open it in a vertical split
+  `<C-x>`     menu_split    open it in a horizontal split
+  `<C-t>`     menu_tab      open it in a new tab
+  `q` `<Esc>`   (close_keys)  close and save
+
+The menu is saved first, so the opened mark is the one you see, in the
+edited order. The buffer has 'filetype' `slopmarks`.
+
+==============================================================================
+4. COMMANDS                                               *slop-marks-commands*
+
+:Slop marks [menu]                                         *:Slop-marks-menu*
+        Toggle the quick menu (default subcommand).
+
+:Slop marks add [path]                                      *:Slop-marks-add*
+        Mark the current file, or [path] (relative to the cwd or absolute).
+        Completes file names.
+
+:Slop marks remove [path]                                *:Slop-marks-remove*
+        Unmark the current file, or [path]. Completes marked paths.
+
+:Slop marks select {n}                                   *:Slop-marks-select*
+        Open mark {n}. Completes the existing indexes.
+
+:Slop marks next                                           *:Slop-marks-next*
+:Slop marks prev                                           *:Slop-marks-prev*
+        Open the next / previous mark (see |slop-marks-keymaps|).
+
+:Slop marks list                                           *:Slop-marks-list*
+        Echo the marks with their remembered line.
+
+:Slop marks clear                                         *:Slop-marks-clear*
+        Remove every mark of the project.
+
+==============================================================================
+5. CONFIGURATION                                            *slop-marks-config*
+
+Defaults: >lua
+  require("slop").setup({
+    marks = {
+      enabled = true,
+      scope = "cwd",           -- "cwd" | "buffer" (see |slop-marks-storage|)
+      wrap = true,             -- next/prev wrap around
+      notify = true,           -- confirm add/remove/clear
+      menu = {
+        width = 0.6,           -- (0, 1] fraction, > 1 cells, or a function
+        height = false,        -- false = fit the marks; else like width
+        close_keys = { "q", "<Esc>" },
+      },
+      keymaps = {
+        add = "<leader>h", menu = "<C-e>", next = false, prev = false,
+        select_1 = "<leader>1", --[[ ... ]] select_9 = "<leader>9",
+        select_10 = "<leader>0",
+        menu_open = "<CR>", menu_vsplit = "<C-v>", menu_split = "<C-x>",
+        menu_tab = "<C-t>",
+      },
+    },
+  })
+<
+The menu is never narrower than its longest path (plus room for the labels).
+
+==============================================================================
+6. STORAGE                                                 *slop-marks-storage*
+
+Which list is used:
+- `scope = "cwd"` (default): the project root of the current directory (the
+  nearest parent with a `project.root_markers` entry, `.git` by default).
+  Jumping into a file of another repository (a plugin source, a dependency)
+  keeps the same list.
+- `scope = "buffer"`: the project root of the current buffer
+  (|slop-project|), so each repository has its own list wherever you are.
+
+Where it lives:
+- with a project root: `<root>/.nvim/state/marks/marks.json`. The folder is
+  created on the first change (reading never creates it), and the first
+  creation of `.nvim/state/` writes `.nvim/.gitignore` with `state/`.
+- without one: `stdpath("data")/slop/marks/<cwd>.json`, where `<cwd>` is the
+  working directory with `/` replaced by `%`.
+
+Format: >json
+  { "version": 1,
+    "marks": [ { "path": "lua/slop/init.lua", "row": 12, "col": 4 } ] }
+<
+Paths are relative to the root (absolute for files outside it); `row` is
+1-based, `col` 0-based. Writes are atomic (temp file + rename). A missing
+file is an empty list. A file that is not valid JSON is treated as empty (a
+warning is logged) and copied to `marks.json.bak` before it is overwritten.
+Entries without a `path` are skipped; a bare string is accepted as a path.
+
+Several instances: the file is the source of truth for which files are
+marked and in which order. Before every change the file is re-read when it
+changed on disk. Cursor positions are kept in memory and written with the
+next change and when Neovim exits.
+
+==============================================================================
+7. LUA API                                                     *slop-marks-api*
+
+`local marks = require("slop").marks`
+
+marks.add({path})                                           *slop-marks.add()*
+        Mark {path} (default: the current file, with its cursor). Returns the
+        index, or nil when the buffer is not a file.
+marks.remove({path})                                     *slop-marks.remove()*
+        Unmark {path} (default: the current file). Returns true if removed.
+marks.toggle_menu()                                 *slop-marks.toggle_menu()*
+        Open the quick menu, or close and save it.
+marks.select({i}, {opts})                                *slop-marks.select()*
+        Open mark {i} and restore its cursor (clamped to the file length).
+        {opts}.cmd: `"edit"` (default), `"split"`, `"vsplit"` or `"tab"`.
+        Out of range or a deleted file: notifies and returns false.
+marks.next() / marks.prev()                                *slop-marks.next()*
+        See |slop-marks-keymaps|. Return false when nothing was opened.
+marks.list()                                               *slop-marks.list()*
+        The marks of the current project: a list of
+        `{ path, file, row, col }` (`path` as stored, `file` absolute).
+marks.clear()                                             *slop-marks.clear()*
+        Remove every mark of the current project.
+marks.file()                                               *slop-marks.file()*
+        Path of the current project's marks file (it may not exist yet).
+
+==============================================================================
+8. HIGHLIGHTS AND EVENTS                                *slop-marks-highlights*
+
+  SlopMarksIndex     -> SlopDim          index / select key in the menu
+  SlopMarksMissing   -> DiagnosticWarn   "missing" label for deleted files
+
+Events (|User| autocmds, `ev.data` is a table):
+  `SlopMarksChanged`  { root, count, action }   the list was changed;
+                      action = "add" | "remove" | "menu" | "clear"
+
+Cursor updates do not fire events.
+
+`:checkhealth slop` shows the list file of the current project, the number
+of marks, missing files and an unreadable list file.
+
+ vim:tw=78:ts=8:ft=help:norl:
