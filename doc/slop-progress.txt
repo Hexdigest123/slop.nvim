@@ -1,0 +1,189 @@
+*slop-progress.txt*  LSP, native and AI progress window for slop.nvim
+
+==============================================================================
+CONTENTS                                               *slop-progress-contents*
+
+  1. Introduction ......................... |slop-progress-intro|
+  2. Sources .............................. |slop-progress-sources|
+  3. Commands ............................. |slop-progress-commands|
+  4. Configuration ........................ |slop-progress-config|
+  5. Lua API .............................. |slop-progress-api|
+  6. Highlights ........................... |slop-progress-highlights|
+  7. Neovim 0.12 notes .................... |slop-progress-nvim|
+
+==============================================================================
+1. INTRODUCTION                                           *slop-progress-intro*
+
+The `progress` module replaces fidget.nvim (`opts = {}`): a small window in
+the bottom-right corner, above the statusline and the command line, lists
+running tasks grouped by source:
+>
+                                lua_ls
+       Loading workspace (42%)  Indexing ⠹
+                                  slop
+           mistral · codestral  commit ✓
+<
+- running tasks show a spinner (|slop| `ui.spinner` style), finished ones a
+  mark: `✓` success, `✗` failed, `⊘` cancelled,
+- title, message and percentage per task, lines right-aligned,
+- finished tasks linger for `linger` ms (2000), then disappear; the window
+  closes when it is empty,
+- no border, `winblend` 100, not focusable: it never takes the cursor, is
+  re-laid out on |VimResized|, 'laststatus' / 'cmdheight' changes and follows
+  you to the current tabpage,
+- finished tasks are kept in a history (`:Slop progress history`).
+
+There are no default keymaps. The module loads on the first |LspProgress|,
+|Progress| or `User SlopAiRequestStarted` event; the event that loaded it is
+shown too.
+
+==============================================================================
+2. SOURCES                                              *slop-progress-sources*
+
+LSP ~
+        `$/progress` notifications through the |LspProgress| autocmd
+        (begin / report / end). The group is the client name. Tasks of a
+        client that stops before sending `end` are marked cancelled.
+
+Native progress messages ~
+        Every |progress-message| (`nvim_echo(..., { kind = "progress" })`),
+        through the |Progress| autocmd: slop's own spinners ("slop edit",
+        "slop rest"), |vim.pack|, |:checkhealth| and any other plugin. The
+        group is the message `source`. Neovim reports a missing percentage
+        as 0, so a percentage is only shown when it is above 0.
+
+AI requests ~
+        `User SlopAiRequestStarted` / `SlopAiRequestFinished`, emitted by the
+        slop AI service around every HTTP request (group "slop", title = the
+        module that asked: `commit`, `rest`, ..., message = provider · model).
+        `chat` requests are shown, `fim` requests are not (they fire on almost
+        every keystroke while |slop-complete| is on); see `sources.ai`.
+
+Duplicates ~                                           *slop-progress-dedupe*
+        - A |Progress| message whose source is in `lsp_mirror_sources`
+          (default `{ "vim.lsp" }`, the source used by the example in
+          |LspProgress|) only mirrors LSP progress, so it is dropped while
+          `sources.lsp` is on.
+        - An AI request and a slop progress message (source "slop") that
+          start within `dedupe_ms` of each other are one task: only the
+          progress message is shown; the provider/model is kept in the
+          history entry.
+
+Events data (for your own consumers): >
+  SlopAiRequestStarted  { id, kind = "chat"|"fim", provider, model?, source? }
+  SlopAiRequestFinished { id, kind, provider, model?, source?, ms, error? }
+<       `error` is the error message, or "cancelled". Pass `source = "..."` in
+        an `ai.chat()` / `ai.complete_fim()` request to name it yourself.
+
+==============================================================================
+3. COMMANDS                                            *slop-progress-commands*
+
+:Slop progress [history]                             *:Slop-progress-history*
+        Finished tasks, newest first, in a float (`q` / `<Esc>` close it):
+        time, mark, group, title, message, duration.
+
+:Slop progress clear [items|history|all]               *:Slop-progress-clear*
+        Remove the tasks in the window (default), the history, or both.
+
+:Slop progress toggle                                 *:Slop-progress-toggle*
+        Hide / show the window. Tasks are still tracked while it is hidden.
+
+==============================================================================
+4. CONFIGURATION                                         *slop-progress-config*
+
+Defaults: >lua
+  require("slop").setup({
+    progress = {
+      enabled = true,
+      sources = {
+        lsp = true,                  -- LspProgress
+        native = true,               -- Progress (nvim_echo kind = "progress")
+        ai = { chat = true, fim = false },
+      },
+      ignore = {},                   -- groups to drop: LSP client names,
+                                     -- Progress sources, "slop" (AI)
+      lsp_mirror_sources = { "vim.lsp" },
+      dedupe_ms = 500,
+      linger = 2000,                 -- ms a finished task stays visible
+      history_size = 100,
+      max_items = 8,                 -- per group (newest kept)
+      suppress_echo = true,          -- see |slop-progress-nvim|
+      spinner = false,               -- false = ui.spinner, or a style name
+      interval = 100,                -- ms per spinner frame / redraw
+      icons = { success = "✓", failed = "✗", cancel = "⊘" },
+      window = {
+        border = "none",             -- any 'winborder' style or a list
+        winblend = 100,
+        zindex = 45,
+        max_width = 0.5,             -- (0, 1] fraction of the editor, > 1 cells
+        x_padding = 1,               -- columns from the right edge
+        y_padding = 0,               -- rows above the statusline
+      },
+    },
+  })
+<
+Spinner styles: `require("slop.core.ui.spinner").styles()`.
+
+From fidget.nvim: `progress.ignore` -> `ignore`, `notification.window.winblend`
+-> `window.winblend`, `progress.display.done_ttl` (seconds) -> `linger` (ms),
+`progress.display.done_icon` -> `icons.success`. fidget's notification
+subsystem (vim.notify override) is not replaced.
+
+==============================================================================
+5. LUA API                                                  *slop-progress-api*
+
+`local progress = require("slop").progress`
+
+progress.items()                                     *slop-progress.items()*
+        Current tasks (running and lingering) in display order, as copies:
+        `{ key, origin = "lsp"|"native"|"ai", group, title, message, percent?,
+        status = "running"|"success"|"failed"|"cancel", started, finished?,
+        ms?, time? }`.
+
+progress.history()                                 *slop-progress.history()*
+        Finished tasks, oldest first (a ring of `history_size`). Entries
+        merged with an AI request have `detail` = "provider · model".
+
+progress.clear({what})                               *slop-progress.clear()*
+        {what}: "items" (default), "history" or "all".
+
+progress.toggle()                                   *slop-progress.toggle()*
+        Hide / show the window. Returns true when it is now shown.
+
+progress.show_history()                       *slop-progress.show_history()*
+        What `:Slop progress history` runs.
+
+The window buffer has 'filetype' `slopprogress`, the history float
+`slopprogresshistory`.
+
+==============================================================================
+6. HIGHLIGHTS                                        *slop-progress-highlights*
+
+  SlopProgressNormal   -> Comment         window text / background
+  SlopProgressBorder   -> SlopBorder
+  SlopProgressGroup    -> Title           group header (client / source)
+  SlopProgressTitle    -> Question        task title
+  SlopProgressMessage  -> Comment         task message
+  SlopProgressPercent  -> Number
+  SlopProgressSpinner  -> SlopSpinner
+  SlopProgressDone     -> DiagnosticOk    ✓
+  SlopProgressError    -> DiagnosticError ✗
+  SlopProgressCancel   -> DiagnosticWarn  ⊘
+
+==============================================================================
+7. NEOVIM 0.12 NOTES                                       *slop-progress-nvim*
+
+LSP progress is NOT echoed by Neovim itself: the `$/progress` handler only
+stores it (|vim.lsp.status()|) and fires |LspProgress|. Native
+|progress-message|s are shown by Neovim in three places: the command line
+('messagesopt' `progress:c`, the default), the default 'statusline' (through
+`vim.ui.progress_status()`) and the terminal tab/taskbar (OSC 9;4, TUI only).
+
+With `suppress_echo = true` the module sets the `progress:` item of
+'messagesopt' to empty while it is loaded, so those messages are not shown
+twice (in the window and the command line). The previous value is restored
+when the module is disabled (`:Slop modules disable progress`), unless you
+changed the option in the meantime. The statusline and OSC 9;4 indicators are
+left alone.
+
+ vim:tw=78:ts=8:ft=help:norl:
