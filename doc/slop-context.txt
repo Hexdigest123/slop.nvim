@@ -39,14 +39,14 @@ the current window; every window gets its own when it becomes current.
 ==============================================================================
 2. KEYMAPS                                              *slop-context-keymaps*
 
-No default keys. Name `goto` (a LuaJIT keyword, so quote it):
+No default keys. Map one with:
 >lua
-  context = { keymaps = { ["goto"] = "[c" } }
+  context = { keymaps = { jump = "[c" } }
 <
   Mode  Name   Action ~
-  n     goto   jump to the start of the enclosing scope ([count] levels up)
+  n     jump   jump to the start of the enclosing scope ([count] levels up)
 
-Plug: `<Plug>(slop-context-goto)`.
+Plug: `<Plug>(slop-context-jump)`.
 
 ==============================================================================
 3. COMMANDS                                            *slop-context-commands*
@@ -80,7 +80,7 @@ Plug: `<Plug>(slop-context-goto)`.
     zindex = 20,
     node_types = {},          -- { lua = { "function_declaration", ... } }
                               -- replaces the built-in list of a language
-    keymaps = { ["goto"] = false },
+    keymaps = { jump = false },
   }
 <
 Per buffer: `vim.b.slop_context = false` turns the context off there.
@@ -172,7 +172,7 @@ Remove nvim-treesitter-context. Its options map one to one:
   `line_numbers`, `min_window_height`, `separator`, `zindex`   same names
   `:TSContext toggle|enable|disable`   `:Slop context toggle|enable|disable`
   `go_to_context(vim.v.count1)`   `require("slop").context.go_to_context()`
-                                or `keymaps = { ["goto"] = "[c" }`
+                                or `keymaps = { jump = "[c" }`
   `TreesitterContext*` groups    `SlopContext*` groups
   `queries/<lang>/context.scm`    `node_types = { <lang> = { ... } }`
   `on_attach`                     `vim.b.slop_context = false`

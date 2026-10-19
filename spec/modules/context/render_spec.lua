@@ -312,7 +312,7 @@ describe("context render", function()
     assert.are.same({ 3, 0 }, api.nvim_win_get_cursor(0))
     assert.is_false(ctx.go_to_context(), "nothing above the outermost scope")
     -- <Plug> mapping exists, no default lhs
-    assert.truthy(vim.fn.maparg("<Plug>(slop-context-goto)", "n") ~= "")
+    assert.truthy(vim.fn.maparg("<Plug>(slop-context-jump)", "n") ~= "")
   end)
 
   it("cloak masks secrets in the float (it carries the source path)", function()

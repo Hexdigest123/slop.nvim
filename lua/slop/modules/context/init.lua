@@ -110,7 +110,7 @@ return {
     separator = false, -- false | one display cell, e.g. "─": drawn as a bottom border line
     zindex = 20,
     node_types = {}, -- { [lang] = { "node_type", ... } } replaces the built-in list of that language
-    keymaps = { ["goto"] = false },
+    keymaps = { jump = false },
   },
   open_keys = { "node_types" },
   schema = function(cfg, check)
@@ -190,7 +190,7 @@ return {
     },
   },
   keymaps = {
-    ["goto"] = {
+    jump = {
       mode = "n",
       desc = "go to context",
       rhs = function()
