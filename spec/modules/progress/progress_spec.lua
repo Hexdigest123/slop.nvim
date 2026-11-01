@@ -162,6 +162,17 @@ describe("progress module", function()
     assert.truthy(vim.tbl_contains(hl, "SlopProgressGroup"))
   end)
 
+  it("draws Neovim's own Progress (bufwrite) after the autocmd: drawing inside it clobbers the echo", function()
+    setup()
+    echo('"f" 1L, 2B written', { status = "success", source = "nvim", id = "bufwrite" })
+    assert.equal(1, #p.history())
+    assert.is_nil(view.win())
+    assert.truthy(wait(function()
+      return view.win() ~= nil
+    end))
+    assert.matches("written", text())
+  end)
+
   it("drops Progress messages that only mirror LSP progress", function()
     setup()
     echo("x", { status = "running", source = "vim.lsp", id = "lsp.1" })

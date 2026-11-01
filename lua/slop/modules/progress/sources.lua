@@ -133,7 +133,16 @@ function M.native(ev)
     end
     store.finish(key, status, fields)
   end
-  on_change(status ~= "running" or created)
+  local now = status ~= "running" or created
+  if source == "nvim" then
+    -- Neovim's own messages (bufwrite: '"f" 4L, 116B written') still sit in IObuff during the autocmd and
+    -- nvim_buf_set_lines reuses IObuff ("'replacement string' item"), so drawing now clobbers the echo
+    vim.schedule(function()
+      on_change(now)
+    end)
+  else
+    on_change(now)
+  end
 end
 
 -- AI requests -------------------------------------------------------------------------------------
