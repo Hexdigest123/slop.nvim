@@ -138,6 +138,11 @@ function M.buf_state(buf, win)
   if st ~= nil and (st == false and S.bufs_path[buf] == path or st and st.path == path) then
     return st or nil
   end
+  -- An unnamed buffer's fallback path (fzf-lua preview) needs a window. A window-less lookup (apply_buf,
+  -- is_cloaked) would read "" and clobber what on_win found, rebuilding the state on every redraw.
+  if st ~= nil and win == nil and path == "" then
+    return st or nil
+  end
   S.bufs_path[buf] = path
   local rules = path ~= "" and S.rules(path) or {}
   local display = path ~= "" and has_display_providers()

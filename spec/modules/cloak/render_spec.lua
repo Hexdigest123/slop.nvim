@@ -237,6 +237,17 @@ describe("cloak render", function()
     vim.w.fzf_lua_preview = true
     vim.cmd("redraw!")
     assert.are.same({ "TOKEN=******" }, screen(1))
+    -- window-less lookups (apply_buf) keep the state on_win found instead of flipping it every redraw
+    local R = require("slop.modules.cloak.render")
+    vim.wait(50)
+    local st = R._state.bufs[pbuf]
+    assert.equal("table", type(st))
+    for _ = 1, 3 do
+      vim.cmd("redraw!")
+      vim.wait(20)
+      assert.equal(st, R._state.bufs[pbuf], "state rebuilt on redraw")
+    end
+    assert.is_true(R._state.completion[pbuf], "completion disabled in the cloaked preview")
     package.loaded["fzf-lua"], package.loaded["fzf-lua.path"] = nil, nil
   end)
 
