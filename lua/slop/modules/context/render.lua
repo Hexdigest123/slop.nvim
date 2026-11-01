@@ -21,6 +21,7 @@ local S = {
   wins = {}, ---@type table<integer, slop.context.WinState>
   timer = nil, ---@type uv.uv_timer_t?
   last = 0,
+  drawing = false, -- draw() sets options (tabstop, list, wrap, ...) that OptionSet listens for
   tokens = nil, ---@type slop.util.Debounced?
 }
 M._state = S
@@ -494,7 +495,9 @@ function M.update(win, force)
     end
     return
   end
+  S.drawing = true
   local dok, err = pcall(draw, win, info, groups, height, force)
+  S.drawing = false
   if not dok then
     log().debug("draw: %s", err)
     M.close(win)
@@ -578,7 +581,15 @@ function M.start(cfg)
   end
   -- FileType: the parser / treesitter highlighter usually starts there, after the first BufEnter
   au("FileType", forced)
-  au("OptionSet", forced, {
+  -- skip draw()'s own option writes on the floats: each one would schedule another forced draw, which
+  -- writes them again (an endless, growing loop that starves vim.wait, e.g. conform's format-on-save).
+  -- Floats never get a context, so options set on one (progress, pickers, ...) are skipped too: during
+  -- OptionSet the current window is the one whose option changed.
+  au("OptionSet", function()
+    if not S.drawing and api.nvim_win_get_config(0).relative == "" then
+      forced()
+    end
+  end, {
     pattern = {
       "number",
       "relativenumber",

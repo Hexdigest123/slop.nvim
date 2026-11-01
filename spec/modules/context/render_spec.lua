@@ -298,6 +298,47 @@ describe("context render", function()
     assert.is_false(api.nvim_win_is_valid(fwin))
   end)
 
+  it("its own option writes do not retrigger it (OptionSet loop), the user's still do", function()
+    open(LUA, "lua")
+    view(15, 25, 4)
+    assert.equal(3, #float_lines())
+    local R = require("slop.modules.context.render")
+    local orig, n = R.update, 0
+    R.update = function(...)
+      n = n + 1
+      if n > 50 then
+        return -- the loop: stop drawing so vim.wait() can return and the spec fails instead of hanging
+      end
+      return orig(...)
+    end
+    local ok, err = pcall(function()
+      vim.wait(100) -- run what open() queued (FileType, number/wrap OptionSet, WinScrolled)
+      n = 0
+      vim.wait(300) -- a looping redraw keeps rescheduling itself here
+      assert.equal(0, n, "redraws while nothing changed")
+      local fw = api.nvim_open_win(api.nvim_create_buf(false, true), false, {
+        relative = "editor",
+        row = 1,
+        col = 1,
+        width = 10,
+        height = 2,
+      })
+      vim.wait(100)
+      n = 0
+      vim.wo[fw].wrap = false -- another plugin's float (progress, picker): not ours to redraw for
+      vim.wait(100)
+      assert.equal(0, n, "redraws after a float's option change")
+      api.nvim_win_close(fw, true)
+      vim.wait(100)
+      n = 0
+      vim.bo.tabstop = 3
+      vim.wait(300)
+      assert.truthy(n >= 1 and n <= 2, "user tabstop change redraws once, got " .. n)
+    end)
+    R.update = orig
+    assert.is_true(ok, err)
+  end)
+
   it("go_to_context climbs scopes (count = depth), with a jumplist entry", function()
     open(LUA, "lua")
     vim.fn.winrestview({ topline = 40, lnum = 45, col = 6 })
