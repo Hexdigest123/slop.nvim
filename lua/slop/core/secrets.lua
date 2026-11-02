@@ -2,8 +2,12 @@
 ---
 --- Every text that may reach an AI provider/agent MUST pass through this module:
 ---   * whole files matching a block glob are never sent (`is_blocked`) — redact_* return the placeholder
----   * spans reported by providers (cloak registers one) are replaced by `secrets.placeholder` ("<redacted>")
----   * built-in, always on: PEM private-key blocks are redacted in any text
+---   * spans reported by providers (cloak registers one) are replaced by `secrets.placeholder` ("<redacted>");
+---     a provider that throws (or returns garbage) fails CLOSED: every line it was given is redacted
+---   * built-in, always on: PEM / OpenSSH / PGP private-key blocks are redacted in any text (markers anywhere in a
+---     line, one-line escaped keys, windows that start inside a key)
+---   * built-in token detectors (AWS, GitHub, GitLab, Slack, OpenAI/Anthropic, Stripe, Google keys, JWTs, URL
+---     passwords), unless config `secrets.detectors = false`; AI redaction only, never masked on screen
 ---
 --- Works with no provider registered: `secrets.block` (config) defaults to a conservative glob list
 --- (".env*", "*.pem", "*.key", "*.p12", "*.pfx", "*secret*", "*credential*", "*private-key*").
@@ -32,6 +36,7 @@ local M = {}
 local providers = {} ---@type table<string, slop.secrets.Provider>
 local order = {} ---@type string[]
 local glob_cache = {} ---@type table<string, vim.lpeg.Pattern|false>
+local failed = {} ---@type table<string, true>  providers whose error was already reported
 local ensuring = false
 local ensured = false -- load_capability ran for the current config generation
 
@@ -76,6 +81,7 @@ function M.register(provider)
     order[#order + 1] = provider.name
   end
   providers[provider.name] = provider
+  failed[provider.name] = nil
 end
 
 ---@param name string
@@ -184,19 +190,213 @@ function M.filter_paths(paths)
   end, paths)
 end
 
---- Rows before a queried range scanned by is_cloaked() for multi-line rules (a 4096-bit PEM key is ~50 lines).
+--- Rows looked back for multi-line rules (a 4096-bit PEM key is ~50 lines): by is_cloaked(), and by spans() /
+--- redact_lines() when the source is a buffer and the lines start below row 0.
 M.LOOKBACK = 200
 
-local PEM_BEGIN = "^%s*%-%-%-%-%-BEGIN [%u%d ]*PRIVATE KEY%-%-%-%-%-"
-local PEM_END = "^%s*%-%-%-%-%-END [%u%d ]*PRIVATE KEY%-%-%-%-%-"
+-- PEM / OpenSSH / PGP private-key markers, anywhere in a line (keys are often embedded in strings)
+local PEM_BEGIN = "%-%-%-%-%-BEGIN [%u%d ]*PRIVATE KEY[%u ]*%-%-%-%-%-"
+local PEM_END = "%-%-%-%-%-END [%u%d ]*PRIVATE KEY[%u ]*%-%-%-%-%-"
+-- armour headers inside a block (encrypted PEM, PGP)
+local PEM_HEADERS = {
+  ["Proc-Type"] = true,
+  ["DEK-Info"] = true,
+  Version = true,
+  Comment = true,
+  Hash = true,
+  Charset = true,
+  MessageID = true,
+}
 
---- All spans for `lines` (built-in PEM rule + providers), as { [row_index] = { {col, end_col}, ... } }.
+--- Strip what wraps key material in text and code: comment leaders, quotes, string escapes (`\n`), concatenation.
+---@param s string
+---@return string
+local function unwrap(s)
+  s = s:gsub("\\[nrt]", " "):gsub("\\", " ")
+  s = s:gsub("^%s*", ""):gsub("^[#;]+", ""):gsub("^//+", ""):gsub("^%-%-+", ""):gsub("^%*+", "")
+  return (s:gsub("^[%s\"'`(+,;]+", ""):gsub("[%s\"'`)+,;]+$", ""))
+end
+
+--- Does a piece of a line look like private-key material?
+---   "blank"  nothing but wrappers           "body"  base64 / armour header (certainly key material)
+---   "weak"   one short or plain-word token  (key material only if an END marker follows)
+---   nil      code or prose
+---@param s string
+---@return "blank"|"body"|"weak"|nil
+local function key_kind(s)
+  local u = unwrap(s)
+  if u == "" then
+    return "blank"
+  end
+  local header = u:match("^([%w%-]+):%s")
+  if header and PEM_HEADERS[header] then
+    return "body"
+  end
+  local toks = {}
+  for tok in u:gmatch("%S+") do
+    if not tok:match("^[%w+/=]+$") then
+      return nil
+    end
+    toks[#toks + 1] = tok
+  end
+  if #toks > 1 then
+    -- base64 chunks joined by escaped newlines / spaces (one-line keys); prose has short words
+    local len = 0
+    for i, tok in ipairs(toks) do
+      if #tok < 16 and i < #toks then
+        return nil
+      end
+      len = len + #tok
+    end
+    return len >= 32 and "body" or nil
+  end
+  local t = toks[1]
+  local random = t:find("[%d+/=]") or (t:find("%u") and t:find("%l"))
+  return (#t >= 20 and random) and "body" or "weak"
+end
+
+--- Built-in private-key rule: spans of PEM/OpenSSH/PGP key material in `lines`. Handles markers anywhere in a
+--- line, one-line escaped keys, bodies whose BEGIN lies before `lines` (an END without BEGIN), and a mere mention
+--- of a marker in code or prose (the block ends at the first line that is not key material).
+---@param lines string[]
+---@param add fun(i: integer, s: integer, e: integer)
+---@param skip? integer  leading look-back lines: scanned for state, no spans reported for them
+local function pem_spans(lines, add, skip)
+  skip = skip or 0
+  local function put(i, s, e)
+    if i > skip then
+      add(i - skip, s, e)
+    end
+  end
+  local in_pem = false
+  local pending = {} ---@type {[1]: integer, [2]: integer, [3]: integer}[]  weak lines of the open block
+  local function flush(keep)
+    if keep then
+      for _, p in ipairs(pending) do
+        put(p[1], p[2], p[3])
+      end
+    end
+    pending = {}
+  end
+  for i, l in ipairs(lines) do
+    -- outside a block only lines with a marker matter
+    local pos = (in_pem or l:find("-----", 1, true)) and 1 or #l + 2
+    while pos <= #l + 1 do
+      if in_pem then
+        local es, ee = l:find(PEM_END, pos)
+        local kind = key_kind(l:sub(pos, (es or #l + 1) - 1))
+        if es then
+          flush(kind ~= nil)
+          if kind == "body" or kind == "weak" then
+            put(i, pos - 1, es - 1)
+          end
+          in_pem, pos = false, ee + 1
+        elseif kind == "body" then
+          flush(true)
+          put(i, pos - 1, #l)
+          break
+        elseif kind == "weak" then
+          pending[#pending + 1] = { i, pos - 1, #l }
+          break
+        elseif kind == "blank" then
+          break
+        else
+          -- not key material: the marker was only mentioned (code / docs); the rest of this line is scanned
+          -- outside a block (pos is kept, so the same BEGIN is not found again)
+          flush(false)
+          in_pem = false
+        end
+      else
+        local bs, be = l:find(PEM_BEGIN, pos)
+        local es, ee = l:find(PEM_END, pos)
+        if es and (not bs or es < bs) then
+          -- END without BEGIN in these lines: the body started above them (e.g. a window inside a key)
+          local kind = key_kind(l:sub(pos, es - 1))
+          local run = {}
+          if kind == "body" or kind == "weak" then
+            run[1] = { i, pos - 1, es - 1 }
+          end
+          if kind ~= nil and pos == 1 then
+            for j = i - 1, 1, -1 do
+              local k = key_kind(lines[j])
+              if k == nil or lines[j]:find(PEM_BEGIN) or lines[j]:find(PEM_END) then
+                break
+              end
+              if k ~= "blank" then
+                run[#run + 1] = { j, 0, #lines[j] }
+              end
+            end
+          end
+          for _, r in ipairs(run) do
+            put(r[1], r[2], r[3])
+          end
+          pos = ee + 1
+        elseif bs then
+          in_pem, pos = true, be + 1
+        else
+          break
+        end
+      end
+    end
+  end
+  -- the lines end inside a block: whatever looked like key material is redacted (fail closed)
+  flush(in_pem)
+end
+
+-- Built-in token detectors (AI redaction only, never masked on screen): { hint, pattern }. `hint` is a cheap
+-- pre-check; the pattern's two position captures delimit the secret, frontiers keep longer tokens out.
+local function rep(set, count)
+  return set:rep(count)
+end
+local DETECTORS = {
+  { "AKIA", "%f[%w_]()AKIA" .. rep("[%u%d]", 16) .. "()%f[^%w_]" }, -- AWS access key id
+  { "ASIA", "%f[%w_]()ASIA" .. rep("[%u%d]", 16) .. "()%f[^%w_]" }, -- AWS temporary access key id
+  { "gh[pousr]_", "%f[%w_]()gh[pousr]_" .. rep("%w", 36) .. "%w*()%f[^%w_]" }, -- GitHub tokens
+  { "github_pat_", "%f[%w_]()github_pat_" .. rep("[%w_]", 22) .. "[%w_]*()%f[^%w_]" }, -- GitHub fine-grained
+  { "glpat%-", "%f[%w_%-]()glpat%-" .. rep("[%w_%-]", 20) .. "[%w_%-]*()%f[^%w_%-]" }, -- GitLab
+  { "xox[abprs]%-", "%f[%w_%-]()xox[abprs]%-" .. rep("[%w%-]", 10) .. "[%w%-]*()%f[^%w_%-]" }, -- Slack
+  -- OpenAI / Anthropic (sk-proj-, sk-ant-)
+  { "sk%-", "%f[%w_%-]()sk%-" .. rep("[%w_%-]", 20) .. "[%w_%-]*()%f[^%w_%-]" },
+  { "k_live_", "%f[%w_]()[sr]k_live_" .. rep("%w", 16) .. "%w*()%f[^%w_]" }, -- Stripe
+  { "k_test_", "%f[%w_]()[sr]k_test_" .. rep("%w", 16) .. "%w*()%f[^%w_]" }, -- Stripe (test mode)
+  { "AIza", "%f[%w_%-]()AIza" .. rep("[%w_%-]", 35) .. "()%f[^%w_%-]" }, -- Google API key
+  { "eyJ", "%f[%w_%-]()eyJ[%w_%-]+%.eyJ[%w_%-]+%.[%w_%-]+()%f[^%w_%-]" }, -- JWT
+  { "://", "%f[%w]%a[%w+.%-]*://[^%s:/@]*:()[^%s/@]+()@" }, -- URL credentials: only the password
+}
+
+---@param lines string[]
+---@param add fun(i: integer, s: integer, e: integer)
+local function token_spans(lines, add)
+  for i, l in ipairs(lines) do
+    for _, d in ipairs(DETECTORS) do
+      if l:find(d[1]) then
+        local init = 1
+        while true do
+          local s, e, a, b = l:find(d[2], init)
+          if not s then
+            break
+          end
+          add(i, a - 1, b - 1)
+          init = e + 1
+        end
+      end
+    end
+  end
+end
+
+--- Is `s` a valid span table?
+local function valid_span(s)
+  return type(s) == "table" and type(s.row) == "number" and type(s.col) == "number" and type(s.end_col) == "number"
+end
+
+--- All spans for `lines` (built-in rules + providers), as { [row_index] = { {col, end_col}, ... } }.
 ---@param path string?
 ---@param lines string[]
 ---@param first_row integer
 ---@param display_only? boolean  only providers with display = true, no built-in rule
+---@param buf? integer  buffer the lines come from: rows above `first_row` are looked back for open key blocks
 ---@return table<integer, {[1]: integer, [2]: integer}[]>
-local function collect(path, lines, first_row, display_only)
+local function collect(path, lines, first_row, display_only, buf)
   local by_row = {}
   local function add(i, s, e)
     if e > s then
@@ -204,14 +404,16 @@ local function collect(path, lines, first_row, display_only)
       table.insert(by_row[i], { s, e })
     end
   end
-  local in_pem = false
-  for i, l in ipairs(display_only and {} or lines) do
-    if l:match(PEM_BEGIN) then
-      in_pem = true
-    elseif l:match(PEM_END) then
-      in_pem = false
-    elseif in_pem then
-      add(i, 0, #l)
+  if not display_only then
+    local scan, skip = lines, 0
+    if buf and first_row > 0 and vim.api.nvim_buf_is_valid(buf) then
+      local pre = vim.api.nvim_buf_get_lines(buf, math.max(0, first_row - M.LOOKBACK), first_row, false)
+      skip = #pre
+      scan = vim.list_extend(pre, lines)
+    end
+    pem_spans(scan, add, skip)
+    if cfg().detectors ~= false then
+      token_spans(lines, add)
     end
   end
   for _, p in ipairs(M.providers()) do
@@ -221,9 +423,25 @@ local function collect(path, lines, first_row, display_only)
       and (not p.match_path or (path and path ~= "" and p.match_path(path)))
     then
       local ok, spans = pcall(p.spans, path or "", lines, first_row)
-      if ok and type(spans) == "table" then
-        for _, s in ipairs(spans) do
+      local good = ok and (spans == nil or type(spans) == "table")
+      for _, s in ipairs(good and spans or {}) do
+        good = good and valid_span(s)
+      end
+      if good then
+        for _, s in ipairs(spans or {}) do
           add(s.row - first_row + 1, s.col, s.end_col)
+        end
+      else
+        -- fail closed: a broken provider must not let the secrets it should find through
+        for i, l in ipairs(lines) do
+          add(i, 0, #l)
+        end
+        if not failed[p.name] then
+          failed[p.name] = true
+          local why = ok and "returned invalid spans" or tostring(spans):match("^[^\n]*"):sub(1, 200)
+          require("slop.core.log")
+            .scope("secrets")
+            .error("provider %s failed (%s): the lines it was given are redacted entirely", p.name, why)
         end
       end
     end
@@ -247,17 +465,28 @@ local function merge(spans)
   return out
 end
 
---- All secret spans of `lines` (built-in PEM rule + every provider whose match_path accepts the source),
+--- Buffer of a source (for the look-back of multi-line rules), if it is one.
+---@param src string|integer|nil
+---@return integer?
+local function src_buf(src)
+  if type(src) ~= "number" then
+    return nil
+  end
+  return src == 0 and vim.api.nvim_get_current_buf() or src
+end
+
+--- All secret spans of `lines` (built-in rules + every provider whose match_path accepts the source),
 --- merged per row and sorted. Rows are absolute (`first_row` + index). Blocked sources are not special-cased.
+--- For a buffer source, rows above `first_row` (up to M.LOOKBACK) are looked back for an open private-key block.
 ---@param src string|integer|nil  path or buffer (effective path)
 ---@param lines string[]
 ---@param first_row? integer  0-based row of lines[1] (default 0)
----@param opts? {display?: boolean}  display = only providers with `display = true` (no PEM rule)
+---@param opts? {display?: boolean}  display = only providers with `display = true` (no built-in rules)
 ---@return slop.secrets.Span[]
 function M.spans(src, lines, first_row, opts)
   ensure()
   first_row = first_row or 0
-  local by_row = collect(to_path(src), lines, first_row, opts and opts.display)
+  local by_row = collect(to_path(src), lines, first_row, opts and opts.display, src_buf(src))
   local rows = vim.tbl_keys(by_row)
   table.sort(rows)
   local out = {}
@@ -270,6 +499,7 @@ function M.spans(src, lines, first_row, opts)
 end
 
 --- Redact lines. Blocked source -> every line replaced by the placeholder (n = #lines).
+--- For a buffer source, rows above `first_row` (up to M.LOOKBACK) are looked back for an open private-key block.
 ---@param src string|integer|nil  path or buffer (effective path used for provider matching)
 ---@param lines string[]
 ---@param first_row? integer      0-based row of lines[1] in the source (default 0)
@@ -283,7 +513,7 @@ function M.redact_lines(src, lines, first_row)
       return ph
     end, lines), #lines
   end
-  local by_row = collect(path, lines, first_row or 0)
+  local by_row = collect(path, lines, first_row or 0, false, src_buf(src))
   local out, n = {}, 0
   for i, l in ipairs(lines) do
     local spans = by_row[i]
@@ -322,15 +552,16 @@ function M.redact_text(text, path)
   return table.concat(lines, "\n"), n
 end
 
---- Redact a unified git diff: sections of blocked files are omitted entirely, other content lines are
---- redacted with that file's providers. Each hunk is redacted as a whole (old side = context + "-" lines,
---- new side = context + "+" lines), so multi-line rules such as PEM key bodies apply inside diffs.
+--- Redact a unified git diff: sections of blocked files are omitted entirely (for renames/copies when EITHER side
+--- is blocked: the "-" lines hold the old file's content), other content lines are redacted with that file's
+--- providers. Each hunk is redacted as a whole (old side = context + "-" lines with the old path's rules, new side =
+--- context + "+" lines), so multi-line rules such as PEM key bodies apply inside diffs.
 ---@param diff string
 ---@return string diff, integer n
 function M.redact_diff(diff)
   ensure()
   local out, n = {}, 0
-  local path, skipping, in_hunk = nil, false, false
+  local path, old_path, skipping, in_hunk = nil, nil, false, false
   local hunk = {} ---@type {sign: string, body: string}[]
   local ph = M.placeholder()
   local function count(str, needle)
@@ -351,7 +582,7 @@ function M.redact_diff(diff)
         idx[#idx + 1], bodies[#bodies + 1] = i, e.body
       end
     end
-    local red = M.redact_lines(path, bodies, 0)
+    local red = M.redact_lines(keep == "-" and old_path or path, bodies, 0)
     local res = {}
     for j, i in ipairs(idx) do
       res[i] = red[j]
@@ -379,14 +610,15 @@ function M.redact_diff(diff)
   end
 
   for _, l in ipairs(vim.split(diff, "\n", { plain = true })) do
-    local b = l:match("^diff %-%-git a/.- b/(.+)$")
+    local a, b = l:match("^diff %-%-git a/(.-) b/(.+)$")
     if b then
       flush()
-      path, in_hunk = b, false
-      skipping = M.is_blocked(b)
+      path, old_path, in_hunk = b, a, false
+      local blocked = M.is_blocked(b) and b or (a ~= b and M.is_blocked(a) and a)
+      skipping = blocked ~= false
       out[#out + 1] = l
       if skipping then
-        out[#out + 1] = ("[slop: diff of %s omitted]"):format(b)
+        out[#out + 1] = ("[slop: diff of %s omitted]"):format(blocked)
         n = n + 1
       end
     elseif not skipping then
@@ -395,7 +627,17 @@ function M.redact_diff(diff)
         in_hunk = true
         out[#out + 1] = l
       elseif not in_hunk then
-        local pb = l:match("^%+%+%+ b/(.+)$")
+        -- the old side of a rename/copy holds the OLD file's content: honour its block globs and rules too
+        local pa = l:match("^%-%-%- a/(.+)$") or l:match("^rename from (.+)$") or l:match("^copy from (.+)$")
+        if pa then
+          old_path = pa
+        end
+        if pa and pa ~= path and M.is_blocked(pa) then
+          skipping = true
+          out[#out + 1] = ("[slop: diff of %s omitted]"):format(pa)
+          n = n + 1
+        end
+        local pb = not skipping and l:match("^%+%+%+ b/(.+)$")
         if pb and pb ~= path then
           path = pb
           skipping = M.is_blocked(pb)
