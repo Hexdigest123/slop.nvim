@@ -142,6 +142,22 @@ describe("marks module", function()
     assert.are.same({ "a.lua", "gone.lua" }, stored())
   end)
 
+  it("reports an :edit error without Lua's internal location prefix", function()
+    slop.marks.add("a.lua")
+    edit("b.lua")
+    vim.wo.winfixbuf = true
+    local ok = slop.marks.select(1)
+    vim.wo.winfixbuf = false
+    assert.is_false(ok)
+    local msg
+    for _, n in ipairs(notes) do
+      if n.level == vim.log.levels.ERROR then
+        msg = n.msg
+      end
+    end
+    assert.matches("^slop: marks: E1513: ", msg)
+  end)
+
   it("remembers the cursor on BufLeave and writes it on VimLeavePre", function()
     slop.marks.add("a.lua")
     slop.marks.add("b.lua")
@@ -295,10 +311,11 @@ describe("marks module", function()
       assert.matches("<CR> open", c.footer[1][1])
       assert.are.same({ 2, 0 }, api.nvim_win_get_cursor(win)) -- the current file
       assert.are.same({ "1  <leader>1", "2  <leader>2", "3  <leader>3" }, labels(buf))
-      assert.equal(1, vim.fn.maparg("<CR>", "n", false, true).buffer)
+      local cr = vim.fn.maparg("<CR>", "n", false, true)
+      assert.equal(1, cr.buf or cr.buffer)
       -- labels follow edits; missing files are flagged
       api.nvim_buf_set_lines(buf, 0, 1, false, { "", "gone.lua" })
-      api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+      api.nvim_exec_autocmds("TextChanged", { buf = buf })
       assert.are.same({ [2] = "missing 1  <leader>1", [3] = "2  <leader>2", [4] = "3  <leader>3" }, labels(buf))
       slop.marks.toggle_menu()
       assert.is_nil(menu_win())
@@ -314,6 +331,38 @@ describe("marks module", function()
       assert.are.same({ "c.lua", "a.lua" }, stored())
       assert.are.same({ root = root, count = 2, action = "menu" }, events[#events])
       assert.equal(root .. "/b.lua", api.nvim_buf_get_name(0))
+    end)
+
+    it("`u` cannot undo away the list the menu opened with", function()
+      slop.marks.toggle_menu()
+      local buf = api.nvim_get_current_buf()
+      vim.cmd("silent! normal! u")
+      assert.are.same({ "a.lua", "b.lua", "c.lua" }, api.nvim_buf_get_lines(buf, 0, -1, false))
+      -- edits of your own stay undoable
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      h.feed("dd")
+      assert.are.same({ "b.lua", "c.lua" }, api.nvim_buf_get_lines(buf, 0, -1, false))
+      h.feed("u")
+      vim.cmd("silent! normal! u")
+      assert.are.same({ "a.lua", "b.lua", "c.lua" }, api.nvim_buf_get_lines(buf, 0, -1, false))
+      h.feed("q")
+      assert.is_nil(menu_win())
+      assert.are.same({ "a.lua", "b.lua", "c.lua" }, stored())
+      assert.equal(0, #events)
+    end)
+
+    it("<CR> opens the entry by path after another instance reordered the list", function()
+      slop.marks.toggle_menu()
+      api.nvim_win_set_cursor(0, { 1, 0 }) -- "a.lua"
+      require("slop.core.project").write_json(state_file(), {
+        version = 1,
+        marks = { { path = "c.lua", row = 1, col = 0 }, { path = "a.lua", row = 4, col = 2 } },
+      })
+      h.feed("<CR>")
+      assert.is_nil(menu_win())
+      assert.equal(root .. "/a.lua", api.nvim_buf_get_name(0))
+      assert.are.same({ 4, 2 }, api.nvim_win_get_cursor(0))
+      assert.are.same({ "c.lua", "a.lua" }, stored(), "the unedited menu does not overwrite the other change")
     end)
 
     it("does not write when nothing changed", function()

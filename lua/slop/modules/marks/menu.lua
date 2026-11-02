@@ -185,14 +185,18 @@ function M.open()
   local buf = handle.buf
   s = { list = list, handle = handle, buf = buf, lines = initial, initial = initial, done = false }
   sess = s
+  -- the fill must not be undoable: one `u` too many would empty the menu and save an empty list
+  local undolevels = vim.bo[buf].undolevels
+  vim.bo[buf].undolevels = -1
   api.nvim_buf_set_lines(buf, 0, -1, false, initial)
+  vim.bo[buf].undolevels = undolevels
   vim.bo[buf].modified = false
   pcall(api.nvim_win_set_cursor, handle.win, { cursor, 0 })
   render(s)
   local group = require("slop.core.util").augroup("marks")
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group = group,
-    buffer = buf,
+    buf = buf,
     desc = "slop: marks menu labels",
     callback = function()
       render(s)
@@ -200,7 +204,7 @@ function M.open()
   })
   api.nvim_create_autocmd("BufWipeout", {
     group = group,
-    buffer = buf,
+    buf = buf,
     desc = "slop: save marks menu",
     callback = function()
       if sess == s then
@@ -228,10 +232,12 @@ function M.open_entry(cmd)
     return
   end
   local lnum = api.nvim_win_get_cursor(0)[1]
-  local _, idx = M.parse(s.list, api.nvim_buf_get_lines(s.buf, 0, -1, false))
+  local paths, idx = M.parse(s.list, api.nvim_buf_get_lines(s.buf, 0, -1, false))
+  local path = idx[lnum] and paths[idx[lnum]]
   M.close()
-  if idx[lnum] then
-    require("slop.modules.marks.actions").select(idx[lnum], { cmd = cmd })
+  if path then
+    -- by path, not index: another instance may have changed the stored order while the menu was open
+    require("slop.modules.marks.actions").select_path(s.list, path, { cmd = cmd })
   end
 end
 

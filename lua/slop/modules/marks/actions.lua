@@ -144,7 +144,9 @@ function M.open(file, row, col, cmd)
   if not (cmd == "edit" and b > 0 and b == api.nvim_get_current_buf()) then
     local ok, err = pcall(vim.cmd, (OPEN[cmd] or "edit") .. " " .. vim.fn.fnameescape(file))
     if not ok then
-      log.notify((tostring(err):gsub("^Vim:", "")), vim.log.levels.ERROR)
+      -- "[string "vim/_core/editor"]:353: nvim_exec2(), line 1: Vim(edit):E37: ..." -> "E37: ..."
+      local msg = tostring(err)
+      log.notify(msg:match("E%d+: .*$") or msg, vim.log.levels.ERROR)
       return false
     end
   end
@@ -172,6 +174,22 @@ function M.select(i, opts)
   ---@cast i integer
   last = i
   return M.open(store.abs(list, item.path), item.row, item.col, opts and opts.cmd)
+end
+
+--- Open the mark stored as `path` in `list` (re-read first): at its remembered cursor, or at line 1 when another
+--- instance unmarked it meanwhile.
+---@param list slop.marks.List
+---@param path string  stored form
+---@param opts? {cmd?: slop.marks.OpenCmd}
+---@return boolean ok
+function M.select_path(list, path, opts)
+  store.sync(list)
+  local i = store.index(list, path)
+  local item = i and list.items[i]
+  if i then
+    last = i
+  end
+  return M.open(store.abs(list, path), item and item.row or 1, item and item.col or 0, opts and opts.cmd)
 end
 
 ---@param step integer  1 or -1

@@ -51,6 +51,15 @@ Defaults (set any of them to `false` under `marks.keymaps` to disable):
 `<Plug>(slop-marks-select-1)` .. `<Plug>(slop-marks-select-10)`,
 `<Plug>(slop-marks-next)`, `<Plug>(slop-marks-prev)`.
 
+The default `<C-e>` replaces Vim's built-in |CTRL-E| (scroll the window one
+line down) in Normal mode. slop only maps a default key that has no mapping
+yet, so a `<C-e>` mapping of your own wins. To keep the built-in scroll, move
+the menu to another key or disable it (and map `<Plug>(slop-marks-menu)`
+yourself, if you like): >lua
+  require("slop").setup({ marks = { keymaps = { menu = "<leader>m" } } })
+  -- or: marks = { keymaps = { menu = false } }
+<
+
 Example: map next/prev >lua
   require("slop").setup({
     marks = { keymaps = { next = "<C-S-N>", prev = "<C-S-P>" } },
@@ -72,7 +81,9 @@ Edit the buffer like any other: `dd` deletes a mark, `ddp` moves it down,
 typing a new path adds one. Blank lines and duplicates are ignored. The list
 is saved when the menu closes: `q`, `<Esc>`, `<C-e>` again, leaving the
 window, or exiting Neovim. Nothing is written when the paths did not change.
-Edited marks keep their remembered cursor; new ones start at line 1.
+Edited marks keep their remembered cursor; new ones start at line 1. `u`
+undoes your own edits only: the list the menu opened with cannot be undone
+away.
 
 Keys in the menu (normal mode, buffer-local):
 
@@ -83,8 +94,13 @@ Keys in the menu (normal mode, buffer-local):
   `<C-t>`     menu_tab      open it in a new tab
   `q` `<Esc>`   (close_keys)  close and save
 
+`<Plug>` mappings: `<Plug>(slop-marks-menu-open)`,
+`<Plug>(slop-marks-menu-vsplit)`, `<Plug>(slop-marks-menu-split)`,
+`<Plug>(slop-marks-menu-tab)` (they act only in the menu).
+
 The menu is saved first, so the opened mark is the one you see, in the
-edited order. The buffer has 'filetype' `slopmarks`.
+edited order (the entry is looked up by path, so it stays right when another
+instance changed the list meanwhile). The buffer has 'filetype' `slopmarks`.
 
 ==============================================================================
 4. COMMANDS                                               *slop-marks-commands*
