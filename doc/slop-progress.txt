@@ -43,7 +43,9 @@ shown too.
 LSP ~
         `$/progress` notifications through the |LspProgress| autocmd
         (begin / report / end). The group is the client name. Tasks of a
-        client that stops before sending `end` are marked cancelled.
+        client that stops before sending `end` are marked cancelled. A
+        `title`, `message` or `percentage` the server sends as JSON `null`
+        counts as not sent.
 
 Native progress messages ~
         Every |progress-message| (`nvim_echo(..., { kind = "progress" })`),
@@ -184,6 +186,9 @@ With `suppress_echo = true` the module sets the `progress:` item of
 twice (in the window and the command line). The previous value is restored
 when the module is disabled (`:Slop modules disable progress`), unless you
 changed the option in the meantime. The statusline and OSC 9;4 indicators are
-left alone.
+left alone. Without a UI (`nvim --headless`, `nvim -l`) nobody sees the
+window, so the option is not touched and progress messages still reach
+stdout; it is set when a UI attaches (|UIEnter|) and restored when the last
+one leaves.
 
  vim:tw=78:ts=8:ft=help:norl:

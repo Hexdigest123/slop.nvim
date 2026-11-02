@@ -23,6 +23,14 @@ local function wait(fn, ms)
   return vim.wait(ms or 2000, fn, 10)
 end
 
+-- headless specs have no UI attached; tests that need one (echo suppression) stub this
+local list_uis = api.nvim_list_uis
+local function with_ui()
+  api.nvim_list_uis = function()
+    return { { chan = 1, width = 100, height = 30 } }
+  end
+end
+
 describe("progress module", function()
   local slop, p, view, clients
 
@@ -70,6 +78,7 @@ describe("progress module", function()
   end)
 
   after_each(function()
+    api.nvim_list_uis = list_uis
     local reg = package.loaded["slop.core.registry"]
     if reg and reg.is_loaded("progress") then
       reg.disable("progress")
@@ -130,6 +139,59 @@ describe("progress module", function()
     end))
     assert.is_false(api.nvim_win_is_valid(win))
     assert.equal(0, #p.items())
+  end)
+
+  it("LSP fields sent as JSON null (vim.NIL) are ignored: begin/report/end draw the window, no errors", function()
+    local notes = {}
+    vim.notify = function(msg, level)
+      notes[#notes + 1] = { msg = tostring(msg), level = level }
+    end
+    vim.v.errmsg = ""
+    setup({ linger = 80 })
+    lsp("begin", "n1", { title = vim.NIL, message = vim.NIL, percentage = vim.NIL, cancellable = vim.NIL })
+    local win = assert(view.win(), "the window opens for a begin with null fields")
+    assert.matches("lua_ls", shows("lua_ls"))
+    lsp("report", "n1", { title = "Indexing", message = vim.NIL, percentage = vim.NIL })
+    assert.matches("Indexing", shows("Indexing"))
+    lsp("report", "n1", { title = vim.NIL, message = "2/3", percentage = 66 })
+    assert.matches("2/3 %(66%%%)  Indexing", shows("2/3 %(66%%%)  Indexing"), "null title keeps the last one")
+    lsp("report", "n1", { message = vim.NIL, percentage = vim.NIL })
+    vim.wait(250) -- a few ticker frames redraw the item
+    assert.matches("2/3 %(66%%%)  Indexing", text())
+    lsp("end", "n1", { title = vim.NIL, message = vim.NIL })
+    assert.matches("2/3  Indexing ✓", shows("2/3  Indexing ✓"))
+    assert.is_true(api.nvim_win_is_valid(win))
+    local done = p.history()[1]
+    assert.equal("Indexing", done.title)
+    assert.equal("2/3", done.message)
+    assert.equal(100, done.percent)
+    assert.equal("", vim.v.errmsg)
+    for _, n in ipairs(notes) do
+      assert.falsy(n.msg:find("on_tick", 1, true) or (n.level or 0) >= vim.log.levels.ERROR, n.msg)
+    end
+  end)
+
+  it("an error while building the lines stays inside render() (retried), the window keeps working", function()
+    local notes = {}
+    vim.notify = function(msg, level)
+      notes[#notes + 1] = { msg = tostring(msg), level = level }
+    end
+    setup()
+    echo("first", { status = "running", title = "t" })
+    assert.matches("first", shows("first"))
+    local orig = view.lines
+    view.lines = function()
+      error("boom")
+    end
+    local ok, err = pcall(view.render)
+    vim.wait(150) -- ticks and the retry run into the same error
+    view.lines = orig
+    assert.is_true(ok, err)
+    echo("second", { status = "running", title = "u" })
+    assert.matches("second", shows("second"))
+    for _, n in ipairs(notes) do
+      assert.falsy(n.msg:find("on_tick", 1, true) or (n.level or 0) >= vim.log.levels.ERROR, n.msg)
+    end
   end)
 
   it("LSP: unknown `end` is ignored, ignored clients are dropped, stopped clients are swept", function()
@@ -317,6 +379,7 @@ describe("progress module", function()
   end)
 
   it("suppress_echo empties the progress: item of 'messagesopt'; teardown restores it", function()
+    with_ui() -- without a UI the echo is kept (next spec)
     setup()
     assert.equal("hit-enter,history:500,progress:", vim.o.messagesopt)
     -- core.ui.spinner shares the augroup: teardown must keep its cancel listener
@@ -334,6 +397,30 @@ describe("progress module", function()
     assert.equal(0, #vim.tbl_filter(function(a)
       return a.desc and a.desc:match("^slop: progress ") and a.desc ~= "slop: progress cancel"
     end, api.nvim_get_autocmds({ group = "slop.progress" })))
+  end)
+
+  it("without a UI (--headless, nvim -l) the echo is kept; UIEnter suppresses it, the last UILeave restores", function()
+    setup() -- headless: no UI attached
+    local s = require("slop.modules.progress.sources")
+    assert.equal("hit-enter,history:500,progress:c", vim.o.messagesopt, "stdout keeps the progress messages")
+    assert.is_false(s.suppressing())
+    with_ui()
+    api.nvim_exec_autocmds("UIEnter", { group = "slop.progress", modeline = false })
+    assert.truthy(wait(function()
+      return vim.o.messagesopt == "hit-enter,history:500,progress:"
+    end))
+    api.nvim_list_uis = list_uis
+    api.nvim_exec_autocmds("UILeave", { group = "slop.progress", modeline = false })
+    assert.truthy(wait(function()
+      return vim.o.messagesopt == "hit-enter,history:500,progress:c"
+    end))
+    assert.is_false(s.suppressing())
+    -- teardown before the scheduled re-check runs: it must not suppress again
+    with_ui()
+    api.nvim_exec_autocmds("UIEnter", { group = "slop.progress", modeline = false })
+    require("slop.core.registry").disable("progress")
+    vim.wait(50)
+    assert.equal("hit-enter,history:500,progress:c", vim.o.messagesopt)
   end)
 
   it("suppress_echo = false leaves 'messagesopt' alone; with_progress appends a missing item", function()

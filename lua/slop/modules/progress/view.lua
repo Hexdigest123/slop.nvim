@@ -329,8 +329,12 @@ function M.render()
   if fn.getcmdwintype() ~= "" then
     return -- floats cannot be opened from the cmdwin; the ticker retries
   end
-  local ok = pcall(draw, M.lines(items, t:frame()))
+  -- building the lines is inside the pcall too: an error must not escape into the autocmd / ticker that asked
+  local ok, err = pcall(function()
+    draw(M.lines(items, t:frame()))
+  end)
   if not ok then
+    require("slop.core.log").scope("progress").debug("render: %s", err)
     retry()
   end
 end

@@ -21,6 +21,37 @@ describe("progress store", function()
     assert.equal("boom stack", store.history()[1].message)
   end)
 
+  it("ignores fields of the wrong type (LSP JSON null = vim.NIL, tables, booleans); numbers become text", function()
+    local item = store.update("n", {
+      origin = "lsp",
+      group = vim.NIL,
+      title = vim.NIL,
+      message = {},
+      percent = vim.NIL,
+      client_id = "7",
+    })
+    assert.equal("lsp", item.origin)
+    assert.equal("slop", item.group, "default group kept")
+    assert.equal("", item.title)
+    assert.equal("", item.message)
+    assert.is_nil(item.percent)
+    assert.is_nil(item.client_id)
+    store.update("n", { title = 42, message = true, percent = "50", detail = vim.NIL })
+    item = assert(store.get("n"))
+    assert.equal("42", item.title)
+    assert.equal("", item.message)
+    assert.is_nil(item.percent)
+    assert.is_nil(item.detail)
+    store.update("n", { message = "half", percent = 50 })
+    store.finish("n", "success", { message = vim.NIL })
+    local done = store.history()[1]
+    assert.equal("half", done.message, "a null end message keeps the last one")
+    assert.equal(100, done.percent)
+    -- finish() of an unknown key creates it only with a real (string) origin
+    assert.is_nil(store.finish("once", "failed", { origin = vim.NIL, group = vim.NIL }))
+    assert.is_nil(store.get("once"))
+  end)
+
   it("creates, updates and finishes items; success forces 100%", function()
     local item, created = store.update("a", { origin = "lsp", group = "lua_ls", title = "Index", percent = 10 })
     assert.is_true(created)

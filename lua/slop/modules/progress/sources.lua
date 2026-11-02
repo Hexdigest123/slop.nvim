@@ -45,20 +45,24 @@ function M.lsp(ev)
     return
   end
   local key = ("lsp:%s:%s"):format(tostring(data.client_id), tostring(data.params.token))
+  -- optional fields a server sends as JSON null arrive as vim.NIL (truthy userdata): keep real strings/numbers only
+  local title = type(value.title) == "string" and value.title or nil
+  local message = type(value.message) == "string" and value.message or nil
+  local percent = type(value.percentage) == "number" and value.percentage or nil
   if value.kind == "end" then
     -- `end` of a task we never saw: nothing to show
-    if store.get(key) and store.finish(key, "success", { message = value.message }) then
+    if store.get(key) and store.finish(key, "success", { message = message }) then
       on_change(true)
     end
     return
   end
-  local fields = { origin = "lsp", group = group, client_id = data.client_id, title = value.title }
+  local fields = { origin = "lsp", group = group, client_id = data.client_id, title = title }
   if value.kind == "begin" then
-    fields.message = value.message or ""
-    fields.percent = value.percentage
+    fields.message = message or ""
+    fields.percent = percent
   else
-    fields.message = value.message
-    fields.percent = value.percentage
+    fields.message = message
+    fields.percent = percent
   end
   local _, created = store.update(key, fields)
   on_change(created)
@@ -221,6 +225,10 @@ end
 --- Hide (true) or restore (false) Neovim's own cmdline echo of progress messages.
 ---@param on boolean
 function M.suppress_echo(on)
+  -- no UI (--headless, nvim -l): nobody sees the window and the echo goes to stdout, keep it (UIEnter re-checks)
+  if on and #api.nvim_list_uis() == 0 then
+    on = false
+  end
   if on and not mopt then
     local saved = vim.o.messagesopt
     local new = M.with_progress(saved, "")
@@ -284,6 +292,17 @@ function M.start(c, changed, ui)
   })
   au({ "VimResized", "TabEnter" }, { desc = "slop: progress layout", callback = ui })
   au("OptionSet", { pattern = { "laststatus", "cmdheight" }, desc = "slop: progress layout", callback = ui })
+  -- a UI attaching after startup (--embed, --remote-ui) or the last one leaving decides whether to echo
+  au({ "UIEnter", "UILeave" }, {
+    desc = "slop: progress echo",
+    callback = function()
+      vim.schedule(function() -- the UI list is final on the next tick
+        if #ids > 0 then -- not stopped meanwhile
+          M.suppress_echo(cfg.suppress_echo)
+        end
+      end)
+    end,
+  })
 end
 
 --- Delete the autocmds (only ours: core.ui.spinner shares the augroup) and restore 'messagesopt'.

@@ -42,18 +42,32 @@ function M.configure(c)
   end
 end
 
-local FIELDS = { "group", "title", "message", "percent", "client_id", "ai_id", "detail", "origin" }
+-- field -> the type it must have. Anything else is ignored, so no source can poison an item: LSP JSON null arrives
+-- as vim.NIL (truthy userdata) and the view concatenates the text fields and %d-formats the percentage.
+local FIELDS = {
+  group = "string",
+  title = "string",
+  message = "string",
+  detail = "string",
+  origin = "string",
+  percent = "number",
+  client_id = "number",
+  ai_id = "number",
+}
 
 ---@param item slop.progress.Item
 ---@param fields table
 local function apply(item, fields)
-  for _, f in ipairs(FIELDS) do
+  for f, want in pairs(FIELDS) do
     local v = fields[f]
-    if type(v) == "string" then
-      -- one window line per item: multi-line LSP/AI messages are flattened
-      v = vim.trim((v:gsub("%s*[\r\n]+%s*", " ")))
+    if want == "string" and type(v) == "number" then
+      v = tostring(v)
     end
-    if v ~= nil then
+    if type(v) == want then
+      if want == "string" then
+        -- one window line per item: multi-line LSP/AI messages are flattened
+        v = vim.trim((v:gsub("%s*[\r\n]+%s*", " ")))
+      end
       item[f] = v
     end
   end
@@ -66,8 +80,8 @@ local function create(key, fields)
   counter = counter + 1
   local item = {
     key = key,
-    origin = fields.origin or "native",
-    group = fields.group or "slop",
+    origin = "native", -- defaults: apply() sets the given (well-typed) origin / group
+    group = "slop",
     title = "",
     message = "",
     status = "running",
@@ -107,7 +121,7 @@ end
 function M.finish(key, status, fields)
   local item = items[key]
   if not item then
-    if not (fields and fields.origin) then
+    if not (fields and type(fields.origin) == "string") then
       return nil
     end
     item = create(key, fields)

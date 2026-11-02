@@ -67,6 +67,48 @@ describe("progress with a real LSP client", function()
     assert.equal(1, #p.history())
   end)
 
+  it("JSON null fields (vim.NIL) through the real handler: the window draws begin/report/end, no errors", function()
+    local notes = {}
+    vim.notify = function(msg, level)
+      notes[#notes + 1] = { msg = tostring(msg), level = level }
+    end
+    vim.v.errmsg = ""
+    local p = require("slop").progress
+    local view = require("slop.modules.progress.view")
+    local function text()
+      local buf = view.buf()
+      return buf and table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") or ""
+    end
+    local function shows(pat)
+      return vim.wait(1000, function()
+        return text():match(pat) ~= nil
+      end, 10)
+    end
+    -- what vim.json.decode makes of `null` (rpc.lua decodes without luanil)
+    send({ kind = "begin", title = vim.NIL, message = vim.NIL, percentage = vim.NIL, cancellable = vim.NIL })
+    assert.truthy(
+      vim.wait(1000, function()
+        return view.win() ~= nil
+      end, 10),
+      "the window opens"
+    )
+    assert.truthy(shows("fakels"))
+    send({ kind = "report", message = "1/2", percentage = vim.NIL })
+    assert.truthy(shows("1/2"), text())
+    send({ kind = "report", message = vim.NIL, percentage = 50 })
+    assert.truthy(shows("1/2 %(50%%%)"), text())
+    send({ kind = "end", message = vim.NIL })
+    assert.truthy(shows("1/2 ✓"), text())
+    local done = p.history()[1]
+    assert.equal("success", done.status)
+    assert.equal("", done.title)
+    assert.equal("1/2", done.message)
+    assert.equal("", vim.v.errmsg)
+    for _, n in ipairs(notes) do
+      assert.falsy(n.msg:find("on_tick", 1, true) or (n.level or 0) >= vim.log.levels.ERROR, n.msg)
+    end
+  end)
+
   it("a stopped client's running task is finished as cancel", function()
     local p = require("slop").progress
     send({ kind = "begin", title = "Indexing" })
