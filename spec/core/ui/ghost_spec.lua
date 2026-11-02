@@ -143,6 +143,17 @@ describe("core.ui.ghost", function()
     assert.are.same({ "", "# comment" }, lines())
   end)
 
+  it("accept keeps a buffer-local 'undolevels' local and leaves the global one alone", function()
+    local global = vim.go.undolevels
+    vim.bo[buf].undolevels = -1 -- e.g. a big-file helper; slop's own scratch buffers do the same
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "x = " })
+    ghost.show(buf, 0, 4, "1")
+    assert.is_true(ghost.accept(buf))
+    assert.are.same({ "x = 1" }, lines())
+    assert.equal(global, vim.go.undolevels)
+    assert.equal(-1, vim.bo[buf].undolevels)
+  end)
+
   it("empty text clears; invalid buffers are ignored", function()
     api.nvim_buf_set_lines(buf, 0, -1, false, { "x" })
     ghost.show(buf, 0, 1, "y")

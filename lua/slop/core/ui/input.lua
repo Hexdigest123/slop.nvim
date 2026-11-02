@@ -296,13 +296,18 @@ function M.open(opts)
     end
     finished = true
     active[buf] = nil
-    if api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    -- only touch the mode and the focus when the prompt itself is focused: a user who left it for another
+    -- window (cancel on leave) stays where they went, in the mode they are in
+    local was_current = fh ~= nil and fh:is_valid() and api.nvim_get_current_win() == fh.win
+    if was_current and api.nvim_get_mode().mode:sub(1, 1) == "i" then
       vim.cmd.stopinsert()
     end
     if fh and fh:is_valid() then
       fh:close()
     end
-    restore_focus()
+    if was_current then
+      restore_focus()
+    end
     if text then
       if opts.history then
         add_history(opts.history, text, hist_buf)
@@ -378,7 +383,7 @@ function M.open(opts)
   end
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group = group,
-    buffer = buf,
+    buf = buf,
     callback = function(ev)
       highlight_tokens(buf, triggers)
       relayout()
@@ -389,7 +394,7 @@ function M.open(opts)
   })
   api.nvim_create_autocmd("BufWipeout", {
     group = group,
-    buffer = buf,
+    buf = buf,
     once = true,
     callback = function()
       active[buf] = nil
@@ -397,6 +402,7 @@ function M.open(opts)
     end,
   })
   highlight_tokens(buf, triggers)
+  relayout() -- a long default wraps: size the float for it right away
 
   local last = #lines
   api.nvim_win_set_cursor(fh.win, { last, #(lines[last] or "") })

@@ -142,6 +142,16 @@ describe("core.ui.float", function()
     assert.equal(9, c.col)
   end)
 
+  it("update() keeps a win-relative float anchored to the window it was opened from", function()
+    local src = api.nvim_get_current_win()
+    local f = float.open({ relative = "win", width = 20, height = 2, title = "t" })
+    assert.equal(f.win, api.nvim_get_current_win()) -- focused: "current window" is the float now
+    f:update({ footer = "3 items" })
+    local c = api.nvim_win_get_config(f.win)
+    assert.equal(" 3 items ", c.footer[1][1])
+    assert.equal(src, c.win)
+  end)
+
   it("update() changes title/footer; get/list/is_float/close", function()
     local f = float.open({ title = "a" })
     f:update({ title = "b", footer = "x" })

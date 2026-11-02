@@ -133,6 +133,21 @@ function M.win(name_or_buf)
   return nil
 end
 
+--- A window showing `buf`: the current tabpage first, else a non-float window of another tabpage.
+---@param buf integer
+---@return integer?
+local function any_win(buf)
+  local w = M.win(buf)
+  if w then
+    return w
+  end
+  for _, win in ipairs(api.nvim_list_wins()) do
+    if api.nvim_win_get_buf(win) == buf and api.nvim_win_get_config(win).relative == "" then
+      return win
+    end
+  end
+end
+
 ---@param size integer|number|nil
 ---@param total integer
 ---@param default number
@@ -157,7 +172,8 @@ local function apply_win_opts(win, buf, opts)
   end
 end
 
---- Show the named scratch buffer, reusing a window (in the current tabpage) that already shows it.
+--- Show the named scratch buffer, reusing a window that already shows it (in the current tabpage; for
+--- layout = "tab" in any tabpage).
 ---@param name string
 ---@param opts? slop.scratch.OpenOpts
 ---@return integer buf, integer win
@@ -168,8 +184,9 @@ function M.open(name, opts)
     vim.b[buf].slop_winbar = opts.winbar
   end
   local src = api.nvim_get_current_win()
-  local win = M.win(buf)
   local layout = opts.layout or "vsplit"
+  -- "tab": once the result tab exists it is another tabpage; reuse it instead of a new tab per call
+  local win = layout == "tab" and any_win(buf) or M.win(buf)
   if not win then
     if layout == "float" then
       local fopts = vim.tbl_extend("force", { width = 0.8, height = 0.8, close_keys = { "q" } }, opts.float or {})
@@ -234,8 +251,9 @@ function M.set_winbar(buf, text)
     return
   end
   vim.b[buf].slop_winbar = text
+  -- floats too: open() and the BufWinEnter hook put the winbar on float windows as well
   for _, w in ipairs(api.nvim_list_wins()) do
-    if api.nvim_win_get_buf(w) == buf and api.nvim_win_get_config(w).relative == "" then
+    if api.nvim_win_get_buf(w) == buf then
       vim.wo[w][0].winbar = text
     end
   end

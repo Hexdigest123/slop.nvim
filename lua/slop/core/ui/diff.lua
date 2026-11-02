@@ -10,8 +10,9 @@
 --- `reject_all()` with nothing accepted and nothing else changed undoes the block (buffer not left 'modified').
 --- If the user undoes the preview with `u`, the handle closes as "rejected" without touching the buffer again.
 ---
---- Buffer-local keymaps (normal mode) exist while at least one handle is active in the buffer; they act on the
---- hunk under the cursor and fall through to the key's previous/native meaning when there is nothing to act on.
+--- Buffer-local keymaps (normal mode, nowait) exist while at least one handle is active in the buffer; they act on
+--- the hunk (or review region) under the cursor (]h/[h: relative to the pending hunks) and fall through to the key's
+--- previous/native meaning everywhere else.
 ---@class slop.ui.diff
 local M = {}
 
@@ -574,7 +575,20 @@ function Handle:reject_all()
       any_accepted = any_accepted or h.state == "accepted"
     end
     local ut = undotree(buf)
-    if not any_accepted and self._seq and ut.seq_last == self._seq and ut.seq_cur == self._seq then
+    -- effective 'undolevels': with a (buffer-local) -1 `silent undo` silently does nothing
+    local can_undo = api.nvim_buf_call(buf, function()
+      return vim.o.undolevels
+    end) >= 0
+    -- undo only while the newest undo state is still the initial apply (plus joined rejects): after a user edit a
+    -- reject gets its own undo block, and undoing just that block would bring the rejected hunk back
+    if
+      not any_accepted
+      and can_undo
+      and self._seq
+      and self._seq == self._seq_base
+      and ut.seq_last == self._seq
+      and ut.seq_cur == self._seq
+    then
       self._active = false -- the TextChanged watcher must not treat our own undo as the user's
       local views = {}
       for _, win in ipairs(api.nvim_list_wins()) do
@@ -698,7 +712,7 @@ function M.close_all(buf)
   end
 end
 
---- Handle the cursor is in (or the only one in the buffer).
+--- Handle whose pending hunk (else whose review region) is under `row`; nil elsewhere, so the keys fall through.
 local function handle_at(buf, row)
   local list = by_buf[buf] or {}
   for _, hd in ipairs(list) do
@@ -710,9 +724,6 @@ local function handle_at(buf, row)
     if hd:_contains(row) then
       return hd
     end
-  end
-  if #list == 1 then
-    return list[1]
   end
 end
 
@@ -737,7 +748,7 @@ local function dispatch(buf, action)
     return false
   end
   if action == "accept" or action == "reject" then
-    local h = hd:hunk_at(row) or (hd:_contains(row) and hd:_nearest(row)) or nil
+    local h = hd:hunk_at(row) or hd:_nearest(row)
     if not h then
       return false
     end
@@ -762,7 +773,7 @@ local function setup_buf(buf, handle)
     buf_state[buf] = st
     api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
       group = st.group,
-      buffer = buf,
+      buf = buf,
       callback = function()
         for _, hd in ipairs(M.list(buf)) do
           hd._active = false
@@ -772,7 +783,7 @@ local function setup_buf(buf, handle)
     })
     api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
       group = st.group,
-      buffer = buf,
+      buf = buf,
       callback = function()
         local list = by_buf[buf]
         if not list or #list == 0 then
@@ -796,14 +807,18 @@ local function setup_buf(buf, handle)
   local keymaps = require("slop.core.keymaps")
   for action, lhs in pairs(keys_of(handle.opts)) do
     if type(lhs) == "string" and lhs ~= "" and not st.maps[lhs] then
-      local saved = vim.fn.maparg(lhs, "n", false, true)
-      if not (type(saved) == "table" and saved.buffer == 1) then
+      -- the reviewed buffer's own mapping (it may not be the current buffer: async doc/edit/rest results)
+      local saved = api.nvim_buf_call(buf, function()
+        return vim.fn.maparg(lhs, "n", false, true)
+      end)
+      if not (type(saved) == "table" and (saved.buf or saved.buffer) == 1) then
         saved = nil
       end
       st.maps[lhs] = { action = action, saved = saved }
+      -- nowait: 0.11+ defines global grn/grr/gra/gri/grt/grx, which would make `gr` wait for 'timeoutlen'
       keymaps.fallthrough("n", lhs, function()
         return dispatch(buf, action)
-      end, { desc = "diff " .. action:gsub("_", " "), buf = buf })
+      end, { desc = "diff " .. action:gsub("_", " "), buf = buf, nowait = true })
     end
   end
 end
@@ -867,6 +882,11 @@ function M.show(buf, range, new_lines, opts)
     s, e = 0, 1 -- empty buffer: replace its only line instead of appending below it
   end
   local old = api.nvim_buf_get_lines(buf, s, e, false)
+  if #new_lines == 0 and s == 0 and e == lc then
+    -- deleting everything leaves Nvim's mandatory empty line: preview exactly that line, so a reject restores
+    -- the buffer without an extra empty line (and an already empty buffer stays "unchanged")
+    new_lines = { "" }
+  end
   next_id = next_id + 1
   local self = setmetatable({
     id = next_id,
@@ -907,13 +927,15 @@ function M.show(buf, range, new_lines, opts)
       h.mark = api.nvim_buf_set_extmark(buf, track, row, 0, {
         end_row = row + h.new_count,
         end_col = 0,
-        right_gravity = false,
+        right_gravity = true, -- a line opened right above the hunk is not part of it
         end_right_gravity = false,
         strict = false,
       })
     elseif row >= lc then
       h.eof = true
-      h.mark = api.nvim_buf_set_extmark(buf, track, lc - 1, #get_line(buf, lc - 1), { right_gravity = false })
+      -- right gravity: text inserted at the very end later (another hunk's revert, typing on an empty last
+      -- line) must stay above the deleted EOF lines
+      h.mark = api.nvim_buf_set_extmark(buf, track, lc - 1, #get_line(buf, lc - 1), { right_gravity = true })
     else
       h.mark = api.nvim_buf_set_extmark(buf, track, row, 0, { right_gravity = false })
     end

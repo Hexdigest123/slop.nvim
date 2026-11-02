@@ -214,7 +214,7 @@ describe("core.ui.diff", function()
       })
       break_undo()
       vim.cmd("silent undo")
-      vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+      vim.api.nvim_exec_autocmds("TextChanged", { buf = buf })
       assert.equal("rejected", done)
       assert.same({ "a", "b" }, lines(buf))
       assert.same({}, diff.list(buf))
@@ -231,6 +231,74 @@ describe("core.ui.diff", function()
       assert.is_true(h2:is_active())
       h2:accept_all()
       assert.same({}, diff.list(buf))
+    end)
+
+    it("reject_all after a user edit and a separate reject restores every hunk", function()
+      local buf = new_buf({ "a", "b", "c", "d", "e", "tail" })
+      api.nvim_set_current_buf(buf)
+      local done
+      local hd = diff.show(buf, { 0, 5 }, { "A", "b", "c", "D", "e" }, {
+        on_done = function(r)
+          done = r
+        end,
+      })
+      break_undo()
+      api.nvim_buf_set_lines(buf, 5, 6, false, { "TAIL" }) -- the user edits while reviewing
+      break_undo()
+      assert.is_true(hd:reject(1)) -- cannot be undojoined any more: its own undo block
+      hd:reject_all()
+      assert.same({ "a", "b", "c", "d", "e", "TAIL" }, lines(buf))
+      assert.equal("rejected", done)
+    end)
+
+    it("reject_all restores the old text when 'undolevels' is -1", function()
+      local buf = new_buf({ "x", "y" })
+      vim.bo[buf].undolevels = -1
+      local hd = diff.show(buf, { 0, 2 }, { "X", "y" })
+      hd:reject_all()
+      assert.same({ "x", "y" }, lines(buf))
+    end)
+
+    it("a line opened right above a hunk is not part of it", function()
+      local buf = new_buf({ "one", "two", "three" })
+      api.nvim_set_current_buf(buf)
+      local hd = diff.show(buf, { 1, 2 }, { "TWO" })
+      break_undo()
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      h.feed("Omine<Esc>", "nx")
+      api.nvim_win_set_cursor(0, { 3, 0 })
+      assert.is_true(hd:reject())
+      assert.same({ "one", "mine", "two", "three" }, lines(buf))
+    end)
+
+    it("restores EOF deletions after an empty last line and a whole-buffer deletion exactly", function()
+      -- two pure deletions whose tracking marks share the (empty) last line
+      local buf = new_buf({ "a", "a", "c", "", "c", "", "c" })
+      local hd = diff.show(buf, { 2, 7 }, { "a", "", "" })
+      assert.equal(3, #hd:hunks())
+      for _, i in ipairs({ 2, 3, 1 }) do
+        assert.is_true(hd:reject(i))
+      end
+      assert.same({ "a", "a", "c", "", "c", "", "c" }, lines(buf))
+
+      local all = new_buf({ "a", "b" })
+      local hd2 = diff.show(all, { 0, 2 }, {})
+      assert.same({ "" }, lines(all))
+      assert.is_true(hd2:reject(1))
+      assert.same({ "a", "b" }, lines(all))
+
+      local empty = new_buf({ "" })
+      local done
+      diff.show(empty, { 0, 1 }, {}, {
+        on_done = function(r)
+          done = r
+        end,
+      })
+      vim.wait(200, function()
+        return done ~= nil
+      end)
+      assert.equal("unchanged", done)
+      assert.same({ "" }, lines(empty))
     end)
 
     it("close() wipes decorations and rejects pending hunks", function()
@@ -276,6 +344,102 @@ describe("core.ui.diff", function()
       assert.equal("", vim.fn.maparg("]h", "n"))
       local restored = vim.fn.maparg("gA", "n", false, true)
       assert.equal("user map", restored.desc)
+    end)
+
+    it("act only inside a hunk or the review region and fall through elsewhere", function()
+      local l = {}
+      for i = 1, 30 do
+        l[i] = "line " .. i
+      end
+      local buf = new_buf(l)
+      api.nvim_set_current_buf(buf)
+      local refined = 0
+      local hd = diff.show(buf, { 20, 22 }, { "AI 21", "AI 22" }, {
+        on_refine = function()
+          refined = refined + 1
+        end,
+      })
+      api.nvim_win_set_cursor(0, { 1, 0 }) -- far away from the review
+      h.feed("<C-r>")
+      assert.equal(0, refined)
+      h.feed("gRxy<Esc>") -- native Virtual Replace mode
+      assert.equal("xyne 1", lines(buf)[1])
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      h.feed("grZ") -- native gr{char}
+      assert.equal("Zine 2", lines(buf)[2])
+      api.nvim_win_set_cursor(0, { 3, 0 })
+      h.feed("gA")
+      assert.is_true(hd:is_active())
+      assert.same({ "AI 21", "AI 22" }, api.nvim_buf_get_lines(buf, 20, 22, false))
+      -- inside the review they act
+      api.nvim_win_set_cursor(0, { 21, 0 })
+      h.feed("<C-r>")
+      assert.equal(1, refined)
+      h.feed("gR")
+      assert.is_false(hd:is_active())
+      assert.same({ "line 21", "line 22" }, api.nvim_buf_get_lines(buf, 20, 22, false))
+    end)
+
+    it("are mapped with nowait (0.11+ defines global gr* maps)", function()
+      local keymaps = require("slop.core.keymaps")
+      local orig = keymaps.fallthrough
+      local seen = {}
+      keymaps.fallthrough = function(mode, lhs, handler, opts)
+        seen[lhs] = opts.nowait
+        return orig(mode, lhs, handler, opts)
+      end
+      local buf = new_buf({ "a" })
+      local ok, hd = pcall(diff.show, buf, { 0, 1 }, { "b" }, { on_refine = function() end })
+      keymaps.fallthrough = orig
+      assert.is_true(ok, hd)
+      for _, lhs in ipairs({ "ga", "gr", "gA", "gR", "]h", "[h", "<C-r>" }) do
+        assert.is_true(seen[lhs], lhs)
+      end
+      hd:close()
+    end)
+
+    it("a real review: `gr` is nowait, `grn` outside a hunk still runs the global grn (keymaps + diff)", function()
+      for _, lhs in ipairs({ "grn", "grr", "gra", "gri", "grt", "grx" }) do
+        pcall(vim.keymap.del, "n", lhs) -- the 0.11+ LSP defaults: replaced by test maps below
+      end
+      local renamed = 0
+      vim.keymap.set("n", "grn", function()
+        renamed = renamed + 1
+      end)
+      vim.keymap.set("n", "grr", "<Nop>")
+      local text = {}
+      for i = 1, 30 do
+        text[i] = "line " .. i
+      end
+      local buf = new_buf(text)
+      api.nvim_set_current_buf(buf)
+      local hd = diff.show(buf, { 0, 1 }, { "AI 1" })
+      assert.equal(1, vim.fn.maparg("gr", "n", false, true).nowait, "gr would wait for 'timeoutlen'")
+      -- outside the hunk: as if slop had not mapped gr at all
+      api.nvim_win_set_cursor(0, { 25, 0 })
+      h.feed("grn")
+      assert.equal(1, renamed)
+      assert.equal("line 25", api.nvim_buf_get_lines(buf, 24, 25, false)[1])
+      assert.is_true(hd:is_active())
+      -- inside the hunk: rejects it
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      h.feed("gr")
+      assert.equal("line 1", api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+      assert.equal(1, renamed)
+    end)
+
+    it("save and restore the reviewed buffer's own maps when it is not the current buffer", function()
+      local cur = api.nvim_get_current_buf()
+      vim.keymap.set("n", "]h", "<Nop>", { buf = cur, desc = "current buffer map" })
+      local other = new_buf({ "x" })
+      vim.keymap.set("n", "]h", "<Nop>", { buf = other, desc = "reviewed buffer map" })
+      local hd = diff.show(other, { 0, 1 }, { "y" })
+      assert.equal(cur, api.nvim_get_current_buf())
+      hd:accept_all()
+      api.nvim_buf_call(other, function()
+        assert.equal("reviewed buffer map", vim.fn.maparg("]h", "n", false, true).desc)
+      end)
+      assert.equal("current buffer map", vim.fn.maparg("]h", "n", false, true).desc)
     end)
 
     it("does not map <C-r> without on_refine", function()

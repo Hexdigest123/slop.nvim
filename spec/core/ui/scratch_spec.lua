@@ -119,6 +119,30 @@ describe("core.ui.scratch", function()
     assert.equal("second", vim.wo[0].winbar)
   end)
 
+  it("set_winbar() updates float windows too (layout = float)", function()
+    -- rest/view.lua order: open() then set_winbar(), twice per request
+    local buf, win = scratch.open("fwb", { layout = "float" })
+    scratch.set_winbar(buf, "running")
+    assert.equal("running", vim.wo[win].winbar)
+    local _, win2 = scratch.open("fwb", { layout = "float" })
+    assert.equal(win, win2)
+    scratch.set_winbar(buf, "200 OK")
+    assert.equal("200 OK", vim.wo[win].winbar)
+  end)
+
+  it("layout = tab reuses the result tab from another tabpage", function()
+    local src = api.nvim_get_current_win()
+    local tabs = #api.nvim_list_tabpages()
+    for _ = 1, 2 do -- rest runs open() twice per request (running, then the result)
+      local _, w1 = scratch.open("tabbed", { layout = "tab" })
+      local _, w2 = scratch.open("tabbed", { layout = "tab" })
+      assert.equal(w1, w2)
+      assert.equal(src, api.nvim_get_current_win())
+    end
+    assert.equal(tabs + 1, #api.nvim_list_tabpages())
+    assert.is_nil(scratch.win("tabbed")) -- win() itself stays "current tabpage only"
+  end)
+
   it("close() never closes the last window; delete() wipes", function()
     local buf = scratch.open("only", { layout = "current" })
     scratch.close("only")

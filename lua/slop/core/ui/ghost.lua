@@ -267,16 +267,20 @@ end
 
 -- Accepting --------------------------------------------------------------------------------------
 
-local function break_undo()
-  -- setting 'undolevels' closes the current undo block (also mid-insert): the accept becomes its own step
-  vim.o.undolevels = vim.o.undolevels
+local function break_undo(buf)
+  -- setting 'undolevels' closes the current undo block (also mid-insert): the accept becomes its own step.
+  -- Set only the global value, with `buf` current: `vim.o` (= :set) would copy a buffer-local 'undolevels'
+  -- (e.g. -1) into the global one and clear the local one.
+  api.nvim_buf_call(buf, function()
+    vim.go.undolevels = vim.go.undolevels
+  end)
 end
 
 local function insert(buf, row, col, part)
   local lines = vim.split(part, "\n", { plain = true })
   local line = api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
   col = math.min(col, #line)
-  break_undo()
+  break_undo(buf)
   api.nvim_buf_set_text(buf, row, col, row, col, lines)
   local erow = row + #lines - 1
   local ecol = #lines == 1 and (col + #lines[1]) or #lines[#lines]

@@ -92,6 +92,16 @@ describe("core.ui.picker", function()
       assert.are.same({ 3 }, m[1].positions)
     end)
 
+    it("filter() positions stay right after combining characters (NFD names)", function()
+      local text = "e\204\129cole.txt" -- e + U+0301 COMBINING ACUTE ACCENT
+      local m = picker.filter({ text }, "co")
+      local got = {}
+      for _, p in ipairs(m[1].positions) do
+        got[#got + 1] = vim.fn.strcharpart(text:sub(p + 1), 0, 1)
+      end
+      assert.are.same({ "c", "o" }, got)
+    end)
+
     it("fzf_key() translates vim key notation", function()
       assert.equal("ctrl-v", picker.fzf_key("<C-v>"))
       assert.equal("alt-x", picker.fzf_key("<M-x>"))
@@ -134,7 +144,7 @@ describe("core.ui.picker", function()
 
     local function type_query(hd, q)
       vim.api.nvim_buf_set_lines(hd._bufs.prompt, 0, -1, false, { q })
-      vim.api.nvim_exec_autocmds("TextChangedI", { buffer = hd._bufs.prompt })
+      vim.api.nvim_exec_autocmds("TextChangedI", { buf = hd._bufs.prompt })
     end
 
     it("shows items, filters, moves and selects", function()
@@ -220,6 +230,75 @@ describe("core.ui.picker", function()
       hd.close()
     end)
 
+    it("previews never throw: NUL bytes, directories, unreadable files, newlines in lines", function()
+      vim.o.columns, vim.o.lines = 160, 50
+      local dir = h.tmpdir("pv-odd")
+      local f = assert(io.open(dir .. "/nul.txt", "wb"))
+      f:write("a\0b\nsecond\n")
+      f:close()
+      h.write(dir .. "/locked.txt", "secret\n")
+      vim.uv.fs_chmod(dir .. "/locked.txt", 0)
+      local items = {
+        { text = "nul", path = dir .. "/nul.txt" },
+        { text = "dir", path = dir },
+        { text = "locked", path = dir .. "/locked.txt" },
+        { text = "newlines" },
+      }
+      local hd = open(items, {
+        preview = function(it)
+          return it.path and { path = it.path } or { lines = { "one\ntwo" } }
+        end,
+      })
+      local function preview()
+        return vim.api.nvim_buf_get_lines(hd._bufs.preview, 0, -1, false)
+      end
+      assert.are.same({ "a\0b", "second" }, preview())
+      hd._move(1)
+      assert.matches("directory", preview()[1])
+      hd._move(1)
+      local locked = preview()
+      assert.equal(1, #locked)
+      assert.truthy(locked[1] == "secret" or locked[1]:find("E484", 1, true), locked[1]) -- root can read it
+      hd._move(1)
+      assert.are.same({ "one", "two" }, preview())
+      hd.close()
+      vim.uv.fs_chmod(dir .. "/locked.txt", 420)
+    end)
+
+    it("a failing setup closes its floats, wipes its buffers and re-raises", function()
+      local wins, bufs = #vim.api.nvim_list_wins(), #vim.api.nvim_list_bufs()
+      local calls = 0
+      local ok, err = pcall(picker.pick, function()
+        error("producer boom")
+      end, {
+        backend = "builtin",
+        on_select = function()
+          calls = calls + 1
+        end,
+      })
+      assert.is_false(ok)
+      assert.matches("producer boom", err)
+      assert.equal(wins, #vim.api.nvim_list_wins())
+      assert.equal(bufs, #vim.api.nvim_list_bufs())
+      vim.wait(50)
+      assert.equal(0, calls)
+      assert.equal("n", vim.api.nvim_get_mode().mode)
+    end)
+
+    it("the preview column ends on the same row as the list", function()
+      vim.o.columns, vim.o.lines = 160, 50
+      local hd = open({ "a" }, {
+        preview = function()
+          return { lines = { "x" } }
+        end,
+      })
+      local function bottom(win)
+        return vim.api.nvim_win_get_position(win)[1] + vim.api.nvim_win_get_config(win).height + 1
+      end
+      assert.equal(bottom(hd._handles.list.win), bottom(hd._handles.preview.win))
+      hd.close()
+    end)
+
     it("supports async item producers", function()
       local deliver
       local hd, got = open(function(cb)
@@ -248,6 +327,27 @@ describe("core.ui.picker", function()
         return got.called == 1
       end)
       assert.are.same({ "a", "b" }, got.item)
+    end)
+
+    it("multi-select highlights stay aligned on marked lines", function()
+      local hd = open({ "alpha", "beta" }, {
+        multi = true,
+        format = function(it)
+          return { { it, "Title" } }
+        end,
+      })
+      h.feed("<C-Space>") -- mark "alpha" ("● " is 4 bytes, the unmarked prefix 2)
+      assert.is_true(hd._state.marks[1])
+      local ns = require("slop.core.util").ns("picker")
+      local line = vim.api.nvim_buf_get_lines(hd._bufs.list, 0, 1, false)[1]
+      local covered
+      for _, m in ipairs(vim.api.nvim_buf_get_extmarks(hd._bufs.list, ns, { 0, 0 }, { 0, -1 }, { details = true })) do
+        if m[4].hl_group == "Title" then
+          covered = line:sub(m[3] + 1, m[4].end_col)
+        end
+      end
+      assert.equal("alpha", covered)
+      hd.close()
     end)
   end)
 

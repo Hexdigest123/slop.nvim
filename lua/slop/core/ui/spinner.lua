@@ -5,7 +5,8 @@
 ---   p:update("reading foo.lua", 30) ... p:finish("success", "done")
 ---
 --- Progress uses `nvim_echo(..., { kind = "progress" })` (Neovim 0.12): the default statusline shows it via
---- vim.ui.progress_status(), the TUI emits OSC 9;4. Ticks are never written to :messages (history only on finish).
+--- vim.ui.progress_status(), the TUI emits OSC 9;4. Updates are never written to :messages; the final state of
+--- finish() is (history only on finish). Progress objects may be used from fast events (luv callbacks).
 ---@class slop.ui.spinner
 local M = {}
 
@@ -113,7 +114,7 @@ end
 ---@field title? string                    default "slop"
 ---@field message? string                  initial message
 ---@field source? string                   Progress autocmd pattern (default "slop")
----@field percent? integer
+---@field percent? number                  0-100 (rounded down, clamped)
 ---@field on_cancel? fun()                 the UI asked to cancel (Progress event with status "cancel")
 
 ---@class slop.Progress
@@ -122,10 +123,27 @@ end
 ---@field private _done boolean
 ---@field private _au integer?
 ---@field private _msg string
+---@field private _percent integer?        last percentage (kept by message-only updates)
 local Progress = {}
 Progress.__index = Progress
 
 local counter = 0
+
+--- nvim_echo() only takes an integer in 0..100; anything else would make it throw and drop the whole update.
+---@param p any
+---@return integer?
+local function to_percent(p)
+  if type(p) ~= "number" or p ~= p then
+    return nil
+  end
+  return math.max(0, math.min(100, math.floor(p)))
+end
+
+--- nvim_echo()/nvim_create_autocmd() fail in fast events (E5560, e.g. a luv callback): run there on the main loop.
+---@param fn fun()
+local function main(fn)
+  require("slop.core.util").main(fn)
+end
 
 ---@param status string
 ---@param message string
@@ -143,18 +161,26 @@ function Progress:_echo(status, message, percent, history)
   })
 end
 
---- Update the message (and optionally the percentage).
+--- Update the message (and optionally the percentage: rounded down and clamped to 0-100; omitted = keep the last
+--- one). Safe to call from fast events.
 ---@param message string
----@param percent? integer
+---@param percent? number
 function Progress:update(message, percent)
   if self._done then
     return
   end
   self._msg = message or self._msg
-  self:_echo("running", self._msg, percent, false)
+  self._percent = to_percent(percent) or self._percent
+  local msg, pct = self._msg, self._percent
+  main(function()
+    -- a finish() may have run before this scheduled update: never go back to "running"
+    if not self._done then
+      self:_echo("running", msg, pct, false)
+    end
+  end)
 end
 
---- Finish: status "success" (default) | "failed" | "cancel".
+--- Finish: status "success" (default) | "failed" | "cancel". The final state goes to the message history.
 ---@param status? "success"|"failed"|"cancel"
 ---@param message? string
 function Progress:finish(status, message)
@@ -162,12 +188,15 @@ function Progress:finish(status, message)
     return
   end
   self._done = true
-  if self._au then
-    pcall(vim.api.nvim_del_autocmd, self._au)
-    self._au = nil
-  end
   status = status or "success"
-  self:_echo(status, message or self._msg, status == "success" and 100 or nil, false)
+  local msg, pct = message or self._msg, status == "success" and 100 or self._percent
+  main(function()
+    if self._au then
+      pcall(vim.api.nvim_del_autocmd, self._au)
+      self._au = nil
+    end
+    self:_echo(status, msg, pct, true)
+  end)
 end
 
 ---@return boolean
@@ -187,22 +216,29 @@ function M.progress(opts)
     _opts = opts,
     _done = false,
     _msg = opts.message or "",
+    _percent = to_percent(opts.percent),
   }, Progress)
-  if opts.on_cancel then
-    local ok, au = pcall(vim.api.nvim_create_autocmd, "Progress", {
-      group = require("slop.core.util").augroup("ui.spinner"),
-      pattern = source,
-      desc = "slop: progress cancel",
-      callback = function(ev)
-        local d = ev.data or {}
-        if d.id == self.id and d.status == "cancel" and not self._done then
-          opts.on_cancel()
-        end
-      end,
-    })
-    self._au = ok and au or nil
-  end
-  self:_echo("running", self._msg, opts.percent, false)
+  local msg, pct = self._msg, self._percent
+  main(function()
+    if self._done then
+      return -- finished before this got to run on the main loop
+    end
+    if opts.on_cancel then
+      local ok, au = pcall(vim.api.nvim_create_autocmd, "Progress", {
+        group = require("slop.core.util").augroup("ui.spinner"),
+        pattern = source,
+        desc = "slop: progress cancel",
+        callback = function(ev)
+          local d = ev.data or {}
+          if d.id == self.id and d.status == "cancel" and not self._done then
+            opts.on_cancel()
+          end
+        end,
+      })
+      self._au = ok and au or nil
+    end
+    self:_echo("running", msg, pct, false)
+  end)
   return self
 end
 

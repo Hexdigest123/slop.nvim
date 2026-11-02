@@ -21,7 +21,7 @@ local api = vim.api
 ---@field min_width? integer
 ---@field min_height? integer
 ---@field relative? "editor"|"cursor"|"win"|"region"  default "editor" (centered)
----@field win? integer                   for relative = "win" / "region" (default: current window)
+---@field win? integer                   for relative = "win" / "region" (default: the window current at open())
 ---@field bufpos? integer[]              {row, col} anchor in `win` (float follows the text)
 ---@field region? slop.Range             for relative = "region": shown below the region (above if no room)
 ---@field row? number
@@ -285,6 +285,11 @@ end
 ---@return slop.float.Handle
 function M.open(opts)
   opts = vim.tbl_extend("force", {}, opts or {})
+  if (opts.relative == "win" or opts.relative == "region") and not opts.win then
+    -- pin the default "current window" now: update() would re-resolve it to whatever is current then (the
+    -- float itself once focused -> "floating window cannot be relative to itself")
+    opts.win = api.nvim_get_current_win()
+  end
   local buf, own = opts.buf, false
   if not (buf and api.nvim_buf_is_valid(buf)) then
     buf = api.nvim_create_buf(false, true)

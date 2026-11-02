@@ -128,12 +128,40 @@ function M.filter(items, query, opts)
   for i, e in ipairs(res[1]) do
     local pos = {}
     for _, cidx in ipairs(res[2][i] or {}) do
-      local ok, b = pcall(vim.str_byteindex, e.text, "utf-32", cidx, false)
-      pos[#pos + 1] = ok and b or cidx
+      local b = vim.fn.byteidx(e.text, cidx)
+      pos[#pos + 1] = b >= 0 and b or cidx
     end
     out[i] = { item = items[e.index], index = e.index, text = e.text, positions = pos }
   end
   return out
+end
+
+--- Lines of a file for the preview. Never throws: directories and unreadable files give a message line.
+---@param path string
+---@return string[] lines, boolean content  false when `lines` is a message
+local function read_preview(path)
+  local stat = vim.uv.fs_stat(path)
+  if not stat then
+    return { "(file not found: " .. path .. ")" }, false
+  elseif stat.type == "directory" then
+    return { "(directory: " .. path .. ")" }, false
+  end
+  local ok, lines
+  if stat.size > PREVIEW_MAX_BYTES then
+    ok, lines = pcall(vim.fn.readfile, path, "", 2000)
+  else
+    ok, lines = pcall(vim.fn.readfile, path)
+  end
+  if not ok then
+    return { ("(%s)"):format((tostring(lines):gsub("^Vim:", ""))) }, false
+  end
+  -- readfile() returns NUL bytes as "\n", which nvim_buf_set_lines() rejects; the API spells NUL "\0"
+  for i, l in ipairs(lines) do
+    if l:find("\n", 1, true) then
+      lines[i] = (l:gsub("\n", "\0"))
+    end
+  end
+  return lines, true
 end
 
 --- Fill a buffer with a preview (lines, or a file read from disk) and return the line to show.
@@ -143,19 +171,20 @@ end
 local function fill_preview(buf, pv)
   local lines = { "" }
   local ft
+  if type(pv) ~= "table" then
+    pv = nil -- preview() returned something unusable: show nothing rather than throw
+  end
   if pv then
     if pv.lines then
-      lines = pv.lines
-    elseif pv.path then
-      local stat = vim.uv.fs_stat(pv.path)
-      if not stat then
-        lines = { "(file not found: " .. pv.path .. ")" }
-      elseif stat.size > PREVIEW_MAX_BYTES then
-        lines = vim.fn.readfile(pv.path, "", 2000)
-      else
-        lines = vim.fn.readfile(pv.path)
+      -- nvim_buf_set_lines() rejects items containing "\n": split them into lines
+      lines = {}
+      for _, l in ipairs(pv.lines) do
+        vim.list_extend(lines, vim.split(tostring(l), "\n", { plain = true }))
       end
-      ft = vim.filetype.match({ filename = pv.path })
+    elseif pv.path then
+      local content
+      lines, content = read_preview(pv.path)
+      ft = content and vim.filetype.match({ filename = pv.path }) or nil
       vim.b[buf].slop_secret_path = pv.path
     end
     ft = pv.filetype or ft
@@ -380,7 +409,8 @@ local function layout(has_preview)
   return {
     prompt = { row = row, col = col, width = lw, height = 1 },
     list = { row = row + 3, col = col, width = lw, height = math.max(1, H - 3) },
-    preview = show_preview and { row = row, col = col + lw + 2, width = W - lw - 2, height = H + 1 } or nil,
+    -- outer height H + 2 = prompt (1 + 2) + list (H - 3 + 2): both columns end on the same row
+    preview = show_preview and { row = row, col = col + lw + 2, width = W - lw - 2, height = H } or nil,
   }
 end
 
@@ -409,7 +439,6 @@ local function pick_builtin(items, opts)
   }
   local L = layout(opts.preview ~= nil)
   local handles = {}
-  local prefix = opts.multi and 2 or 0
 
   local function close_all()
     state.closing = true
@@ -443,48 +472,66 @@ local function pick_builtin(items, opts)
     end
   end
 
-  if L.preview then
-    handles.preview = float.open({
-      buf = preview_buf,
+  -- never leave half-built floats behind (invalid action keys, a throwing producer or format(), ...): close what
+  -- exists, wipe the buffers and let the caller see the error
+  local function guard(fn)
+    local ok, err = pcall(fn)
+    if ok then
+      return
+    end
+    close_all()
+    for _, b in ipairs({ list_buf, prompt_buf, preview_buf }) do
+      if api.nvim_buf_is_valid(b) then
+        pcall(api.nvim_buf_delete, b, { force = true })
+      end
+    end
+    error(err, 0)
+  end
+
+  guard(function()
+    if L.preview then
+      handles.preview = float.open({
+        buf = preview_buf,
+        enter = false,
+        focusable = false,
+        row = L.preview.row,
+        col = L.preview.col,
+        width = const(L.preview.width),
+        height = const(L.preview.height),
+        title = "Preview",
+        zindex = 60,
+        responsive = false,
+        wo = { wrap = false, number = true, cursorline = true },
+        on_close = on_close,
+      })
+    end
+    handles.list = float.open({
+      buf = list_buf,
       enter = false,
       focusable = false,
-      row = L.preview.row,
-      col = L.preview.col,
-      width = const(L.preview.width),
-      height = const(L.preview.height),
-      title = "Preview",
+      row = L.list.row,
+      col = L.list.col,
+      width = const(L.list.width),
+      height = const(L.list.height),
       zindex = 60,
       responsive = false,
-      wo = { wrap = false, number = true, cursorline = true },
+      wo = { wrap = false, cursorline = false },
       on_close = on_close,
     })
-  end
-  handles.list = float.open({
-    buf = list_buf,
-    enter = false,
-    focusable = false,
-    row = L.list.row,
-    col = L.list.col,
-    width = const(L.list.width),
-    height = const(L.list.height),
-    zindex = 60,
-    responsive = false,
-    wo = { wrap = false, cursorline = false },
-    on_close = on_close,
-  })
-  handles.prompt = float.open({
-    buf = prompt_buf,
-    enter = true,
-    row = L.prompt.row,
-    col = L.prompt.col,
-    width = const(L.prompt.width),
-    height = const(1),
-    title = opts.title or opts.prompt or "Pick",
-    title_pos = "left",
-    zindex = 61,
-    responsive = false,
-    on_close = on_close,
-  })
+    handles.prompt = float.open({
+      buf = prompt_buf,
+      enter = true,
+      row = L.prompt.row,
+      col = L.prompt.col,
+      width = const(L.prompt.width),
+      height = const(1),
+      title = opts.title or opts.prompt or "Pick",
+      title_pos = "left",
+      zindex = 61,
+      responsive = false,
+      on_close = on_close,
+    })
+  end)
 
   local function current()
     return state.matches[state.sel]
@@ -534,6 +581,7 @@ local function pick_builtin(items, opts)
       api.nvim_buf_set_extmark(list_buf, ns, 0, 0, { end_col = #lines[1], hl_group = "SlopDim" })
     else
       for i, m in ipairs(state.matches) do
+        local prefix = opts.multi and #(state.marks[m.index] and "● " or "  ") or 0
         local _, hls = flatten(formatted(m.item, opts))
         for _, h in ipairs(hls) do
           pcall(api.nvim_buf_set_extmark, list_buf, ns, i - 1, h[1] + prefix, {
@@ -670,48 +718,51 @@ local function pick_builtin(items, opts)
       "picker " .. name,
     }
   end
-  for _, m in ipairs(maps) do
-    for _, lhs in ipairs(m[1]) do
-      km.set_buf(prompt_buf, { "i", "n" }, lhs, m[2], { desc = m[3], nowait = true })
+  guard(function()
+    for _, m in ipairs(maps) do
+      for _, lhs in ipairs(m[1]) do
+        km.set_buf(prompt_buf, { "i", "n" }, lhs, m[2], { desc = m[3], nowait = true })
+      end
     end
-  end
-  km.set_buf(prompt_buf, "n", "q", cancel, { desc = "picker cancel", nowait = true })
+    km.set_buf(prompt_buf, "n", "q", cancel, { desc = "picker cancel", nowait = true })
 
-  api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
-    buffer = prompt_buf,
-    desc = "slop: picker filter",
-    callback = refresh,
-  })
-  api.nvim_create_autocmd("WinLeave", {
-    buffer = prompt_buf,
-    desc = "slop: picker close on leave",
-    callback = function()
-      vim.schedule(function()
-        if not state.closing and handles.prompt:is_valid() and api.nvim_get_current_win() ~= handles.prompt.win then
-          cancel()
-        end
+    api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
+      buf = prompt_buf,
+      desc = "slop: picker filter",
+      callback = refresh,
+    })
+    api.nvim_create_autocmd("WinLeave", {
+      buf = prompt_buf,
+      desc = "slop: picker close on leave",
+      callback = function()
+        vim.schedule(function()
+          if not state.closing and handles.prompt:is_valid() and api.nvim_get_current_win() ~= handles.prompt.win then
+            cancel()
+          end
+        end)
+      end,
+    })
+
+    if opts.initial and opts.initial ~= "" then
+      api.nvim_buf_set_lines(prompt_buf, 0, -1, false, { (opts.initial:gsub("\n", " ")) })
+    end
+    refresh()
+
+    if state.loading then
+      items(function(list)
+        vim.schedule(function()
+          if state.closing then
+            return
+          end
+          state.items = list or {}
+          state.loading = false
+          refresh()
+        end)
       end)
-    end,
-  })
-
-  if opts.initial and opts.initial ~= "" then
-    api.nvim_buf_set_lines(prompt_buf, 0, -1, false, { opts.initial })
-  end
-  refresh()
-  vim.cmd("startinsert!")
-
-  if state.loading then
-    items(function(list)
-      vim.schedule(function()
-        if state.closing then
-          return
-        end
-        state.items = list or {}
-        state.loading = false
-        refresh()
-      end)
-    end)
-  end
+    end
+    -- last: a failure above must not leave a pending Insert mode behind
+    vim.cmd("startinsert!")
+  end)
 
   ---@type slop.picker.Handle
   local handle = {
