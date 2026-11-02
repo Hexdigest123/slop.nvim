@@ -339,6 +339,191 @@ describe("context render", function()
     assert.is_true(ok, err)
   end)
 
+  it("a closed fold between the topline and the cursor: the context never covers the cursor line", function()
+    open(LUA, "lua")
+    vim.wo.foldmethod = "manual"
+    vim.cmd("7,28fold") -- closed: lines 7-28 take one screen row
+    view(6, 29, 4) -- screen rows: 6, the fold, 29 (cursor)
+    assert.are.same({ "  if a then" }, float_lines(), "two rows above the cursor: the outer scope is trimmed")
+    assert.equal(" 29     print(24)", screen_row(3))
+  end)
+
+  it("'smoothscroll': only the visible rows of a partly scrolled-off topline count", function()
+    local lines = { "function M.f(a,", "  b,", "  c)", "  local s = '" .. ("x"):rep(300) .. "'" }
+    for i = 1, 30 do
+      lines[#lines + 1] = "  print(" .. i .. ")"
+    end
+    lines[#lines + 1] = "end"
+    open(lines, "lua")
+    vim.wo.wrap = true
+    vim.wo.smoothscroll = true
+    vim.fn.winrestview({ topline = 4, lnum = 5, col = 2, leftcol = 0 })
+    vim.cmd("normal! 4\5") -- scroll 4 screen rows into line 4 (5 rows): one of its rows stays, the cursor is below
+    ctx.refresh()
+    redraw()
+    local ok, err = pcall(function()
+      assert.equal(4, vim.fn.line("w0"))
+      assert.truthy(vim.fn.winsaveview().skipcol > 0, "smooth-scrolled")
+      assert.equal(2, vim.fn.screenpos(0, 5, 3).row, "cursor line on the second screen row")
+      assert.are.same({ "function M.f(a," }, float_lines(), "one row: the 3-row signature is cut")
+    end)
+    vim.wo.smoothscroll = false
+    assert.is_true(ok, err)
+  end)
+
+  it("topline mode: the first line below the float is a screen row (a closed fold is one)", function()
+    local lines = { "local M = {}", "", "function M.outer(a,", "  b)", "  local x = 1", "  local y = 2", "  if a then" }
+    for i = 1, 12 do
+      lines[#lines + 1] = "    print(" .. i .. ")"
+    end
+    lines[#lines + 1] = "  end" -- 20
+    for i = 1, 20 do
+      lines[#lines + 1] = "  local z" .. i .. " = " .. i
+    end
+    vim.list_extend(lines, { "end", "return M" })
+    open(lines, "lua", { mode = "topline" })
+    vim.wo.foldmethod = "manual"
+    vim.cmd("7,20fold") -- the `if` block
+    view(6, 30)
+    -- screen rows 6, the fold, 21: below a 2-row float comes line 21, outside the folded `if`
+    assert.are.same({ { row = 2, col = 0, rows = 2 } }, ctx.contexts())
+  end)
+
+  it("never shows a line that is visible below it: not the cursor row's scope, nor one kept by trimmed rows", function()
+    local lines = { "local function f()" }
+    for i = 1, 18 do
+      lines[#lines + 1] = "  local v" .. i .. " = " .. i
+    end
+    vim.list_extend(lines, {
+      "  for i = 1, 10 do", -- 20
+      "    if i > 2 then", -- 21
+      "      if i > 5 then", -- 22
+      "        print(i)",
+      "      end",
+      "    end",
+      "  end",
+      "end",
+    })
+    for i = 1, 20 do
+      lines[#lines + 1] = "-- tail " .. i
+    end
+    open(lines, "lua")
+    -- cursor on 22, two rows below the topline: the `for` on the topline is covered (shown), the cursor's own `if` not
+    view(20, 22, 6)
+    assert.are.same({ "  for i = 1, 10 do", "    if i > 2 then" }, float_lines())
+    assert.equal(" 22       if i > 5 then", screen_row(3))
+
+    lines = { "local function f(a,", "  b,", "  c)" }
+    for i = 1, 16 do
+      lines[#lines + 1] = "  local v" .. i .. " = " .. i
+    end
+    vim.list_extend(lines, {
+      "  for i = 1, 10 do", -- 20
+      "    local w = i", -- 21
+      "    if i > 2 then", -- 22
+      "      print(1)",
+      "      print(2)",
+      "      print(3)",
+      "      print(i)", -- 26
+      "    end",
+      "  end",
+      "end",
+    })
+    for i = 1, 20 do
+      lines[#lines + 1] = "-- tail " .. i
+    end
+    vim.cmd("silent! %bwipe!")
+    open(lines, "lua")
+    -- the 3-row signature (trimmed: max_lines 3) made the `if` on 22 count as hidden; without it 22 is visible
+    view(20, 26, 6)
+    assert.are.same({ "  for i = 1, 10 do" }, float_lines())
+    assert.equal(" 22     if i > 2 then", screen_row(3))
+  end)
+
+  it("keeps the injected trees the highlighter parsed (a partial parse dropped them after every edit)", function()
+    local lines = { "local M = {}", "function M.setup()" }
+    for i = 1, 8 do
+      lines[#lines + 1] = ('  vim.cmd("highlight G%d guifg=#%06x")'):format(i, i)
+      lines[#lines + 1] = ("  local y%d = %d"):format(i, i)
+    end
+    vim.list_extend(lines, { "end", "return M" })
+    local buf = open(lines, "lua")
+    local parser = vim.treesitter.get_parser(buf)
+    local function injected()
+      local child = parser:children().vim
+      local regions, trees = 0, 0
+      for _ in pairs(child and child:included_regions() or {}) do
+        regions = regions + 1
+      end
+      for _ in pairs(child and child:trees() or {}) do
+        trees = trees + 1
+      end
+      return { regions, trees }
+    end
+    vim.fn.winrestview({ topline = 1, lnum = 12, col = 2 })
+    -- what the highlighter parses on every redraw (highlighter.lua _on_start): the window's w0-1 .. w$+1
+    parser:parse({ { vim.fn.line("w0") - 1, vim.fn.line("w$") + 1 } })
+    assert.are.same({ 8, 8 }, injected())
+    -- type on a row without an injection; TextChanged(I) runs the context update before the redraw
+    local line = api.nvim_buf_get_lines(buf, 11, 12, false)[1]
+    api.nvim_buf_set_text(buf, 11, #line, 11, #line, { "0" })
+    ctx.refresh()
+    assert.are.same({ 8, 8 }, injected(), "the injected vim trees survive")
+  end)
+
+  it("diagnostics that change without a text change reach the header", function()
+    local buf = open(LUA, "lua")
+    view(15, 25, 4)
+    local function diag_rows()
+      local rows = {}
+      for _, m in ipairs(api.nvim_buf_get_extmarks(wstate().buf, -1, 0, -1, { details = true })) do
+        if tostring(m[4].hl_group):match("^DiagnosticUnderline") then
+          rows[#rows + 1] = m[2]
+        end
+      end
+      return rows
+    end
+    assert.are.same({}, diag_rows())
+    local dns = api.nvim_create_namespace("context-spec-diag")
+    vim.diagnostic.set(dns, buf, {
+      { lnum = 2, col = 9, end_col = 14, severity = vim.diagnostic.severity.ERROR, message = "bad" },
+    })
+    assert.truthy(vim.wait(1000, function()
+      return #diag_rows() > 0
+    end, 10))
+    assert.are.same({ 0 }, diag_rows(), "source line 3 is the first header row")
+    vim.diagnostic.reset(dns, buf)
+    assert.truthy(
+      vim.wait(1000, function()
+        return #diag_rows() == 0
+      end, 10),
+      "and gone again"
+    )
+  end)
+
+  it("statuscolumn gutter keeps stacked highlight groups (a sign's texthl over SignColumn)", function()
+    local buf = open(LUA, "lua")
+    vim.fn.sign_define("SlopContextSpec", { text = "E>", texthl = "ErrorMsg" })
+    vim.fn.sign_place(1, "", "SlopContextSpec", buf, { lnum = 3 })
+    vim.wo.signcolumn = "yes:1"
+    vim.wo.statuscolumn = "%s%l "
+    view(15, 25, 4)
+    local gbuf = wstate().gbuf
+    local seen, set_extmark = {}, api.nvim_buf_set_extmark
+    api.nvim_buf_set_extmark = function(b, n, row, col, o)
+      if b == gbuf and row == 0 and col == 0 then
+        seen[#seen + 1] = o.hl_group
+      end
+      return set_extmark(b, n, row, col, o)
+    end
+    local ok, err = pcall(view, 15, 25, 4)
+    api.nvim_buf_set_extmark = set_extmark
+    vim.wo.statuscolumn = ""
+    assert.is_true(ok, err)
+    assert.are.same({ { "SignColumn", "ErrorMsg" } }, seen)
+    assert.matches("^E>%s*3%s*$", gutter_lines()[1])
+  end)
+
   it("go_to_context climbs scopes (count = depth), with a jumplist entry", function()
     open(LUA, "lua")
     vim.fn.winrestview({ topline = 40, lnum = 45, col = 6 })

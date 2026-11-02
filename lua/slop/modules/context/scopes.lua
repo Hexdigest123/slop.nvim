@@ -326,7 +326,7 @@ end
 
 --- The buffer's parser, parsed (main tree + injections around `rows`). nil without a parser.
 ---@param buf integer
----@param rows? {[1]: integer, [2]: integer}
+---@param rows? {[1]: integer, [2]: integer}|{[1]: integer, [2]: integer}[]  a row range or a sorted list of them
 ---@return vim.treesitter.LanguageTree?
 function M.parser(buf, rows)
   local ok, parser = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
@@ -339,6 +339,31 @@ function M.parser(buf, rows)
   return parser
 end
 
+--- The rows to parse for `row`: what the buffer's treesitter highlighter parses on every redraw (w0-1 .. w$+1 of
+--- each window of the tabpage showing `buf`, highlighter.lua `_on_start`), plus `row` if none of them shows it.
+--- A partial LanguageTree:parse() drops the injected regions outside its range (0.12, see included_regions()): any
+--- other range made the highlighter re-create and re-parse every injected tree in view after each edit.
+---@param buf integer
+---@param row integer
+---@return {[1]: integer, [2]: integer}[]
+local function parse_ranges(buf, row)
+  local ranges, shown = {}, false
+  for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_buf(w) == buf then
+      local first, last = vim.fn.line("w0", w) - 1, vim.fn.line("w$", w) + 1
+      ranges[#ranges + 1] = { first, last }
+      shown = shown or (row >= first and row <= last)
+    end
+  end
+  if not shown then
+    ranges[#ranges + 1] = { row, row + 1 }
+  end
+  table.sort(ranges, function(a, b)
+    return a[1] < b[1]
+  end)
+  return ranges
+end
+
 --- Every context node enclosing (row, col), in all language trees, outermost first, one per start row (the outermost
 --- of a row wins; its header covers the longest header of that row). Multi-line nodes only.
 ---@param buf integer
@@ -347,7 +372,7 @@ end
 ---@param user? table<string, string[]>
 ---@return slop.context.Candidate[]? nil without a parser
 function M.candidates(buf, row, col, user)
-  local parser = M.parser(buf, { row, row + 1 })
+  local parser = M.parser(buf, parse_ranges(buf, row))
   if not parser then
     return nil
   end
@@ -394,19 +419,26 @@ end
 ---@param top integer  0-based topline
 ---@param limit integer  rows the context may cover (the pos row is never covered)
 ---@param cfg table  context config
+---@param pos? fun(row: integer): integer  screen rows from the topline to `row`, negative above it (default
+---  `row - top`; folds and wrapped lines make them differ)
 ---@return slop.context.Group[], integer height
-function M.pick(cands, top, limit, cfg)
-  local groups, h = {}, 0 ---@type slop.context.Group[], integer
-  for _, c in ipairs(cands) do
-    if c.row < top + h then
-      local n = math.min(c.last - c.row + 1, cfg.multiline_threshold)
-      groups[#groups + 1] = { row = c.row, col = c.col, rows = n }
-      h = h + n
-    end
+function M.pick(cands, top, limit, cfg, pos)
+  pos = pos or function(row)
+    return row - top
   end
   local max = cfg.max_lines > 0 and math.min(cfg.max_lines, limit) or limit
   if max <= 0 then
     return {}, 0
+  end
+  local groups, h = {}, 0 ---@type slop.context.Group[], integer
+  for _, c in ipairs(cands) do
+    -- a start at or below screen row `max` (e.g. on the cursor row) is never covered: it would only push others out
+    local p = pos(c.row)
+    if p < h and p < max then
+      local n = math.min(c.last - c.row + 1, cfg.multiline_threshold)
+      groups[#groups + 1] = { row = c.row, col = c.col, rows = n }
+      h = h + n
+    end
   end
   while h > max and #groups > 1 do
     local g = table.remove(groups, cfg.trim_scope == "inner" and #groups or 1)
@@ -416,7 +448,16 @@ function M.pick(cands, top, limit, cfg)
     groups[1].rows = max
     h = max
   end
-  return groups, h
+  -- trimming removed rows that hid later starts: drop the groups whose start row is now visible below the float,
+  -- else that line shows twice (one drawn exactly over its own row is harmless)
+  local kept, kh = {}, 0 ---@type slop.context.Group[], integer
+  for _, g in ipairs(groups) do
+    if pos(g.row) <= kh then
+      kept[#kept + 1] = g
+      kh = kh + g.rows
+    end
+  end
+  return kept, kh
 end
 
 ---@param buf integer
@@ -437,9 +478,27 @@ function M.compute(win, cfg, limit)
   local top = vim.fn.line("w0", win) - 1
   local cursor = api.nvim_win_get_cursor(win)
   local crow, ccol = cursor[1] - 1, cursor[2]
+  -- the float covers screen rows, not buffer rows: a closed fold is one row, a wrapped line several, and with
+  -- 'smoothscroll' the topline may be partly scrolled off (skipcol)
+  local skip = api.nvim_win_call(win, function()
+    return vim.fn.winsaveview().skipcol
+  end)
+  local function height(opts)
+    opts.start_row = top
+    opts.start_vcol = skip > 0 and skip or nil
+    return api.nvim_win_text_height(win, opts)
+  end
+  ---@param row integer
+  ---@return integer  screen rows from the topline to `row`, negative above the window
+  local function pos(row)
+    if row <= top then
+      return row - top
+    end
+    return height({ end_row = row - 1 }).all
+  end
   -- never cover the cursor line
   if crow >= top then
-    limit = math.min(limit, crow - top)
+    limit = math.min(limit, pos(crow))
   end
   if limit <= 0 then
     return require("slop.core.ts").has_parser(buf) and {} or nil, 0
@@ -455,12 +514,12 @@ function M.compute(win, cfg, limit)
         c.last = math.min(c.last, crow - 1)
       end
     end
-    return M.pick(cands, top, limit, cfg)
+    return M.pick(cands, top, limit, cfg, pos)
   end
   -- topline: the context of the first row below the float; re-evaluated until the height is stable
   local h, groups = 0, {}
   for _ = 1, 4 do
-    local row = math.min(top + h, api.nvim_buf_line_count(buf) - 1)
+    local row = height({ max_height = h + 1 }).end_row -- the buffer row on screen row h
     local cands = M.candidates(buf, row, indent_col(buf, row), cfg.node_types)
     if not cands then
       return nil, 0
@@ -471,7 +530,7 @@ function M.compute(win, cfg, limit)
       end
     end
     local nh
-    groups, nh = M.pick(cands, top, limit, cfg)
+    groups, nh = M.pick(cands, top, limit, cfg, pos)
     if nh == h then
       break
     end

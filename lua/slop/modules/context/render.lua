@@ -284,7 +284,7 @@ end
 ---@param lnum integer
 ---@param cursor integer cursor lnum
 ---@param width integer
----@return string text, {[1]: integer, [2]: integer, [3]: string}[] hls  {col, end_col, group}
+---@return string text, {[1]: integer, [2]: integer, [3]: string|string[]}[] hls  {col, end_col, group(s)}
 local function gutter_line(win, lnum, cursor, width)
   local wo = vim.wo[win]
   local stc = wo.statuscolumn
@@ -300,8 +300,11 @@ local function gutter_line(win, lnum, cursor, width)
       local hls = {}
       for i, h in ipairs(res.highlights or {}) do
         local e = res.highlights[i + 1] and res.highlights[i + 1].start or #res.str
-        if e > h.start and h.group and h.group ~= "" then
-          hls[#hls + 1] = { h.start, e, h.group }
+        -- `groups` (stacked, highest priority last; an extmark hl_group takes the list): the deprecated `group`
+        -- is only the last one, e.g. a sign's texthl without its SignColumn background
+        local hl = (type(h.groups) == "table" and #h.groups > 0) and h.groups or h.group
+        if e > h.start and hl and hl ~= "" then
+          hls[#hls + 1] = { h.start, e, hl }
         end
       end
       return text, hls
@@ -617,8 +620,11 @@ function M.start(cfg)
       M.update(nil, true)
     end
   end, 100)
-  au("LspTokenUpdate", function()
-    S.tokens()
+  -- highlight extmarks of the source rows that change without a text change (the redraw key would skip them)
+  au({ "LspTokenUpdate", "DiagnosticChanged" }, function(ev)
+    if ev.buf == api.nvim_get_current_buf() then
+      S.tokens()
+    end
   end)
   vim.schedule(function()
     if S.cfg then

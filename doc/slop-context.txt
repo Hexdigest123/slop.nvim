@@ -105,7 +105,8 @@ Which scopes. A scope shows when its first row is above the window's first
 line, or hidden under the context rows shown above it. In "cursor" mode
 these are the scopes around the cursor. In "topline" mode they are the
 scopes around the first line below the context. The context never covers
-the cursor line, and at least one line of the window stays visible.
+the cursor line, and at least one line of the window stays visible. Rows
+are screen rows: a closed fold counts as one, a wrapped line as several.
 
 Trimming. With more than `max_lines` rows, whole scopes are dropped:
 outermost first with `trim_scope = "outer"`, innermost first with "inner".
@@ -127,9 +128,10 @@ longer than the window are cut at the edge.
 
 Highlights are copied, never recomputed: the treesitter captures of the
 buffer's active highlighter (|vim.treesitter.start()|; nvim-treesitter's
-`highlight` module does this) and every highlight extmark of the source rows
-(LSP semantic tokens, diagnostics, other plugins), keeping their priority
-order.
+`highlight` module does this) and every highlight extmark stored in the
+source rows (LSP semantic tokens, diagnostics, other plugins), keeping their
+priority order. Highlights a decoration provider only draws during a redraw
+are not copied (see |slop-context-limitations|).
 
 The float buffer carries the source file's path (`vim.b.slop_secret_path`),
 so |slop-cloak| masks secrets in it like in the file.
@@ -137,9 +139,11 @@ so |slop-cloak| masks secrets in it like in the file.
 Updates follow CursorMoved(I), WinScrolled, WinResized, BufEnter, WinEnter,
 TextChanged(I), FileType and gutter-related OptionSet. They run at once, then
 at most every 30 ms while you scroll; the last position is always drawn. A
-context that did not change is not redrawn. The context closes on WinLeave
-and is never shown in floating windows, special buffers ('buftype' not
-empty), buffers without a parser, or windows lower than `min_window_height`.
+context that did not change is not redrawn; new semantic tokens and
+diagnostics of the current buffer (|LspTokenUpdate|, |DiagnosticChanged|)
+redraw it 100 ms later. The context closes on WinLeave and is never shown in
+floating windows, special buffers ('buftype' not empty), buffers without a
+parser, or windows lower than `min_window_height`.
 
 ==============================================================================
 7. LUA API                                                  *slop-context-api*
@@ -187,5 +191,9 @@ Defaults differ: slop starts with `mode = "cursor"` and `max_lines = 3`.
   the context may be partly covered.
 - Semantic tokens of rows that were never drawn are not known yet; the
   float picks them up on the next LspTokenUpdate.
+- Highlights that a decoration provider draws only while the window is
+  redrawn (ephemeral extmarks, e.g. the keywords of |slop-todo.txt| or some
+  color-preview plugins) are not copied: that text shows with its treesitter
+  and extmark colors only.
 
  vim:tw=78:ts=8:ft=help:norl:
