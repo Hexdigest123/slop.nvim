@@ -6,7 +6,8 @@
       "package-name": "slop.nvim",
       "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
-      "include-v-in-tag": true
+      "include-v-in-tag": true,
+      "extra-files": ["lua/slop/init.lua"]
     }
   }
 }
