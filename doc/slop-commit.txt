@@ -18,16 +18,24 @@ CONTENTS                                                *slop-commit-contents*
 ==============================================================================
 1. INTRODUCTION                                            *slop-commit-intro*
 
-When a `gitcommit` buffer opens with an empty message, the `commit` module
-asks an AI chat provider (default `mistral_chat`) for a commit message and
-shows it as ghost text on line 1. Press `<C-y>` (the completion accept key) to
-insert it, `<C-e>` to dismiss it, `<C-n>`/`<C-p>` to cycle variants and
-`<leader>ac` to regenerate.
+When a commit message buffer (`COMMIT_EDITMSG`) opens with an empty message,
+the `commit` module asks an AI chat provider (default `mistral_chat`) for a
+commit message and shows it as ghost text on line 1. Press `<C-y>` (the
+completion accept key) to insert it, `<C-e>` to dismiss it, `<C-n>`/`<C-p>` to
+cycle variants and `<leader>ac` to regenerate.
 
-It works with plain `git commit` (`EDITOR=nvim` / `core.editor = nvim`) and
-with vim-fugitive (`:Git commit`, `cc` in the status window). The module is
-loaded lazily on the first `gitcommit` buffer. It does not need the `complete`
-module.
+Tag annotations (`TAG_EDITMSG`), notes (`NOTES_EDITMSG`) and branch
+descriptions (`EDIT_DESCRIPTION`) have the `gitcommit` filetype too. They are
+not commit messages and the staged diff has nothing to do with them, so slop
+never sends anything for them (`:Slop commit` refuses). Other `gitcommit`
+buffers, such as `MERGE_MSG` or a new buffer set to `gitcommit`, get a
+message only on request (`<leader>ac`, `:Slop commit`).
+
+It works with plain `git commit` (`EDITOR=nvim` / `core.editor = nvim`), with
+`git --git-dir=… --work-tree=… commit` (bare dotfiles repositories, yadm,
+vcsh) and with vim-fugitive (`:Git commit`, `cc` in the status window). The
+module is loaded lazily on the first `gitcommit` buffer. It does not need the
+`complete` module.
 
 Recommended: >sh
     git config --global commit.verbose true
@@ -41,20 +49,29 @@ below the scissors line, so slop sees exactly that diff, whatever you ran
 
 1. On |FileType| `gitcommit` the buffer is attached. The message area
    counts as empty when it holds only comment lines and blank lines. The
-   scissors section is ignored. If `auto` is set and the message is empty, a
-   message is generated. Buffers that already have a message are left
-   alone; use `<leader>ac` there. Examples are `--amend`, merge, reword and
-   squash.
+   comment character is git's: the scissors line's, else `core.commentChar`
+   or `core.commentString` (`auto` included); nothing is decided before git
+   answered. The scissors section is ignored. If `auto` is set and the
+   message of `COMMIT_EDITMSG` is empty, a message is generated. Buffers that
+   already have a message are left alone; use `<leader>ac` there. Examples
+   are `--amend`, merge, reword and squash.
 2. The context is gathered in parallel, without blocking:
    - the diff:
      - the verbose section below the scissors line, if there is one;
      - else `git diff --cached`, which honours a `GIT_INDEX_FILE` exported
-       by `git commit -a` or `git commit <paths>`;
-     - else, when nothing is staged, unstaged tracked changes
-       (`unstaged_fallback`).
+       by `git commit -a` or `git commit <paths>`. An editor that did not
+       inherit it (nvr, flatten.nvim, `--remote-wait`, fugitive's
+       `:Git commit -a`) reads the in-progress `index.lock` /
+       `next-index-*.lock` instead;
+     - else, when nothing is staged and Neovim is not git's own editor,
+       unstaged tracked changes (`unstaged_fallback`). Inside `git commit`
+       the index git exports is exactly what gets committed, so an empty
+       commit (`--allow-empty`) is not described with changes it does not
+       contain.
    - the branch name,
    - the last `recent` subjects of your own commits (`user.email`) and of the
-     repository, used to match the style,
+     repository, used to match the style (the signature lines of signed
+     commits are not part of them),
    - `<root>/.nvim/commit.md` (|slop-commit-conventions|) and `instructions`.
 3. Amend is detected from:
    - the verbose diff (already exact),
@@ -75,7 +92,9 @@ below the scissors line, so slop sees exactly that diff, whatever you ran
    - the body is wrapped at 'textwidth' (default 72) when `wrap` is set.
 6. If you type a message while a request is running, the request is cancelled
    and its result discarded. Accepting inserts the text above git's comment
-   block as one undo step.
+   block as one undo step. If a request fails (e.g. a timeout while
+   streaming), its partial text is removed; the previous variant, if any, is
+   shown again.
 
 ==============================================================================
 3. KEYMAPS                                               *slop-commit-keymaps*
@@ -84,7 +103,8 @@ All keys are buffer-local in `gitcommit` buffers. Set any of them to `false`
 under `commit.keymaps` to disable it. The defaults are the same as the
 `complete` module's keys. These keys only act on a commit suggestion; with no
 suggestion visible they fall through to the previous mapping or the native
-key (for example scrolling, or insert-mode completion).
+key (for example scrolling, or insert-mode completion). While the popup menu
+is shown they always belong to it.
 
   Mode  Key           Name        Action ~
   n,i   `<C-y>`         accept      insert the suggestion (one undo step)
@@ -93,22 +113,27 @@ key (for example scrolling, or insert-mode completion).
   n,i   `<C-p>`         prev        previous variant (wraps)
   n     `<leader>ac`    regenerate  new variant; replaces a typed message
 
-Regenerating raises the temperature on each attempt, as VS Code does:
+Replacing a message drops only the message lines: git's comment block and the
+scissors section stay. Regenerating raises the temperature on each attempt,
+as VS Code does:
 `min(temperature * (1 + attempt), max_temperature)`. Variants are kept for
 the buffer and the ghost text shows `(i/n)`.
 
-To use other keys, set them in the config (they are buffer-local, so there
-are no `<Plug>` mappings), or map the Lua API (|slop-commit-api|) yourself in
-an `ftplugin/gitcommit.lua`.
+To use other keys, set them in the config, map the `<Plug>` mappings
+(`<Plug>(slop-commit-regenerate)`, and `<Plug>(slop-commit-accept)`,
+`-dismiss`, `-next`, `-prev`, which do nothing when there is no suggestion),
+or map the Lua API (|slop-commit-api|) yourself in an
+`ftplugin/gitcommit.lua`.
 
 ==============================================================================
 4. COMMANDS                                             *slop-commit-commands*
 
 :Slop commit [generate]                                *:Slop-commit-generate*
 :Slop commit! [generate]
-        Generate a message for the current gitcommit buffer. Without `!`,
-        an existing message is kept. With `!`, it is replaced (one undo
-        step).
+        Generate a message for the current gitcommit buffer (not for tag,
+        notes or branch-description buffers). Without `!`, an existing
+        message is kept. With `!`, it is replaced (one undo step; comment
+        lines and the scissors section stay).
 
 :Slop commit regenerate                              *:Slop-commit-regenerate*
         Same as `<leader>ac`.
@@ -128,7 +153,7 @@ Defaults: >lua
         enabled = true,
         provider = "mistral_chat",  -- a `chat` provider from ai.providers
         style = "auto",             -- "auto" | "conventional" | "plain"
-        auto = true,                -- generate when the message is empty
+        auto = true,                -- generate when COMMIT_EDITMSG is empty
         stream = true,
         recent = 5,                 -- recent subjects (yours + repo's)
         branch = true,              -- send the branch name
@@ -138,7 +163,8 @@ Defaults: >lua
         summarize = { "*.lock", "package-lock.json", "npm-shrinkwrap.json",
                       "pnpm-lock.yaml", "yarn.lock", "go.sum",
                       "*.min.js", "*.min.css", "*.map" },
-        unstaged_fallback = true,   -- nothing staged: use tracked changes
+        unstaged_fallback = true,   -- nothing staged: tracked changes
+                                    -- (never inside `git commit`)
         temperature = 0.3,
         max_temperature = 1.0,
         max_tokens = 512,
@@ -189,7 +215,9 @@ Everything sent to the provider goes through |slop-secrets| first:
   private-key blocks inside a hunk;
 - diff sections whose file path cannot be parsed (quoted names,
   `diff.noprefix`) are dropped;
-- the branch, the recent subjects and `commit.md` are redacted too.
+- the branch, the recent subjects and `commit.md` are redacted too; the
+  signature lines of signed commits (`log.showSignature`) are never part of
+  the recent subjects (`git log --no-show-signature`).
 Nothing else is read: only the diff is sent, never whole files.
 
 ==============================================================================
@@ -232,13 +260,16 @@ Events (|User| autocmds, see |slop-events|):
 `require("slop.core.git")` is the shared git layer, also used by other
 modules. All process calls go through |vim.system()| and call back on the
 main loop. The environment is inherited, so `GIT_INDEX_FILE` from
-`git commit` applies, and `GIT_OPTIONAL_LOCKS=0` is set so slop never
-competes with git for the index lock.
+`git commit` applies (as do the `GIT_DIR` / `GIT_WORK_TREE` of
+`git --git-dir=… --work-tree=… commit`), and `GIT_OPTIONAL_LOCKS=0` is set so
+slop never competes with git for the index lock.
 
   git.run(args, {cwd?, env?, stdin?, timeout?}, cb(res))
   git.root(path|buf?)  git.git_dir(path|buf?)        sync, no process spawned
   git.staged_diff({cwd?, amend?, worktree?, env?, context?, paths?},
                   cb(diff?, err?))
+  git.commit_index(cwd?) -> the index lock of a `git commit` in progress that
+                  this Neovim did not inherit as `GIT_INDEX_FILE`, else nil
   git.branch({cwd?}, cb(name?))
   git.log({cwd?, n?, author?}, cb(subjects?))
   git.config_get(key, {cwd?}, cb(value?))   git.head_message({cwd?}, cb(msg?))

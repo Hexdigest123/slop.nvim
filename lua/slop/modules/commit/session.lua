@@ -5,12 +5,15 @@ local api = vim.api
 
 ---@class slop.commit.State
 ---@field buf integer
+---@field kind "commit"|"unknown"      COMMIT_EDITMSG, or another gitcommit buffer (MERGE_MSG...: no auto)
 ---@field status "idle"|"gathering"|"streaming"|"done"|"accepted"|"partial"|"dismissed"|"stale"|"error"
 ---@field seq integer                  request generation (bumped on every request / cancel)
 ---@field variants string[][]
 ---@field index integer                variant shown (0 = none)
 ---@field attempt integer              requests made so far (temperature ramp)
 ---@field initial string[]             message when the buffer was attached (amend heuristic)
+---@field cc? string                   comment character (nil until resolved, see with_comment_char)
+---@field cc_waiting? fun()[]          run once `cc` is known
 ---@field handle? slop.http.Handle
 ---@field ctx? table                   gathered + redacted context, reused by regenerate
 ---@field error? string
@@ -50,6 +53,92 @@ end
 
 local function parse(buf, cc)
   return git().parse_commit_buffer(api.nvim_buf_get_lines(buf, 0, -1, false), { comment_char = cc })
+end
+
+-- gitcommit buffers that never hold a commit message: a tag annotation, notes, a branch description. The staged
+-- diff has nothing to do with them.
+local NOT_COMMIT = { TAG_EDITMSG = true, NOTES_EDITMSG = true, EDIT_DESCRIPTION = true }
+
+---@param buf integer
+---@return "commit"|"other"|"unknown"
+local function message_kind(buf)
+  local name = vim.fs.basename(api.nvim_buf_get_name(buf))
+  if name == "COMMIT_EDITMSG" then
+    return "commit"
+  end
+  return NOT_COMMIT[name] and "other" or "unknown"
+end
+
+-- core.commentChar = auto: git takes the first of these that starts no line of the message
+local AUTO_CANDIDATES = "#;@!$%^&|:"
+
+--- The comment character git picked for `auto`: the first one of the comment block it appends after the message,
+--- else (no comment block, e.g. --no-status) the first candidate that starts no line.
+---@param lines string[]
+---@return string
+local function auto_comment_char(lines)
+  for i = #lines, 1, -1 do
+    if lines[i]:find("%S") then
+      local c = lines[i]:sub(1, 1)
+      if AUTO_CANDIDATES:find(c, 1, true) then
+        return c
+      end
+      break
+    end
+  end
+  for c in AUTO_CANDIDATES:gmatch(".") do
+    local used = false
+    for _, l in ipairs(lines) do
+      used = used or l:sub(1, 1) == c
+    end
+    if not used then
+      return c
+    end
+  end
+  return "#"
+end
+
+--- Run `fn` once the buffer's comment character is known: the scissors line's prefix, else git's
+--- core.commentChar / core.commentString (`auto` read from the buffer). Nothing is decided with a guessed "#":
+--- `;` comment lines would count as a message.
+---@param st slop.commit.State
+---@param fn fun()
+local function with_comment_char(st, fn)
+  if st.cc then
+    return fn()
+  end
+  local asked = st.cc_waiting ~= nil
+  st.cc_waiting = st.cc_waiting or {}
+  table.insert(st.cc_waiting, fn)
+  if asked then
+    return
+  end
+  local function resolved(cc)
+    st.cc = cc
+    local waiting = st.cc_waiting or {}
+    st.cc_waiting = nil
+    for _, f in ipairs(waiting) do
+      f()
+    end
+  end
+  local parsed = parse(st.buf)
+  if parsed.scissors then
+    return resolved(parsed.comment_char)
+  end
+  local args = { "config", "--get-regexp", [[^core\.comment(char|string)$]] }
+  git().run(args, { cwd = git().root(st.buf) }, function(res)
+    if not util().buf_valid(st.buf) then
+      return
+    end
+    local value
+    for line in res.stdout:gmatch("[^\n]+") do
+      value = line:match("^%S+ (.*)$") -- aliases of each other: the one git read last wins
+    end
+    if value == "auto" then
+      value = auto_comment_char(api.nvim_buf_get_lines(st.buf, 0, -1, false))
+    end
+    resolved((value and value ~= "") and value or "#")
+  end)
 end
 
 local function ghost_id(st)
@@ -102,9 +191,8 @@ local function check_stale(st)
     cancel(st)
     return true
   end
-  local cc = st.ctx and st.ctx.comment_char or nil
-  if parse(st.buf, cc).empty then
-    return false
+  if not st.cc or parse(st.buf, st.cc).empty then
+    return false -- (nothing runs before the comment character is known)
   end
   if st.status == "partial" then
     return true
@@ -147,6 +235,14 @@ local function fail(st, err)
   st.handle = nil
   st.error = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
   set_status(st, nil)
+  -- a partly streamed suggestion must not stay acceptable: back to the last complete variant, if there is one
+  if util().buf_valid(st.buf) and ours(st.buf) then
+    if st.variants[st.index] then
+      show(st, st.variants[st.index], false)
+    else
+      ghost().clear(st.buf)
+    end
+  end
   log().warn("commit message generation failed: %s", st.error)
 end
 
@@ -187,7 +283,7 @@ local function gather(st, parsed, opts, cb)
     cb(nil, "not inside a git repository")
     return
   end
-  local raw = { root = root, comment_char = parsed.comment_char }
+  local raw = { root = root, comment_char = st.cc or parsed.comment_char }
   local pending = 1
   local function done()
     pending = pending - 1
@@ -234,15 +330,6 @@ local function gather(st, parsed, opts, cb)
   end
 
   task(function(fin)
-    g.config_get("core.commentChar", { cwd = root }, function(v)
-      if v and v ~= "" and v ~= "auto" and not parsed.scissors then
-        raw.comment_char = v
-      end
-      fin()
-    end)
-  end)
-
-  task(function(fin)
     if parsed.diff then
       raw.diff, raw.source = parsed.diff, "verbose"
       fin()
@@ -260,7 +347,9 @@ local function gather(st, parsed, opts, cb)
           return
         end
         raw.diff_err = err
-        if not c.unstaged_fallback or amend then
+        -- Nvim is git's editor (git exports GIT_INDEX_FILE): that index is what gets committed, so an empty one
+        -- means an empty commit (--allow-empty), not changes to describe from the work tree
+        if not c.unstaged_fallback or amend or vim.env.GIT_INDEX_FILE then
           fin()
           return
         end
@@ -370,9 +459,6 @@ local function request(st)
           })
           if #lines == 0 then
             fail(st, "the model returned an empty message")
-            if ours(st.buf) then
-              ghost().clear(st.buf)
-            end
             return
           end
           st.variants[#st.variants + 1] = lines
@@ -400,7 +486,8 @@ end
 
 -- Public -----------------------------------------------------------------------------------------
 
---- Start tracking a gitcommit buffer (idempotent). Auto-generates when enabled and the message is empty.
+--- Start tracking a gitcommit buffer (idempotent). Auto-generates in COMMIT_EDITMSG when enabled and the message is
+--- empty. Tag annotations, notes and branch descriptions are not tracked (nil).
 ---@param buf integer
 ---@param opts? {auto?: boolean}
 ---@return slop.commit.State?
@@ -413,14 +500,19 @@ function M.attach(buf, opts)
   if not util().buf_valid(buf) or vim.bo[buf].buftype ~= "" or not vim.bo[buf].modifiable then
     return nil
   end
-  local parsed = parse(buf)
+  local kind = message_kind(buf)
+  if kind == "other" then
+    return nil
+  end
+  ---@cast kind "commit"|"unknown"
+  local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
   ---@type slop.commit.State
-  local st = { buf = buf, status = "idle", seq = 0, variants = {}, index = 0, attempt = 0, initial = parsed.message }
+  local st = { buf = buf, kind = kind, status = "idle", seq = 0, variants = {}, index = 0, attempt = 0, initial = {} }
   states[buf] = st
   local group = util().augroup("commit")
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = group,
-    buffer = buf,
+    buf = buf,
     desc = "slop: commit: discard stale suggestions",
     callback = function()
       if states[buf] == st then
@@ -430,7 +522,7 @@ function M.attach(buf, opts)
   })
   api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     group = group,
-    buffer = buf,
+    buf = buf,
     desc = "slop: commit: forget buffer",
     callback = function()
       cancel(st)
@@ -440,9 +532,15 @@ function M.attach(buf, opts)
       return true
     end,
   })
-  if opts.auto ~= false and cfg().auto and parsed.empty then
-    M.generate(buf)
-  end
+  with_comment_char(st, function()
+    if states[buf] ~= st then
+      return
+    end
+    st.initial = git().parse_commit_buffer(lines, { comment_char = st.cc }).message
+    if opts.auto ~= false and cfg().auto and kind == "commit" and parse(buf, st.cc).empty then
+      M.generate(buf)
+    end
+  end)
   return st
 end
 
@@ -464,23 +562,49 @@ function M.generate(buf, opts)
     log().notify("not a git commit message buffer", vim.log.levels.WARN)
     return false
   end
+  if message_kind(buf) == "other" then
+    log().notify(
+      ("%s is not a commit message (tag, notes or branch description)"):format(
+        vim.fs.basename(api.nvim_buf_get_name(buf))
+      ),
+      vim.log.levels.WARN
+    )
+    return false
+  end
   local st = states[buf] or M.attach(buf, { auto = false })
   if not st then
     log().notify("this commit buffer is not modifiable", vim.log.levels.WARN)
     return false
   end
-  local parsed = parse(buf, st.ctx and st.ctx.comment_char or nil)
+  if not st.cc then
+    -- what counts as the message depends on the comment character: go on once git answered
+    with_comment_char(st, function()
+      if states[buf] == st then
+        M.generate(buf, opts)
+      end
+    end)
+    return true
+  end
+  local parsed = parse(buf, st.cc)
   if not parsed.empty then
     if not opts.force then
       say("the commit message is not empty (regenerate or :Slop commit! replaces it)")
       return false
     end
-    -- drop the current message (one undo step), keep comments and the scissors section
-    local stop = (parsed.first_comment or parsed.scissors or (api.nvim_buf_line_count(buf) + 1)) - 1
+    -- drop the message (one undo step): the lines above the scissors that are not comments. git's comment block
+    -- and the scissors section stay as they are.
     cancel(st)
     clear_ghost(st)
-    api.nvim_buf_set_lines(buf, 0, stop, false, { "" })
-    parsed = parse(buf, st.ctx and st.ctx.comment_char or nil)
+    local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
+    local last = parsed.scissors and parsed.scissors - 1 or #lines
+    local keep = { "" }
+    for i = 1, last do
+      if vim.startswith(lines[i], parsed.comment_char) then
+        keep[#keep + 1] = lines[i]
+      end
+    end
+    api.nvim_buf_set_lines(buf, 0, last, false, keep)
+    parsed = parse(buf, st.cc)
   end
   cancel(st)
   clear_ghost(st)

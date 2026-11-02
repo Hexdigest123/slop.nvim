@@ -69,8 +69,8 @@ end
 describe("commit module", function()
   local dir, calls, commit, ghost
 
-  local function open(content)
-    local path = dir .. "/.git/COMMIT_EDITMSG"
+  local function open(content, name)
+    local path = dir .. "/.git/" .. (name or "COMMIT_EDITMSG")
     h.write(path, table.concat(content or TEMPLATE, "\n") .. "\n")
     vim.cmd.edit(path)
     local buf = vim.api.nvim_get_current_buf()
@@ -176,7 +176,7 @@ describe("commit module", function()
     calls[1].chunk("```text\nfeat: partial")
     assert.is_true(commit.is_visible(buf))
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "my own message" })
-    vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf })
+    vim.api.nvim_exec_autocmds("TextChanged", { buf = buf })
     assert.is_true(calls[1].cancelled)
     assert.is_false(ghost.is_visible(buf))
     calls[1].done("```text\nfeat: late\n```")
@@ -227,9 +227,10 @@ describe("commit module", function()
     end)
     for _, lhs in ipairs({ "<C-y>", "<C-e>", "<C-n>", "<C-p>", " ac" }) do
       local m = vim.fn.maparg(lhs, "n", false, true)
-      assert.equal(1, m.buffer, lhs .. " is buffer-local")
+      assert.equal(1, m.buf or m.buffer, lhs .. " is buffer-local")
     end
-    assert.equal(1, vim.fn.maparg("<C-y>", "i", false, true).buffer)
+    local im = vim.fn.maparg("<C-y>", "i", false, true)
+    assert.equal(1, im.buf or im.buffer)
     calls[1].done("```text\nfix: zed\n```")
     h.feed("<C-e>")
     assert.is_false(ghost.is_visible(buf))
@@ -343,6 +344,126 @@ describe("commit module", function()
       found = found or e.msg:find("no staged changes", 1, true) ~= nil
     end
     assert.is_true(found)
+  end)
+
+  it("leaves tag/notes/branch-description messages alone; other gitcommit buffers only on request", function()
+    h.write(dir .. "/a.txt", "staged\n")
+    sh(dir, { "add", "a.txt" })
+    for _, name in ipairs({ "TAG_EDITMSG", "NOTES_EDITMSG", "EDIT_DESCRIPTION" }) do
+      local buf = open(TEMPLATE, name)
+      vim.wait(200)
+      assert.equal(0, #calls, name)
+      assert.is_nil(commit.state(buf), name)
+      assert.is_false(commit.generate(buf, { explicit = true }), name)
+      assert.is_false(commit.accept(buf), name)
+    end
+    local merge = open(TEMPLATE, "MERGE_MSG")
+    vim.wait(200)
+    assert.equal(0, #calls, "no automatic request outside COMMIT_EDITMSG")
+    assert.equal("idle", commit.state(merge).status)
+    assert.is_true(commit.generate(merge, { explicit = true }))
+    wait(function()
+      return #calls == 1
+    end)
+  end)
+
+  it("uses core.commentChar `;`: generates automatically and regenerate keeps git's comment block", function()
+    sh(dir, { "config", "core.commentChar", ";" })
+    h.write(dir .. "/a.txt", "semi\n")
+    sh(dir, { "add", "a.txt" })
+    local template = vim.tbl_map(function(l)
+      return (l:gsub("^#", ";"))
+    end, TEMPLATE)
+    local buf = open(template)
+    wait(function()
+      return #calls == 1
+    end, "no automatic request with core.commentChar=;")
+    calls[1].done("```text\nfeat: semi\n```")
+    assert.is_true(commit.accept(buf))
+    assert.equal("feat: semi", lines(buf)[1])
+    assert.is_true(commit.regenerate(buf))
+    assert.same(template, lines(buf), "only the message is dropped")
+    assert.equal(2, #calls)
+  end)
+
+  it("core.commentChar = auto: the comment character comes from git's comment block", function()
+    sh(dir, { "config", "core.commentChar", "auto" })
+    h.write(dir .. "/a.txt", "auto\n")
+    sh(dir, { "add", "a.txt" })
+    local comments = { "; Please enter the commit message for your changes.", ";", "; On branch main" }
+    local buf = open(vim.list_extend({ "#123 fix the login", "" }, comments))
+    vim.wait(200)
+    assert.equal(0, #calls, "`#123 ...` is a message line here, not a comment")
+    assert.is_true(commit.regenerate(buf))
+    assert.same(vim.list_extend({ "" }, comments), lines(buf))
+    wait(function()
+      return #calls == 1
+    end)
+  end)
+
+  it("a failed stream leaves no partial suggestion to accept (the last complete variant comes back)", function()
+    h.write(dir .. "/a.txt", "p\n")
+    sh(dir, { "add", "a.txt" })
+    local buf = open()
+    wait(function()
+      return #calls == 1
+    end)
+    calls[1].chunk("```text\nfeat: add the sec")
+    assert.is_true(commit.is_visible(buf))
+    calls[1].done(nil, { kind = "timeout", message = "request timed out" })
+    assert.equal("error", commit.state(buf).status)
+    assert.is_false(ghost.is_visible(buf))
+    assert.is_false(commit.accept(buf))
+    assert.equal("", lines(buf)[1])
+    assert.is_true(commit.regenerate(buf))
+    calls[2].done("```text\nfeat: complete\n```")
+    assert.is_true(commit.next(buf)) -- past the last variant: a new request, which fails mid-stream
+    calls[3].chunk("```text\nfeat: hal")
+    calls[3].done(nil, { kind = "timeout", message = "request timed out" })
+    assert.same({ "feat: complete" }, ghost.get(buf).lines)
+    assert.is_true(commit.accept(buf))
+    assert.equal("feat: complete", lines(buf)[1])
+  end)
+
+  it("does not describe unstaged changes when Nvim is git's editor (empty commit)", function()
+    h.write(dir .. "/a.txt", "unrelated local change\n") -- not staged
+    vim.env.GIT_INDEX_FILE = dir .. "/.git/index" -- `git commit --allow-empty` exports it to its editor
+    local buf = open()
+    vim.wait(300)
+    assert.is_true(commit.generate(buf, { explicit = true }))
+    wait(function()
+      return commit.state(buf).status == "idle"
+    end)
+    vim.env.GIT_INDEX_FILE = nil
+    assert.equal(0, #calls)
+    -- not git's editor: the tracked changes are described
+    assert.is_true(commit.generate(buf, { explicit = true, fresh = true }))
+    wait(function()
+      return #calls == 1
+    end)
+    assert.equal("worktree", commit.state(buf).source)
+    assert.matches("%+unrelated local change", calls[1].req.messages[2].content)
+  end)
+
+  it("leaves <C-n>/<C-y> to the popup menu while it is shown", function()
+    h.write(dir .. "/a.txt", "pum\n")
+    sh(dir, { "add", "a.txt" })
+    local buf = open()
+    wait(function()
+      return #calls == 1
+    end)
+    calls[1].done("```text\nfeat: ghost\n```")
+    assert.is_true(commit.is_visible(buf))
+    local completeopt = vim.o.completeopt
+    vim.o.completeopt = "menuone,noselect"
+    vim.keymap.set("i", "<F2>", function()
+      vim.fn.complete(vim.fn.col("."), { "alpha", "beta" })
+    end, { buf = buf })
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("i<F2><C-n><C-y><Esc>")
+    vim.o.completeopt = completeopt
+    assert.equal("alpha", lines(buf)[1])
+    assert.equal(1, #calls, "<C-n> did not ask for another variant")
   end)
 
   it("does not attach to non-gitcommit buffers", function()

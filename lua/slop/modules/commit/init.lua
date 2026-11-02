@@ -1,8 +1,9 @@
 --- commit: AI commit message as ghost text in gitcommit buffers (`git commit` with EDITOR=nvim, fugitive).
 ---
---- On `FileType gitcommit` with an empty message area, the staged diff (verbose scissors section, else
---- `git diff --cached` honouring GIT_INDEX_FILE / --amend), branch, recent commits and <root>/.nvim/commit.md are
---- redacted (core.secrets), sent to services.ai.chat and streamed as ghost text at line 1 (core.ui.ghost).
+--- On `FileType gitcommit` in COMMIT_EDITMSG with an empty message area, the staged diff (verbose scissors section,
+--- else `git diff --cached` honouring GIT_INDEX_FILE / --amend), branch, recent commits and <root>/.nvim/commit.md
+--- are redacted (core.secrets), sent to services.ai.chat and streamed as ghost text at line 1 (core.ui.ghost).
+--- Tag annotations, notes and branch descriptions (also filetype gitcommit) are left alone.
 --- The heavy parts live in session.lua / prompt.lua and are required lazily.
 local function session()
   return require("slop.modules.commit.session")
@@ -69,6 +70,10 @@ local function key(fn, desc)
     fallthrough = true,
     desc = desc,
     rhs = function()
+      -- while the popup menu is shown (insert completion, 0.12 'autocomplete') these keys belong to it
+      if vim.fn.pumvisible() == 1 then
+        return false
+      end
       return fn(0)
     end,
   }
@@ -89,7 +94,7 @@ return {
     enabled = true,
     provider = "mistral_chat",
     style = "auto", -- "auto" (follow recent commits) | "conventional" | "plain"
-    auto = true, -- generate when a gitcommit buffer opens with an empty message
+    auto = true, -- generate when COMMIT_EDITMSG opens with an empty message
     stream = true,
     recent = 5, -- recent subjects (user's own + repository's) sent for style
     branch = true, -- send the branch name
@@ -107,7 +112,7 @@ return {
       "*.min.css",
       "*.map",
     },
-    unstaged_fallback = true, -- nothing staged (e.g. fugitive `:Git commit -a`): describe tracked changes
+    unstaged_fallback = true, -- nothing staged and Nvim is not git's editor: describe tracked changes
     temperature = 0.3,
     max_temperature = 1.0,
     max_tokens = 512,
