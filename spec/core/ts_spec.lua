@@ -75,6 +75,58 @@ describe("core.ts", function()
     assert.are.same({ "static int", "add(int a,", "    int b)", "{" }, s.header)
   end)
 
+  it("header parts and type references are not scopes", function()
+    for _, t in ipairs({
+      "function_declarator",
+      "method_index_expression",
+      "class_heritage",
+      "function_type",
+      "struct_field",
+    }) do
+      assert.is_nil(ts.classify(t), t)
+    end
+    -- cursor on a function's name / parameter list: the whole function, not its declarator
+    local c = buf_with({ "static int", "add(int a,", "    int b)", "{", "  return a + b;", "}" }, "c")
+    local s = ts.scope(c, { 1, 1 })
+    assert.equal("function_definition", s.type)
+    assert.are.same({ 0, 0, 5, 1 }, s.range)
+    local l = buf_with({ "local M = {}", "function M:greet(name)", "  return 'hi ' .. name", "end" }, "lua")
+    s = ts.scope(l, { 1, 12 })
+    assert.equal("function_declaration", s.type)
+    assert.are.same({ 1, 0, 3, 3 }, s.range)
+    -- a struct type reference (no body) is not a class scope; the definition is
+    local st = buf_with({ "struct point { int x; };", "int f(struct point *p) {", "  return p->x;", "}" }, "c")
+    s = ts.scope(st, { 1, 14 })
+    assert.equal("function_definition", s.type)
+    assert.equal("struct_specifier", ts.scope(st, { 0, 16 }).type)
+  end)
+
+  it("scopes inside an injected language include the host language's scopes", function()
+    local b = buf_with({
+      "local M = {}",
+      "function M.setup(opts)",
+      '  vim.cmd("highlight link Foo Bar")',
+      "end",
+    }, "lua")
+    local all = ts.scopes(b, { 2, 20 })
+    assert.equal(1, #all)
+    assert.equal("M.setup", all[1].name)
+    local md = buf_with({ "# Title", "", "```lua", "local function f()", "  return 1", "end", "```" }, "markdown")
+    assert.equal("f", ts.scope(md, { 4, 4 }).name)
+  end)
+
+  it("parses only the injections at the position", function()
+    local lines = { "function M.a()", '  vim.cmd("echo 1")', "end" }
+    for i = 1, 200 do
+      lines[#lines + 1] = ("local x%d = %d"):format(i, i)
+    end
+    vim.list_extend(lines, { "function M.b()", '  vim.cmd("echo 2")', "end" })
+    local b = buf_with(lines, "lua")
+    assert.equal("M.a", ts.scope(b, { 1, 12 }).name)
+    local trees = vim.treesitter.get_parser(b):children().vim:trees()
+    assert.equal(1, vim.tbl_count(trees), "the far vim.cmd() injection was parsed too")
+  end)
+
   it("defaults to the cursor position of the current window", function()
     local b = buf_with({ "function f()", "  return 1", "end" }, "lua")
     api.nvim_set_current_buf(b)

@@ -45,6 +45,9 @@ M.kinds = {
 
 -- node types that look like scopes but aren't (calls, parameters, names, bodies)
 local NOT_SCOPE = { "call", "parameter", "argument", "name", "identifier", "body", "type_identifier", "signature" }
+-- parts of a scope's header or type references, matched against the end of the type: C `function_declarator`,
+-- Lua `M:name` (`method_index_expression`), JS `class_heritage`, Go/TS `function_type`, struct fields
+local NOT_SCOPE_SUFFIX = { "_declarator$", "_index_expression$", "_heritage$", "_type$", "_field$" }
 
 --- Body-ish child node types (header stops where the body starts).
 local BODY = {
@@ -73,6 +76,11 @@ end
 function M.classify(t)
   for _, bad in ipairs(NOT_SCOPE) do
     if t:find(bad, 1, true) and not t:match("_definition$") and not t:match("_declaration$") then
+      return nil
+    end
+  end
+  for _, bad in ipairs(NOT_SCOPE_SUFFIX) do
+    if t:match(bad) then
       return nil
     end
   end
@@ -105,14 +113,18 @@ function M.has_parser(buf)
   return M.lang(buf) ~= nil
 end
 
+--- Parser of `buf`, parsed (root tree + the injections at `row`/`col` only: a full parse re-parses every injection
+--- of the buffer on each call).
 ---@param buf integer
+---@param row integer
+---@param col integer
 ---@return vim.treesitter.LanguageTree?
-local function parse(buf)
+local function parse(buf, row, col)
   local ok, parser = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
   if not ok or not parser then
     return nil
   end
-  local pok = pcall(parser.parse, parser, true)
+  local pok = pcall(parser.parse, parser, { row, col, row, col + 1 })
   if not pok then
     return nil
   end
@@ -134,20 +146,29 @@ local function position(buf, pos)
   return 0, 0
 end
 
+--- Smallest named node at (row, col) in every language tree containing the position, innermost tree first: a node
+--- of an injected tree (a `vim.cmd` string, a comment, a markdown code block) has no parent in the outer tree.
 ---@param buf integer
 ---@param row integer
 ---@param col integer
----@return TSNode?
-local function node_at(buf, row, col)
-  local parser = parse(buf)
+---@return TSNode[]
+local function nodes_at(buf, row, col)
+  local parser = parse(buf, row, col)
   if not parser then
-    return nil
+    return {}
   end
-  local ok, node = pcall(vim.treesitter.get_node, { bufnr = buf, pos = { row, col }, ignore_injections = false })
-  if not ok then
-    return nil
+  local range = { row, col, row, col }
+  local ok, tree = pcall(parser.language_for_range, parser, range)
+  tree = ok and tree or parser
+  local out = {}
+  while tree do
+    local nok, node = pcall(tree.named_node_for_range, tree, range, { ignore_injections = true })
+    if nok and node then
+      out[#out + 1] = node
+    end
+    tree = tree:parent()
   end
-  return node
+  return out
 end
 
 local function node_name(node, buf)
@@ -172,19 +193,25 @@ end
 
 local MAX_HEADER = 6
 
-local function header(node, buf)
-  local srow = node:range()
-  local body
+--- Body node of a scope (field "body", else a body-ish child).
+---@param node TSNode
+---@return TSNode?
+local function body_of(node)
   local ok, b = pcall(node.field, node, "body")
-  body = ok and b and b[1] or nil
+  local body = ok and b and b[1] or nil
   if not body then
     for child in node:iter_children() do
       if BODY[child:type()] then
-        body = child
-        break
+        return child
       end
     end
   end
+  return body
+end
+
+local function header(node, buf)
+  local srow = node:range()
+  local body = body_of(node)
   local last = srow
   if body then
     local brow = body:range()
@@ -224,15 +251,20 @@ function M.scopes(buf, pos, opts)
     return {}
   end
   local row, col = position(buf, pos)
-  local node = node_at(buf, row, col)
   local out = {}
   local want = opts and opts.kinds
-  while node do
-    local kind = M.classify(node:type())
-    if kind and (not want or vim.tbl_contains(want, kind)) then
-      table.insert(out, 1, make_scope(node, kind, buf))
+  for _, node in ipairs(nodes_at(buf, row, col)) do
+    local found = {}
+    while node do
+      local t = node:type()
+      local kind = M.classify(t)
+      -- C/C++ `struct foo` / `enum bar` without a body is a type reference, not a scope
+      if kind and (not want or vim.tbl_contains(want, kind)) and (not t:match("_specifier$") or body_of(node)) then
+        table.insert(found, 1, make_scope(node, kind, buf))
+      end
+      node = node:parent()
     end
-    node = node:parent()
+    out = vim.list_extend(found, out) -- trees come innermost first: the outer tree's scopes go before
   end
   return out
 end
