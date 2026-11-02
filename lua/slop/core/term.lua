@@ -17,7 +17,7 @@ local api = vim.api
 
 ---@class slop.term.Spec
 ---@field name? string                 display name (default: basename of cmd[1])
----@field cmd? string|string[]          default: { vim.o.shell }; a string with spaces runs through 'shell'
+---@field cmd? string|string[]          default: 'shell' (with its arguments); a string with spaces runs through 'shell'
 ---@field cwd? string                   default: core.project.root()
 ---@field env? table<string, string>
 ---@field owner? string                 "term" | "task" | ...  (default "term")
@@ -62,6 +62,7 @@ local api = vim.api
 ---@field private _sizes table<string, integer>
 ---@field private _origin integer?
 ---@field private _used integer
+---@field private _job_cmd string|string[]  what jobstart() runs (`cmd` is for display)
 local Term = {}
 Term.__index = Term
 
@@ -209,12 +210,35 @@ local function fallback_buf(t)
   return api.nvim_create_buf(true, false)
 end
 
+local insert_pending ---@type slop.Term?  its show() ran startinsert, which takes effect when the main loop runs again
+
+--- Is `mode` an Insert / Terminal mode the user is in (or returns to after i_CTRL-O: "niI")?
+---@param mode string
+---@return boolean
+local function user_insert(mode)
+  return mode:find("^[iRt]") ~= nil or mode:find("^ni") ~= nil
+end
+
+--- The terminal's window goes away (hidden, killed, closed, left) before the startinsert of show() took effect:
+--- cancel it, or the window that is current then (a normal buffer) would start Insert mode.
+---@param t slop.Term
+local function cancel_insert(t)
+  if insert_pending ~= t then
+    return
+  end
+  insert_pending = nil
+  if not user_insert(api.nvim_get_mode().mode) then
+    vim.cmd.stopinsert()
+  end
+end
+
 ---@param t slop.Term
 ---@param win integer
 local function close_window(t, win)
   if not api.nvim_win_is_valid(win) then
     return
   end
+  cancel_insert(t)
   local layout = t:layout_of(win)
   if layout == "split" then
     t._sizes.split = api.nvim_win_get_height(win)
@@ -222,7 +246,7 @@ local function close_window(t, win)
     t._sizes.vsplit = api.nvim_win_get_width(win)
   end
   if is_last_window(win) then
-    vim.wo[win].winfixbuf = false
+    api.nvim_set_option_value("winfixbuf", false, { win = win, scope = "local" })
     api.nvim_win_set_buf(win, fallback_buf(t))
     return
   end
@@ -247,7 +271,9 @@ local function enter_mode(t, insert)
   end
   if insert and t:is_running() then
     vim.cmd.startinsert()
+    insert_pending = t -- until TermEnter, see cancel_insert()
   else
+    insert_pending = nil
     vim.cmd.stopinsert()
   end
 end
@@ -291,26 +317,64 @@ local function on_exit(t, code)
   end
 end
 
+--- argv to start: Neovim's default `nvim.terminal` TermClose handler deletes a terminal whose argv (argv[0] resolved
+--- to a full path) equals 'shell' when it exits with 0. For `close_on_exit = false` the same shell is started through
+--- an equivalent path ("/bin/./zsh") so the buffer is kept; other terminals keep that default.
+---@param t slop.Term
+---@return string|string[]
+local function job_argv(t)
+  local cmd = t._job_cmd
+  if t.spec.close_on_exit ~= false or type(cmd) ~= "table" or not cmd[1] then
+    return cmd
+  end
+  local exe = vim.fn.exepath(cmd[1])
+  if exe == "" then
+    return cmd
+  end
+  local argv = { exe }
+  vim.list_extend(argv, cmd, 2)
+  if table.concat(argv, " ") ~= vim.o.shell then
+    return cmd
+  end
+  argv[1] = vim.fs.joinpath(vim.fs.dirname(exe), ".", vim.fs.basename(exe))
+  return argv
+end
+
 ---@param t slop.Term
 ---@return boolean ok, string? err
 local function start(t)
   local buf = api.nvim_create_buf(false, true)
-  local job_cmd = t._job_cmd
+  local job_cmd = job_argv(t)
+  local mode = api.nvim_get_mode().mode
+  if terms[t.id] and terms[t.id] ~= t then
+    t.id = next_id() -- restart of an unregistered terminal whose id was taken meanwhile
+  end
   local ok, job = pcall(api.nvim_buf_call, buf, function()
     return vim.fn.jobstart(job_cmd, {
       term = true,
       cwd = t.cwd,
       env = t.spec.env,
-      on_exit = function(_, code)
+      on_exit = function(job_id, code)
         vim.schedule(function()
-          on_exit(t, code)
+          if t.job == job_id then -- ignore the exit of a previous run (kill() + show())
+            on_exit(t, code)
+          end
         end)
       end,
     })
   end)
+  -- cancel a `startinsert` queued by the user's TermOpen autocmds (hidden spawn), unless we were in Insert /
+  -- Terminal mode already, will return to Insert mode (i_CTRL-O: "niI"), or the current window is a terminal whose
+  -- show() asked for Terminal mode in this same tick (that startinsert must stay)
+  local shown = insert_pending ~= nil and insert_pending.buf == api.nvim_get_current_buf()
+  if not user_insert(mode) and not shown then
+    vim.cmd.stopinsert()
+  end
   if not ok or type(job) ~= "number" or job <= 0 then
     pcall(api.nvim_buf_delete, buf, { force = true })
-    return false, tostring(ok and ("jobstart returned " .. tostring(job)) or job)
+    local err = tostring(ok and ("jobstart returned " .. tostring(job)) or job)
+    -- the error comes through nvim_buf_call: keep the message, drop the Lua traceback / prefixes
+    return false, (err:gsub("\nstack traceback:.*$", ""):gsub("^Lua: ", ""):gsub("^Vim:", ""))
   end
   t.buf, t.job, t.exit_code = buf, job, nil
   vim.bo[buf].bufhidden = "hide"
@@ -326,9 +390,20 @@ local function start(t)
     once = true,
     desc = "slop: unregister terminal",
     callback = function()
+      cancel_insert(t)
       if t.buf == buf then
         t.buf = nil
         unregister(t)
+      end
+    end,
+  })
+  api.nvim_create_autocmd("TermEnter", {
+    group = grp,
+    buf = buf,
+    desc = "slop: show()'s startinsert took effect",
+    callback = function()
+      if insert_pending == t then
+        insert_pending = nil
       end
     end,
   })
@@ -338,6 +413,7 @@ local function start(t)
     desc = "slop: terminal mode / hide on leave",
     callback = function()
       local win = api.nvim_get_current_win()
+      cancel_insert(t) -- left (closed, or focus moved) in the tick show() ran in
       remember_mode(t)
       if t.spec.hide_on_leave and float().is_float(win) then
         vim.schedule(function()
@@ -351,12 +427,27 @@ local function start(t)
   return true
 end
 
+--- 'shell' as an argv: it may carry arguments (":h 'shell'": "csh -f") or be a path with spaces (maybe quoted).
+---@return string[]
+local function shell_argv()
+  local sh = vim.trim(vim.o.shell)
+  if vim.fn.executable(sh) == 1 then
+    return { sh }
+  end
+  local quoted, rest = sh:match('^"([^"]+)"%s*(.*)$')
+  local argv = vim.split(quoted and rest or sh, "%s+", { trimempty = true })
+  if quoted then
+    table.insert(argv, 1, quoted)
+  end
+  return argv
+end
+
 --- Spawn a terminal job in a hidden buffer (not shown).
 ---@param spec? slop.term.Spec
 ---@return slop.Term? term, string? err   nil + error message when the command cannot be started
 function M.spawn(spec)
   spec = spec or {}
-  local cmd = spec.cmd or { vim.o.shell }
+  local cmd = spec.cmd or shell_argv()
   local job_cmd ---@type string|string[]
   if type(cmd) == "string" then
     if cmd:find("%s") then
@@ -394,7 +485,7 @@ function M.spawn(spec)
     log().error("cannot start %s: %s", table.concat(cmd, " "), err)
     return nil, err
   end
-  terms[id] = t
+  terms[t.id] = t
   emit(t, "Open")
   if spec.on_open then
     local ok2, e = pcall(spec.on_open, t)
@@ -405,6 +496,37 @@ function M.spawn(spec)
   return t
 end
 
+local float_winhl ---@type string?  core.ui.float's default 'winhighlight' (seen on a float opened without one)
+
+--- Float options of a terminal (core.ui.float.open()).
+---@param t slop.Term
+---@param enter boolean
+---@return slop.float.Opts
+local function float_opts(t, enter)
+  local fo = vim.tbl_extend("force", {}, t.spec.float or {})
+  fo.buf, fo.enter, fo.title = t.buf, enter, title_of(t)
+  fo.close_keys, fo.close_on_leave, fo.on_close = nil, nil, nil
+  fo.wo = vim.tbl_extend("force", { winfixbuf = true }, t.spec.wo or {}, fo.wo or {})
+  return fo
+end
+
+--- Window-local options of a split / vsplit showing a terminal.
+---@param t slop.Term
+---@param layout slop.term.Layout
+---@return table<string, any>
+local function split_wo(t, layout)
+  return vim.tbl_extend("force", {
+    number = false,
+    relativenumber = false,
+    signcolumn = "no",
+    foldcolumn = "0",
+    spell = false,
+    winfixheight = layout == "split",
+    winfixwidth = layout == "vsplit",
+    winfixbuf = true,
+  }, t.spec.wo or {})
+end
+
 ---@param t slop.Term
 ---@param layout slop.term.Layout
 ---@param enter boolean
@@ -412,17 +534,21 @@ end
 local function open_window(t, layout, enter)
   local sl = tab_slots()
   local win = sl[layout]
-  local base_wo = { winfixbuf = true }
   if win and api.nvim_win_is_valid(win) and vim.b[api.nvim_win_get_buf(win)].slop_term then
-    -- occupied slot: swap the buffer
-    vim.wo[win].winfixbuf = false
+    -- occupied slot: swap the buffer. Switching buffers resets the window-local options, so everything a new window
+    -- gets is applied again for THIS terminal (its wo, float size / border / title)
+    api.nvim_set_option_value("winfixbuf", false, { win = win, scope = "local" })
     api.nvim_win_set_buf(win, t.buf)
-    set_wo(win, base_wo)
     if layout == "float" then
+      local fo = float_opts(t, enter)
       local h = float().get(win)
       if h then
-        h:update({ title = title_of(t) or "" })
+        h.opts = fo -- the previous terminal's float options must not stick (also on VimResized)
+        h:update()
       end
+      set_wo(win, vim.tbl_extend("force", { winhighlight = float_winhl }, fo.wo))
+    else
+      set_wo(win, split_wo(t, layout))
     end
     if enter then
       api.nvim_set_current_win(win)
@@ -430,11 +556,11 @@ local function open_window(t, layout, enter)
     return win
   end
   if layout == "float" then
-    local fo = vim.tbl_extend("force", {}, t.spec.float or {})
-    fo.buf, fo.enter, fo.title = t.buf, enter, title_of(t)
-    fo.close_keys, fo.close_on_leave, fo.on_close = nil, nil, nil
-    fo.wo = vim.tbl_extend("force", base_wo, t.spec.wo or {}, fo.wo or {})
+    local fo = float_opts(t, enter)
     win = float().open(fo).win
+    if fo.wo.winhighlight == nil then
+      float_winhl = api.nvim_get_option_value("winhighlight", { win = win })
+    end
   else
     local o = t.spec[layout] or {}
     local cfg = { win = -1 }
@@ -446,16 +572,7 @@ local function open_window(t, layout, enter)
       cfg.width = math.max(1, t._sizes.vsplit or float().resolve_size(o.size or 0.4, vim.o.columns))
     end
     win = api.nvim_open_win(t.buf, enter, cfg)
-    set_wo(win, {
-      number = false,
-      relativenumber = false,
-      signcolumn = "no",
-      foldcolumn = "0",
-      spell = false,
-      winfixheight = layout == "split",
-      winfixwidth = layout == "vsplit",
-    })
-    set_wo(win, vim.tbl_extend("force", base_wo, t.spec.wo or {}))
+    set_wo(win, split_wo(t, layout))
   end
   sl[layout] = win
   return win
@@ -601,12 +718,11 @@ function M.dedent(lines)
   return out
 end
 
---- Bytes sent for `data` (pure; exposed for tests).
+--- Lines to send for `data` (trailing blank lines dropped, CR stripped, dedented) and whether to paste them.
 ---@param data string|string[]
----@param opts? slop.term.SendOpts
----@return string
-function M.encode(data, opts)
-  opts = opts or {}
+---@param opts slop.term.SendOpts
+---@return string[] lines, boolean paste
+local function prepare(data, opts)
   local lines = type(data) == "string" and vim.split(data, "\n", { plain = true }) or vim.list_extend({}, data)
   while #lines > 1 and lines[#lines] == "" do
     lines[#lines] = nil
@@ -621,8 +737,19 @@ function M.encode(data, opts)
   if paste == nil then
     paste = "auto"
   end
+  return lines, paste == true or (paste == "auto" and #lines > 1)
+end
+
+--- Bytes of `data` for a program that enabled bracketed paste (pure; exposed for tests). send() pastes through
+--- Neovim's terminal instead, which adds the ESC[200~ / ESC[201~ markers only when the program asked for them.
+---@param data string|string[]
+---@param opts? slop.term.SendOpts
+---@return string
+function M.encode(data, opts)
+  opts = opts or {}
+  local lines, paste = prepare(data, opts)
   local text = table.concat(lines, "\r")
-  if paste == true or (paste == "auto" and #lines > 1) then
+  if paste then
     text = "\27[200~" .. text .. "\27[201~"
   end
   if opts.submit ~= false then
@@ -631,7 +758,8 @@ function M.encode(data, opts)
   return text
 end
 
---- Send text to the job (bracketed paste for multi-line text by default; <CR> appended).
+--- Send text to the job (bracketed paste for multi-line text by default, when the program supports it; <CR>
+--- appended).
 ---@param term slop.Term|integer|string
 ---@param data string|string[]
 ---@param opts? slop.term.SendOpts
@@ -653,7 +781,19 @@ function M.send(term, data, opts)
     log().warn("terminal %s has exited", t.name)
     return false
   end
-  api.nvim_chan_send(t.job, M.encode(data, opts))
+  local lines, paste = prepare(data, opts)
+  -- a paste into the terminal buffer goes through Neovim's terminal paste, which wraps it in ESC[200~ / ESC[201~
+  -- only when the program enabled bracketed paste (other programs would get the escape sequences as input)
+  local pasted = paste and pcall(api.nvim_buf_call, t.buf, function()
+    api.nvim_put(lines, "c", false, false)
+  end)
+  if pasted then
+    if opts.submit ~= false then
+      api.nvim_chan_send(t.job, "\r")
+    end
+  else
+    api.nvim_chan_send(t.job, M.encode(data, vim.tbl_extend("force", opts, { paste = false })))
+  end
   if opts.show and not t:is_visible() then
     M.show(t, { enter = false })
   end
@@ -672,6 +812,7 @@ function M.kill(term)
   end
   local wins = t:windows()
   local was_current = vim.tbl_contains(wins, api.nvim_get_current_win())
+  cancel_insert(t) -- also when its windows were already gone
   for _, win in ipairs(wins) do
     close_window(t, win)
   end

@@ -231,6 +231,204 @@ describe("core.term", function()
     assert.is_true(t:is_running())
   end)
 
+  it("kill() + show() restarts the terminal; the old job's exit does not touch the new one", function()
+    local exits = {}
+    events.on("term", "Exit", function(d)
+      if d.name == "runner" then
+        exits[#exits + 1] = d.code
+      end
+    end)
+    local t = assert(term.spawn({ cmd = { "sh" }, name = "runner" }))
+    local old_job = t.job
+    t:kill()
+    t:show({ enter = false })
+    local job, buf = t.job, t.buf
+    assert.not_equal(old_job, job)
+    vim.wait(800) -- the killed job's exit arrives meanwhile
+    assert.is_true(api.nvim_buf_is_valid(buf))
+    assert.equal(buf, t.buf)
+    assert.is_nil(t.exit_code)
+    assert.is_true(t:is_running())
+    assert.equal(t, term.get(t.id))
+    assert.are.same({}, exits)
+  end)
+
+  it("a restarted terminal whose id was taken meanwhile gets a new id", function()
+    local a = assert(term.spawn({ cmd = { "sh", "-c", "exit 0" }, name = "task" }))
+    assert.truthy(wait(function()
+      return term.get(a.id) == nil
+    end))
+    local b = assert(term.spawn({ cmd = { "sh" }, name = "shell" }))
+    assert.equal(a.id, b.id) -- ids are gap-filling
+    a:show({ enter = false })
+    assert.not_equal(a.id, b.id)
+    assert.equal(a, term.get(a.id))
+    assert.equal(b, term.get(b.id))
+    assert.equal(b, term.from_buf(b.buf))
+    assert.equal(a, term.from_buf(a.buf))
+    assert.equal(2, #term.list({ hidden = true }))
+  end)
+
+  it("a hidden spawn does not leave the current window in Insert mode (user TermOpen startinsert)", function()
+    -- needs Neovim's main loop (startinsert takes effect there): drive a child nvim over RPC
+    local chan = vim.fn.jobstart(
+      { vim.v.progpath, "--embed", "--headless", "--clean", "-u", "NONE", "--cmd", "set rtp^=" .. h.root },
+      { rpc = true }
+    )
+    local ok, err = pcall(function()
+      vim.rpcrequest(
+        chan,
+        "nvim_exec_lua",
+        [[
+        vim.api.nvim_create_autocmd("TermOpen", { command = "startinsert" })
+        local t = require("slop.core.term").spawn({ cmd = { "sh" }, cwd = vim.fn.getcwd() })
+        t:send("echo hi")
+        t:show({ layout = "split", enter = false })
+      ]],
+        {}
+      )
+      vim.wait(300)
+      local mode = vim.rpcrequest(chan, "nvim_get_mode").mode
+      local bt = vim.rpcrequest(chan, "nvim_exec_lua", "return vim.bo.buftype", {})
+      assert.equal("n", mode)
+      assert.equal("", bt, "focus stays in the source window")
+    end)
+    vim.fn.jobstop(chan)
+    assert(ok, err)
+  end)
+
+  --- Run `code` in a child nvim (its main loop applies a pending startinsert) and return the child's mode and the
+  --- 'buftype' of its current window afterwards. `keys` are typed first.
+  local function in_child(code, keys)
+    local chan = vim.fn.jobstart(
+      { vim.v.progpath, "--embed", "--headless", "--clean", "-u", "NONE", "--cmd", "set rtp^=" .. h.root },
+      { rpc = true }
+    )
+    local ok, res = pcall(function()
+      if keys then
+        vim.rpcrequest(chan, "nvim_input", keys)
+        vim.wait(100)
+      end
+      vim.rpcrequest(chan, "nvim_exec_lua", code, {})
+      vim.wait(300)
+      return {
+        mode = vim.rpcrequest(chan, "nvim_get_mode").mode,
+        buftype = vim.rpcrequest(chan, "nvim_exec_lua", "return vim.bo.buftype", {}),
+      }
+    end)
+    vim.fn.jobstop(chan)
+    assert(ok, res)
+    return res
+  end
+
+  it("a terminal shown with startinsert and closed in the same tick leaves no Insert mode behind", function()
+    local spawn = 'local t = require("slop.core.term").spawn({ cmd = { "sh" }, cwd = vim.fn.getcwd() })\n'
+    assert.are.same({ mode = "t", buftype = "terminal" }, in_child(spawn .. "t:show()"), "show() alone")
+    local normal = { mode = "n", buftype = "" }
+    assert.are.same(normal, in_child(spawn .. "t:show()\nt:kill()"), "show + kill")
+    assert.are.same(normal, in_child(spawn .. 't:show({ layout = "split" })\nt:kill()'), "split: show + kill")
+    assert.are.same(normal, in_child(spawn .. "t:show()\nvim.api.nvim_win_close(t.win, true)"), "window closed")
+    assert.are.same(
+      normal,
+      in_child(spawn .. "local o = vim.api.nvim_get_current_win()\nt:show()\nvim.api.nvim_set_current_win(o)"),
+      "focus moved back"
+    )
+    -- an Insert mode the user is in is left alone
+    assert.are.same({ mode = "i", buftype = "" }, in_child(spawn .. "t:show()\nt:kill()", "i"), "user's Insert mode")
+    -- a hidden spawn in the same tick does not cancel show()'s Terminal mode
+    assert.are.same(
+      { mode = "t", buftype = "terminal" },
+      in_child(spawn .. 't:show()\nrequire("slop.core.term").spawn({ cmd = { "sh" }, hidden = true })'),
+      "show + hidden spawn"
+    )
+  end)
+
+  it(
+    "close_on_exit = false keeps a 'shell' terminal that exits 0 (Neovim's TermClose default would delete it)",
+    function()
+      local shell = vim.o.shell
+      vim.o.shell = vim.fn.exepath("sh") -- 'shell' is normally an absolute path ($SHELL)
+      local ok, err = pcall(function()
+        local t = assert(term.spawn({ cmd = { vim.o.shell }, close_on_exit = false }))
+        local buf = t.buf
+        t:show({ layout = "split" })
+        t:send("exit 0")
+        assert.truthy(wait(function()
+          return t.exit_code ~= nil
+        end))
+        vim.wait(100)
+        assert.equal(0, t.exit_code)
+        assert.is_true(api.nvim_buf_is_valid(buf))
+        assert.equal(t, term.get(t.id))
+        -- the default still applies to other terminals
+        vim.cmd("botright new | terminal")
+        local tbuf = api.nvim_get_current_buf()
+        api.nvim_chan_send(vim.bo[tbuf].channel, "exit 0\r")
+        assert.truthy(wait(function()
+          return not api.nvim_buf_is_valid(tbuf)
+        end))
+      end)
+      vim.o.shell = shell
+      assert(ok, err)
+    end
+  )
+
+  it("the default cmd honours a 'shell' with arguments; start errors carry no traceback", function()
+    local shell = vim.o.shell
+    vim.o.shell = "sh -e"
+    local t, err = term.spawn({ cwd = h.tmpdir("t") })
+    vim.o.shell = shell
+    assert.truthy(t, err)
+    assert.are.same({ "sh", "-e" }, t.cmd)
+    assert.is_true(t:is_running())
+    local bad, e = term.spawn({ cmd = { "/nonexistent/slop-cmd" } })
+    assert.is_nil(bad)
+    assert.falsy(e:find("traceback", 1, true), e)
+    assert.matches("not executable", e)
+  end)
+
+  it("multi-line send: bracketed paste markers only when the program enabled bracketed paste", function()
+    local dir = h.tmpdir("paste")
+    local function received(enable)
+      local file = dir .. (enable and "/on" or "/off")
+      local script = "stty -echo; " .. (enable and "printf '\\033[?2004h'; " or "") .. "cat > " .. file
+      local t = assert(term.spawn({ cmd = { "sh", "-c", script }, close_on_exit = false }))
+      vim.wait(300)
+      assert.is_true(t:send({ "echo one", "echo two" }))
+      vim.wait(100)
+      vim.fn.chansend(t.job, "\4")
+      assert.truthy(wait(function()
+        return t.exit_code ~= nil
+      end))
+      return table.concat(vim.fn.readfile(file, "b"), "\n")
+    end
+    assert.equal("echo one\necho two\n", received(false))
+    assert.equal("\27[200~echo one\necho two\27[201~\n", received(true))
+  end)
+
+  it("a terminal shown in another terminal's float slot gets its own window options and size", function()
+    local a = assert(term.spawn({ cmd = { "sh" }, name = "a", wo = { winhighlight = "Normal:ErrorMsg" } }))
+    local b = assert(term.spawn({
+      cmd = { "sh" },
+      name = "b",
+      wo = { winhighlight = "Normal:DiffAdd", winblend = 30 },
+      float = { width = 50, height = 10 },
+    }))
+    a:show()
+    assert.equal("Normal:ErrorMsg", vim.wo[a.win].winhighlight)
+    b:show()
+    assert.equal(a.win, b.win)
+    assert.equal("Normal:DiffAdd", vim.wo[b.win].winhighlight)
+    assert.equal(30, vim.wo[b.win].winblend)
+    assert.equal(50, api.nvim_win_get_width(b.win))
+    assert.equal(10, api.nvim_win_get_height(b.win))
+    assert.is_true(vim.wo[b.win].winfixbuf)
+    a:show()
+    assert.equal("Normal:ErrorMsg", vim.wo[a.win].winhighlight)
+    assert.equal(0, vim.wo[a.win].winblend)
+    assert.not_equal(50, api.nvim_win_get_width(a.win), "b's float size does not stick")
+  end)
+
   it("float is resized on VimResized", function()
     local t = assert(term.spawn({
       cmd = { "sh" },
