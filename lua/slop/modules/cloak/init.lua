@@ -74,6 +74,7 @@ local function rebuild()
   compile()
   register_provider()
   render().reconfigure(state.cfg)
+  require("slop.modules.cloak.integrations").reconfigure(state.cfg)
 end
 
 -- API ------------------------------------------------------------------------------------------
@@ -136,9 +137,12 @@ function api.spans(buf, srow, erow)
   end
   buf = (buf == nil or buf == 0) and vim.api.nvim_get_current_buf() or buf
   srow = srow or 0
+  local rules = rules_for(require("slop.core.secrets").effective_path(buf))
+  if #rules == 0 then
+    return {} -- cheap for un-cloaked buffers (status() is used in completion-source filters)
+  end
   local lines = vim.api.nvim_buf_get_lines(buf, srow, erow and erow + 1 or -1, false)
-  local path = require("slop.core.secrets").effective_path(buf)
-  return patterns().compute(rules_for(path), lines, srow, state.cfg)
+  return patterns().compute(rules, lines, srow, state.cfg)
 end
 
 ---@class slop.cloak.Status
@@ -190,6 +194,7 @@ end
 ---@param buf integer
 ---@param path string
 function api.attach(buf, path)
+  buf = (buf == nil or buf == 0) and vim.api.nvim_get_current_buf() or buf
   vim.b[buf].slop_secret_path = path
   api.refresh(buf)
 end
@@ -278,6 +283,7 @@ return {
     builtin_patterns = true, -- extra slop rules (http-client env json, .npmrc, .netrc, aws, .nvim/state, .http)
     exclude = {}, -- globs never cloaked, e.g. { ".env.example" }
     disable_completion = true, -- cmp / blink / native autocomplete / slop complete off in cloaked buffers
+    nobuflisted = false, -- 'nobuflisted' while cloaked: <C-n>/'autocomplete' in other buffers skip their words
     fzf_lua = true, -- mask fzf-lua previews
     keymaps = { toggle = "<leader>tp", preview_line = "<leader>tl" },
   },
@@ -299,6 +305,7 @@ return {
     check("builtin_patterns", cfg.builtin_patterns, "boolean")
     check("exclude", cfg.exclude, "table")
     check("disable_completion", cfg.disable_completion, "boolean")
+    check("nobuflisted", cfg.nobuflisted, "boolean")
     check("fzf_lua", cfg.fzf_lua, "boolean")
     local errs = require("slop.modules.cloak.patterns").validate(cfg.patterns, "patterns")
     if #errs > 0 then
@@ -432,6 +439,14 @@ return {
     if s.cmp or s.blink then
       vim.health.info(
         ("completion in cloaked buffers: %s"):format(cfg.disable_completion and "disabled" or "NOT disabled")
+      )
+    end
+    if cfg.nobuflisted then
+      vim.health.ok("nobuflisted: cloaked buffers are unlisted, so <C-n>/'autocomplete' elsewhere skip their words")
+    else
+      vim.health.info(
+        "keyword completion in OTHER buffers (<C-n>, 'autocomplete', buffer sources) can offer cloaked values:"
+          .. " cloak.nobuflisted = true and :h slop-cloak-limitations"
       )
     end
     if vim.fn.exists(":CloakToggle") == 2 or package.loaded["cloak"] then

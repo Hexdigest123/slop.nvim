@@ -10,7 +10,16 @@ local M = {}
 local api = vim.api
 
 local fzf = { patched = false, error = nil, orig = nil, cls = nil }
-local saved = {} ---@type table<integer, {completion: any, autocomplete: any, cmp: boolean?, au: integer?}>
+---@class slop.cloak.SavedCompletion
+---@field completion any         vim.b.completion before
+---@field has_ac? boolean        'autocomplete' was saved (autocomplete = its local value, nil = none)
+---@field autocomplete? boolean
+---@field cmp? boolean           nvim-cmp was disabled (cmp_prev = the buffer config it had)
+---@field cmp_prev? table
+---@field au? integer            InsertEnter autocmd waiting for a lazy-loaded cmp
+
+local saved = {} ---@type table<integer, slop.cloak.SavedCompletion>
+local aus = {} ---@type integer[]  autocmds of setup(), deleted by reconfigure()
 
 --- Absolute path for a (possibly relative) path.
 ---@param p string?
@@ -46,9 +55,15 @@ local function fzf_tag(self, entry)
   end
   local cwd = entry.cwd or (type(self.opts) == "table" and self.opts.cwd) or nil
   path = abs(path, cwd)
+  local render = require("slop.modules.cloak.render")
   if path and vim.b[buf].slop_secret_path ~= path then
     vim.b[buf].slop_secret_path = path
-    require("slop.modules.cloak.render").invalidate(buf)
+    render.invalidate(buf)
+  end
+  -- fzf-lua swaps preview buffers under eventignore (no BufWinEnter) and sets the window options globally,
+  -- so every new preview buffer gets the window's wrap/conceallevel: fix them before the first redraw
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    render.apply_win(win)
   end
 end
 
@@ -141,13 +156,32 @@ end
 
 -- completion ------------------------------------------------------------------------------------
 
-local function cmp_set(buf, enabled)
+--- nvim-cmp's own config of `buf` (cmp.setup.buffer() replaces it wholesale), so a restore can put it back.
+---@param buf integer
+---@return table?
+local function cmp_buffer_config(buf)
+  local cc = package.loaded["cmp.config"]
+  local c = type(cc) == "table" and type(cc.buffers) == "table" and cc.buffers[buf] or nil
+  if type(c) ~= "table" then
+    return nil
+  end
+  c = vim.deepcopy(c)
+  c.revision = nil
+  return next(c) ~= nil and c or nil
+end
+
+--- Disable cmp in `buf` (keeping its own buffer config), or restore that config. Restoring with
+--- `{ enabled = true }` would override the user's/cmp's enabled() function (prompt buffers, macros).
+---@param buf integer
+---@param enabled boolean
+---@param prev? table  buffer config to restore
+local function cmp_set(buf, enabled, prev)
   local cmp = package.loaded["cmp"]
   if type(cmp) ~= "table" or type(cmp.setup) ~= "table" or not api.nvim_buf_is_valid(buf) then
     return false
   end
   return pcall(api.nvim_buf_call, buf, function()
-    cmp.setup.buffer({ enabled = enabled })
+    cmp.setup.buffer(enabled and (prev or {}) or vim.tbl_extend("force", prev or {}, { enabled = false }))
   end)
 end
 
@@ -164,30 +198,34 @@ function M.completion(buf, enabled)
       return
     end
     local s = { completion = vim.b[buf].completion }
-    local ok, ac = pcall(function()
-      return vim.bo[buf].autocomplete
-    end)
+    -- 'autocomplete' is global-local (0.12): nil = no local value, the global one applies (vim.bo reads nil too)
+    local ok, ac = pcall(api.nvim_get_option_value, "autocomplete", { scope = "local", buf = buf })
     if ok then
-      s.autocomplete = ac
+      s.has_ac, s.autocomplete = true, ac
       pcall(function()
         vim.bo[buf].autocomplete = false
       end)
     end
     vim.b[buf].completion = false
-    if cmp_set(buf, false) then
+    s.cmp_prev = cmp_buffer_config(buf)
+    if cmp_set(buf, false, s.cmp_prev) then
       s.cmp = true
     else
       -- cmp not loaded yet (lazy on InsertEnter): disable it as soon as it is, before the first TextChangedI.
       s.au = api.nvim_create_autocmd("InsertEnter", {
         group = require("slop.core.util").augroup("cloak"),
-        buffer = buf,
+        buf = buf,
         desc = "slop: cloak disable nvim-cmp",
         callback = function()
           local function try()
-            if saved[buf] and not saved[buf].cmp and cmp_set(buf, false) then
-              saved[buf].cmp = true
-              pcall(api.nvim_del_autocmd, saved[buf].au)
-              saved[buf].au = nil
+            local cur = saved[buf]
+            if cur and not cur.cmp then
+              cur.cmp_prev = cmp_buffer_config(buf)
+              if cmp_set(buf, false, cur.cmp_prev) then
+                cur.cmp = true
+                pcall(api.nvim_del_autocmd, cur.au)
+                cur.au = nil
+              end
             end
           end
           try()
@@ -206,13 +244,17 @@ function M.completion(buf, enabled)
       pcall(api.nvim_del_autocmd, s.au)
     end
     vim.b[buf].completion = s.completion
-    if s.autocomplete ~= nil then
-      pcall(function()
-        vim.bo[buf].autocomplete = s.autocomplete
+    if s.has_ac then
+      pcall(api.nvim_buf_call, buf, function()
+        if s.autocomplete == nil then
+          vim.cmd("set autocomplete<") -- global-local: drop the local value, the global one applies again
+        else
+          vim.bo[buf].autocomplete = s.autocomplete
+        end
       end)
     end
     if s.cmp then
-      cmp_set(buf, true)
+      cmp_set(buf, true, s.cmp_prev)
     end
   end
 end
@@ -224,7 +266,7 @@ function M.setup(cfg)
   local group = require("slop.core.util").augroup("cloak")
   if cfg.fzf_lua ~= false then
     M.patch_fzf(false)
-    api.nvim_create_autocmd("FileType", {
+    aus[#aus + 1] = api.nvim_create_autocmd("FileType", {
       group = group,
       pattern = "fzf",
       desc = "slop: cloak fzf-lua previews",
@@ -235,7 +277,7 @@ function M.setup(cfg)
     require("slop.modules.cloak.render")._state.fallback_path = M.fzf_fallback_path
   end
   if cfg.cloak_telescope ~= false then
-    api.nvim_create_autocmd("User", {
+    aus[#aus + 1] = api.nvim_create_autocmd("User", {
       group = group,
       pattern = "TelescopePreviewerLoaded",
       desc = "slop: cloak telescope previews",
@@ -244,11 +286,26 @@ function M.setup(cfg)
   end
 end
 
+--- Apply a changed config (fzf_lua / cloak_telescope toggled by a later setup()).
+---@param cfg table
+function M.reconfigure(cfg)
+  for _, id in ipairs(aus) do
+    pcall(api.nvim_del_autocmd, id)
+  end
+  aus = {}
+  if cfg.fzf_lua == false then
+    M.unpatch_fzf()
+    require("slop.modules.cloak.render")._state.fallback_path = nil
+  end
+  M.setup(cfg)
+end
+
 function M.teardown()
   M.unpatch_fzf()
   for buf in pairs(saved) do
     M.completion(buf, true)
   end
+  aus = {} -- deleted with the augroup
   require("slop.modules.cloak.render")._state.fallback_path = nil
 end
 

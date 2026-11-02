@@ -134,6 +134,47 @@ describe("cloak patterns", function()
     assert.are.same({}, P.validate(P.builtin, "builtin"))
   end)
 
+  it("validate catches pattern errors that only show up when the matcher reaches them", function()
+    -- string.find("", pat) accepts all of these; matching "API_KEY=x" etc. throws
+    local bad = {
+      ["(password: .+"] = "unfinished capture",
+      ["=.+%"] = "ends with '%%'",
+      ["=[%w"] = "missing ']'",
+      ["=%f"] = "missing '%[' after '%%f'",
+      ["=%f[%w"] = "missing ']'",
+      ["password: %b"] = "missing arguments to '%%b'",
+      ["a%1(b)"] = "invalid capture index",
+      ["x%0"] = "invalid capture index",
+      ["a)"] = "invalid pattern capture",
+      [("(.)"):rep(33)] = "too many captures",
+    }
+    for pat, err in pairs(bad) do
+      local errs = P.validate({ { file_pattern = "*", cloak_pattern = pat } }, "patterns")
+      assert.equal(1, #errs, pat)
+      assert.matches("^patterns%[1%]%.cloak_pattern: invalid Lua pattern .*" .. err, errs[1])
+    end
+    local good = { "=.+", "(%w+)=%1", "[]]", "[^]]+", "[%]]", "%b()", "%f[%w]%w+", "()=", "%%", "^(%s*)%S.*" }
+    for _, pat in ipairs(good) do
+      assert.are.same({}, P.validate({ { file_pattern = "*", cloak_pattern = pat } }, "patterns"), pat)
+    end
+  end)
+
+  it("compute fails closed when a pattern throws anyway: the whole line is a span, reported once", function()
+    local msgs = {}
+    local notify = vim.notify
+    vim.notify = function(m)
+      msgs[#msgs + 1] = m
+    end
+    local rules = P.normalize({ { file_pattern = "*", cloak_pattern = "(password: .+" } }, "mine")
+    local s = P.compute(rules, { "user: me", "password: hunter2", "" }, 4)
+    assert.are.same({ { row = 5, col = 0, end_col = 17, prefix = "" } }, s)
+    P.compute(rules, { "password: again" }, 0)
+    vim.wait(20)
+    vim.notify = notify
+    assert.equal(1, #msgs)
+    assert.matches("mine%[1%]: pattern error %(unfinished capture%)", msgs[1])
+  end)
+
   describe("builtin rules", function()
     local function apply(path, line)
       local rules = P.rules_for(P.normalize(P.builtin), path)
@@ -148,9 +189,12 @@ describe("cloak patterns", function()
       assert.are.same({ "abc123" }, apply("/p/http-client.private.env.json", '    "token": "abc123",'))
       assert.are.same({ "localhost" }, apply("/p/http-client.env.json", '"host": "localhost"'))
       assert.are.same({}, apply("/p/http-client.env.json", '  "dev": {'))
+      -- an escaped quote does not end the masked value
+      assert.are.same({ 'has\\"quote"' }, apply("/p/http-client.private.env.json", '  "password": "has\\"quote",'))
     end)
 
     it(".npmrc / .netrc / aws credentials", function()
+      assert.are.same({ '"user:pass"' }, apply("/h/.yarnrc.yml", 'npmAuthIdent: "user:pass"'))
       assert.are.same({ "npm_XYZ" }, apply("/h/.npmrc", "//registry.npmjs.org/:_authToken=npm_XYZ"))
       assert.are.same({ "s3cr3t" }, apply("/h/.netrc", "machine x login me password s3cr3t"))
       assert.are.same({ "wJalr" }, apply("/h/.aws/credentials", "aws_secret_access_key = wJalr"))
@@ -172,6 +216,28 @@ describe("cloak patterns", function()
       assert.are.same({ "abc" }, apply("/p/api.http", "@auth_token = abc"))
       assert.are.same({}, apply("/p/api.http", "GET https://example.com/auth"))
       assert.are.same({}, apply("/p/api.http", "Content-Type: application/json"))
+    end)
+
+    it(".http: secret-ish variables, case-insensitive headers, query/form values, JSON bodies", function()
+      local cases = {
+        ["@password = hunter2"] = "hunter2",
+        ["@api_key = abc123"] = "abc123",
+        ["@client_secret = s3cr3t"] = "s3cr3t",
+        ["@apiKey=xyz"] = "xyz",
+        ["AUTHORIZATION: Bearer abc.def"] = "abc.def",
+        ["Proxy-Authorization: Basic dXNlcg=="] = "dXNlcg==",
+        ["X-Auth-Token: abc123"] = "abc123",
+        ["Api-Key: abc123"] = "abc123",
+        ["GET https://x/y?api_key=abc&page=2 HTTP/1.1"] = "abc",
+        ["user=me&password=hunter2"] = "hunter2",
+        ['  "password": "hunter2",'] = 'hunter2"',
+      }
+      for line, want in pairs(cases) do
+        assert.are.same({ want }, apply("/p/api.rest", line), line)
+      end
+      for _, line in ipairs({ "Host: example.com", "Accept: */*", "@baseUrl = https://example.com", "GET /users" }) do
+        assert.are.same({}, apply("/p/api.http", line), line)
+      end
     end)
   end)
 end)

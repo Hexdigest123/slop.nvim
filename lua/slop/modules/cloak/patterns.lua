@@ -13,6 +13,8 @@
 --- real text and only the rest is masked, otherwise the prefix is drawn over the original.
 --- Fixed: every rule matching a file contributes (spans are unioned), the search always advances (no infinite
 --- loop on 1-char/empty matches), and file patterns use one matcher everywhere (core.secrets.match_glob).
+--- Fail closed: validate() checks the pattern syntax statically, and a pattern that throws anyway counts the
+--- whole line as secret (screen and AI) instead of matching nothing.
 local M = {}
 
 ---@class slop.cloak.Pattern
@@ -32,18 +34,47 @@ local M = {}
 ---@field end_col integer  exclusive
 ---@field prefix string    text drawn over the start of the region ("" = only mask chars)
 
+--- Case-insensitive Lua pattern for a lowercase word: "key" -> "[Kk][Ee][Yy]".
+---@param word string
+---@return string
+local function ci(word)
+  return (word:gsub("%a", function(c)
+    return "[" .. c:upper() .. c .. "]"
+  end))
+end
+
+--- Parts of names that mark a value as secret in .http/.rest files (header names are case-insensitive).
+local HTTP_WORDS = { "auth", "token", "key", "secret", "passw", "pwd", "cookie", "session" }
+
+---@return string[]
+local function http_patterns()
+  -- Authorization-style headers keep their scheme visible ("Bearer ****"); first in the list so it wins ties
+  local pats = { "^(%s*[%w%-]*" .. ci("authorization") .. "[%w%-]*:%s*%a+%s+)%S.*" }
+  for _, word in ipairs(HTTP_WORDS) do
+    local w = ci(word)
+    vim.list_extend(pats, {
+      "^(%s*[%w%-]*" .. w .. "[%w%-]*:%s*).+", -- header
+      "^(%s*@[%w_%-%.]*" .. w .. "[%w_%-%.]*%s*=%s*).+", -- @variable = value
+      "(%f[%w_][%w_%-%.]*" .. w .. '[%w_%-%.]*=)[^&%s#"]+', -- ?query= / form body
+      '("[%w_%-%.]*' .. w .. '[%w_%-%.]*"%s*:%s*").*[^\\]"', -- "json": "value" (escaped quotes included)
+    })
+  end
+  return pats
+end
+
 --- Extra rules shipped by slop (`builtin_patterns = true`), on top of the user's/cloak.nvim `patterns`.
 M.builtin = {
   {
     file_pattern = { "http-client.env.json", "http-client.private.env.json", "*.private.env.json" },
-    cloak_pattern = '(":%s*")[^"]+',
+    -- a value with an escaped quote ("a\"b") is matched up to its real end by the longer first pattern
+    cloak_pattern = { '(":%s*")[^"]*\\".*[^\\]"', '(":%s*")[^"]+' },
     replace = "%1",
   },
   {
     file_pattern = { ".npmrc", ".yarnrc", ".yarnrc.yml" },
     cloak_pattern = {
       "([%w_]*[Tt]oken%s*[=:]%s*).+",
-      "(_auth%s*=%s*).+",
+      "([%w_]*[Aa]uth[%w_]*%s*[=:]%s*).+", -- _auth=, npmAuthIdent: (yarn's user:password)
       "(_password%s*=%s*).+",
     },
     replace = "%1",
@@ -60,18 +91,7 @@ M.builtin = {
     block = true,
   },
   { file_pattern = { ".nvim/state/**" }, cloak_pattern = "^(%s*)%S.*", replace = "%1", block = true },
-  {
-    file_pattern = { "*.http", "*.rest" },
-    cloak_pattern = {
-      "^(%s*[Aa]uthorization:%s*%a+%s+)%S.*",
-      "^(%s*[Aa]uthorization:%s*).+",
-      "^(%s*[Pp]roxy%-[Aa]uthorization:%s*).+",
-      "^(%s*[Cc]ookie:%s*).+",
-      "^(%s*[Xx]%-[Aa][Pp][Ii]%-[Kk][Ee][Yy]:%s*).+",
-      "^(%s*@[%w_%-]*[Tt][Oo][Kk][Ee][Nn][%w_%-]*%s*=%s*).+",
-    },
-    replace = "%1",
-  },
+  { file_pattern = { "*.http", "*.rest" }, cloak_pattern = http_patterns(), replace = "%1" },
 }
 
 ---@param v any
@@ -118,6 +138,93 @@ function M.normalize(rules, source)
   return out
 end
 
+--- Index after the set that starts at `i` (pat:sub(i, i) == "["), nil when it is not closed (Lua's classEnd).
+---@param pat string
+---@param i integer
+---@return integer?
+local function set_end(pat, i)
+  local p = i + 1
+  if pat:sub(p, p) == "^" then
+    p = p + 1
+  end
+  repeat -- the first char always belongs to the set: "[]]" and "[^]]" are valid
+    if p > #pat then
+      return nil
+    end
+    if pat:sub(p, p) == "%" then
+      p = p + 1
+    end
+    p = p + 1
+  until pat:sub(p, p) == "]"
+  return p + 1
+end
+
+--- Syntax errors that string.find only raises once the matcher reaches them (so `find("", pat)` misses them):
+--- a trailing "%", an unclosed set, unbalanced captures, %b without its 2 chars, %f without a set, and back
+--- references to captures that are not closed yet.
+---@param pat string
+---@return string? err
+function M.pattern_error(pat)
+  local i, n = 1, #pat
+  local open, closed, level = {}, {}, 0
+  while i <= n do
+    local c = pat:sub(i, i)
+    if c == "%" then
+      local x = pat:sub(i + 1, i + 1)
+      if x == "" then
+        return "malformed pattern (ends with '%')"
+      elseif x == "b" then
+        if i + 3 > n then
+          return "missing arguments to '%b'"
+        end
+        i = i + 4
+      elseif x == "f" then
+        if pat:sub(i + 2, i + 2) ~= "[" then
+          return "missing '[' after '%f' in pattern"
+        end
+        local e = set_end(pat, i + 2)
+        if not e then
+          return "malformed pattern (missing ']')"
+        end
+        i = e
+      elseif x:match("%d") then
+        if x == "0" or not closed[tonumber(x)] then
+          return "invalid capture index %" .. x
+        end
+        i = i + 2
+      else
+        i = i + 2
+      end
+    elseif c == "[" then
+      local e = set_end(pat, i)
+      if not e then
+        return "malformed pattern (missing ']')"
+      end
+      i = e
+    elseif c == "(" then
+      level = level + 1
+      if level > 32 then
+        return "too many captures"
+      end
+      open[#open + 1] = level
+      i = i + 1
+    elseif c == ")" then
+      local k = table.remove(open)
+      if not k then
+        return "invalid pattern capture"
+      end
+      closed[k] = true
+      i = i + 1
+    else
+      i = i + 1
+    end
+  end
+  if #open > 0 then
+    return "unfinished capture"
+  end
+  return nil
+end
+
 --- Validation errors of a rule list (for spec.schema). Paths like "patterns[2].cloak_pattern[1]".
 ---@param rules any
 ---@param prefix string
@@ -132,9 +239,13 @@ function M.validate(rules, prefix)
       errs[#errs + 1] = ("%s: expected a Lua pattern string, got %s"):format(path, type(pat))
       return
     end
-    local ok, err = pcall(string.find, "", pat)
-    if not ok then
-      errs[#errs + 1] = ("%s: invalid Lua pattern %q: %s"):format(path, pat, tostring(err):gsub("^.-:%d+: ", ""))
+    local err = M.pattern_error(pat)
+    if not err then
+      local ok, e = pcall(string.find, "", pat)
+      err = not ok and (tostring(e):gsub("^.-:%d+: ", "")) or nil
+    end
+    if err then
+      errs[#errs + 1] = ("%s: invalid Lua pattern %q: %s"):format(path, pat, err)
     end
   end
   for i, r in ipairs(rules) do
@@ -256,6 +367,27 @@ function M.match_line(line, pats, try_all)
   return out
 end
 
+local reported = setmetatable({}, { __mode = "k" }) ---@type table<slop.cloak.Rule, boolean>
+
+--- A pattern threw although validate() accepted it: tell the user once per rule (scheduled, since compute()
+--- runs inside redraws and secrets queries).
+---@param rule slop.cloak.Rule
+---@param err any
+local function report(rule, err)
+  if reported[rule] then
+    return
+  end
+  reported[rule] = true
+  local msg = ("%s[%d]: pattern error (%s); the lines it fails on are masked and redacted entirely"):format(
+    rule.source,
+    rule.index,
+    (tostring(err):gsub("^.-:%d+: ", ""))
+  )
+  vim.schedule(function()
+    require("slop.core.log").notify(msg, vim.log.levels.ERROR, { scope = "cloak" })
+  end)
+end
+
 --- Spans of `rules` over `lines` (rows absolute: first_row + index - 1), merged per row.
 ---@param rules slop.cloak.Rule[]
 ---@param lines string[]
@@ -272,7 +404,13 @@ function M.compute(rules, lines, first_row, opts)
   for i, line in ipairs(lines) do
     local row_spans = {}
     for _, r in ipairs(rules) do
-      vim.list_extend(row_spans, M.match_line(line, r.patterns, try_all))
+      local ok, res = pcall(M.match_line, line, r.patterns, try_all)
+      if not ok then
+        -- fail closed: where the secret is cannot be known, so the whole line counts as secret
+        report(r, res)
+        res = #line > 0 and { { col = 0, end_col = #line, prefix = "" } } or {}
+      end
+      vim.list_extend(row_spans, res)
     end
     if #row_spans > 0 then
       table.sort(row_spans, function(a, b)

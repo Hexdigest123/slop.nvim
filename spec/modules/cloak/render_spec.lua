@@ -139,7 +139,7 @@ describe("cloak render", function()
     assert.falsy(s:find("secret1", 1, true))
     assert.truthy(#api.nvim_get_autocmds({ group = "slop.cloak" }) > before)
     api.nvim_win_set_cursor(w2, { 3, 0 })
-    vim.api.nvim_exec_autocmds("CursorMoved", { buffer = 0 })
+    vim.api.nvim_exec_autocmds("CursorMoved", { buf = 0 })
     vim.cmd("redraw!")
     assert.falsy(all_screen():find("secret", 1, true))
     assert.equal(before, #api.nvim_get_autocmds({ group = "slop.cloak" }))
@@ -150,7 +150,7 @@ describe("cloak render", function()
     vim.cmd("Slop cloak preview_line 2")
     vim.cmd("redraw!")
     assert.are.same({ "A=secret1", "B=secret2", "C=*******" }, screen(3))
-    vim.api.nvim_exec_autocmds("BufLeave", { buffer = 0 })
+    vim.api.nvim_exec_autocmds("BufLeave", { buf = 0 })
     vim.cmd("redraw!")
     assert.are.same({ "A=*******", "B=*******", "C=*******" }, screen(3))
   end)
@@ -186,6 +186,7 @@ describe("cloak render", function()
         end,
       },
     }
+    vim.o.autocomplete = true -- the user's global value; no local one
     local _, buf = open(".env", "A=1\n")
     vim.wait(50, function()
       return #calls > 0
@@ -195,8 +196,39 @@ describe("cloak render", function()
     assert.are.same({ buf = buf, enabled = false }, calls[1])
     require("slop").cloak.toggle()
     assert.is_nil(vim.b[buf].completion)
-    assert.are.same({ buf = buf, enabled = true }, calls[#calls])
+    -- the buffer override is dropped (enabled = true would beat the user's enabled() function)
+    assert.are.same({ buf = buf }, calls[#calls])
+    -- global-local 'autocomplete': the local value is removed again, so the global one applies
+    assert.is_nil(api.nvim_get_option_value("autocomplete", { scope = "local", buf = buf }))
+    assert.is_true(api.nvim_buf_call(buf, function()
+      return vim.o.autocomplete
+    end))
+    vim.o.autocomplete = false
     package.loaded.cmp = nil
+  end)
+
+  it("completion restore puts the user's own cmp buffer config back", function()
+    local store = { buffers = {} }
+    package.loaded["cmp.config"] = store
+    package.loaded.cmp = {
+      setup = {
+        buffer = function(c)
+          store.buffers[api.nvim_get_current_buf()] = vim.tbl_extend("force", c, { revision = 9 })
+        end,
+      },
+    }
+    require("slop").setup({ cloak = {} })
+    assert(require("slop").load("cloak"))
+    local buf = api.nvim_create_buf(true, false)
+    store.buffers[buf] = { sources = { { name = "path" } }, revision = 3 }
+    local integ = require("slop.modules.cloak.integrations")
+    integ.completion(buf, false)
+    assert.equal(false, store.buffers[buf].enabled)
+    assert.are.same({ { name = "path" } }, store.buffers[buf].sources)
+    integ.completion(buf, true)
+    assert.is_nil(store.buffers[buf].enabled)
+    assert.are.same({ { name = "path" } }, store.buffers[buf].sources)
+    package.loaded.cmp, package.loaded["cmp.config"] = nil, nil
   end)
 
   it("fzf-lua previewer patch tags preview buffers (fake previewer)", function()
@@ -314,5 +346,229 @@ describe("cloak render", function()
     vim.cmd("redraw!")
     assert.are.same({ "A=secret" }, screen(1))
     assert.is_true(vim.wo.wrap)
+  end)
+
+  -- Regressions ---------------------------------------------------------------------------------
+
+  it("closed folds and diff-mode folds stay masked; foldtext is restored, also in splits", function()
+    local lines = {}
+    for i = 1, 12 do
+      lines[i] = ("KEY%02d=topsecret%02d"):format(i, i)
+    end
+    open(".env", table.concat(lines, "\n") .. "\n")
+    assert.equal("", vim.wo.foldtext)
+    vim.cmd("2,5fold")
+    vim.cmd("redraw!")
+    assert.falsy(all_screen():find("topsecret", 1, true), "manual fold")
+    vim.cmd("normal! zE")
+    lines[12] = "KEY12=CHANGED"
+    h.write(dir .. "/.env.prod", table.concat(lines, "\n") .. "\n")
+    vim.cmd("vert diffsplit " .. vim.fn.fnameescape(dir .. "/.env.prod"))
+    vim.cmd("redraw!")
+    local s = all_screen()
+    assert.truthy(s:find("KEY01=*", 1, true), "diff fold line drawn with its mask")
+    assert.falsy(s:find("topsecret", 1, true), "diff folds")
+    vim.cmd("diffoff!")
+    vim.cmd("split") -- inherits the cloaked window's local options
+    require("slop").cloak.disable()
+    for _, w in ipairs(api.nvim_list_wins()) do
+      assert.equal("foldtext()", vim.wo[w].foldtext, "foldtext restored in window " .. w)
+      assert.is_true(vim.wo[w].wrap, "wrap restored in window " .. w)
+    end
+  end)
+
+  it("a pattern that throws anyway masks its whole line (screen and AI) and is reported once", function()
+    local msgs = {}
+    vim.notify = function(m)
+      msgs[#msgs + 1] = m
+    end
+    local P = require("slop.modules.cloak.patterns")
+    local orig = P.match_line
+    P.match_line = function(line, ...)
+      if line:find("boom", 1, true) then
+        error("malformed pattern (simulated)")
+      end
+      return orig(line, ...)
+    end
+    local ok, err = pcall(function()
+      open(".env", "A=fine\nboom TOKEN hunter2\nB=x\n")
+      vim.cmd("redraw!")
+      vim.cmd("redraw!")
+      assert.are.same({ "A=****", "******************", "B=*" }, screen(3))
+      -- the provider core.secrets redacts with fails closed too (no rule may silently stop redacting)
+      local spans = require("slop.core.secrets").spans(dir .. "/x.http", { "GET /", "boom x" })
+      assert.are.same({ { row = 1, col = 0, end_col = 6 } }, spans)
+    end)
+    P.match_line = orig
+    assert.is_true(ok, err)
+    vim.wait(20)
+    local reports = vim.tbl_filter(function(m)
+      return m:find("pattern error", 1, true) ~= nil
+    end, msgs)
+    assert.equal(2, #reports, "one per failing rule (.env rule, builtin .http rule)")
+  end)
+
+  it("'inccommand' is off while a : command is typed over a masked buffer", function()
+    open(".env", "A=alpha_secret\n")
+    -- :%s/=/: / would preview "A: alpha_secret", which no rule matches any more
+    vim.o.inccommand = "split"
+    local seen
+    vim.keymap.set("c", "<F7>", function()
+      seen = vim.o.inccommand
+    end)
+    h.feed(":s/=/: /<F7><Esc>")
+    assert.equal("", seen)
+    assert.equal("split", vim.o.inccommand, "restored when the cmdline is left")
+    assert.equal("A=alpha_secret", api.nvim_get_current_line())
+    vim.cmd.edit(vim.fn.fnameescape(dir .. "/notes.txt"))
+    h.feed(":s/a/b/<F7><Esc>")
+    assert.equal("split", seen, "other buffers keep the live preview")
+    vim.keymap.del("c", "<F7>")
+    vim.o.inccommand = "nosplit"
+  end)
+
+  for _, mode in ipairs({ "conceal", "overlay" }) do
+    it(("first frame of an fzf-lua preview swapped without autocmds is masked (%s)"):format(mode), function()
+      local cls = { preview_buf_post = function() end }
+      package.loaded["fzf-lua.previewer.builtin"] = { buffer_or_file = cls }
+      open("main.lua", "x\n", { cloak = { render = mode } })
+      local pwin = api.nvim_open_win(api.nvim_create_buf(false, true), false, {
+        relative = "editor",
+        row = 2,
+        col = 0,
+        width = 40,
+        height = 4,
+        border = "none",
+        style = "minimal",
+      })
+      for i = 1, 2 do
+        -- what fzf-lua does: fill a tmp buffer, swap it in under eventignore, set wrap globally, post
+        local tmp = api.nvim_create_buf(false, true)
+        api.nvim_buf_set_lines(tmp, 0, -1, false, { "KEY=supersecret" .. i, "LONG=" .. ("x"):rep(40) .. "TAILSECRET" })
+        vim.o.eventignore = "all"
+        api.nvim_win_set_buf(pwin, tmp)
+        vim.wo[pwin].wrap = true
+        vim.o.eventignore = ""
+        cls.preview_buf_post({ preview_bufnr = tmp }, { path = dir .. "/.env" })
+        vim.cmd("redraw")
+        vim.cmd("redraw") -- still before any vim.schedule() callback
+        local s = all_screen()
+        assert.falsy(s:find("supersecret", 1, true), "preview " .. i)
+        assert.falsy(s:find("TAILSECRET", 1, true), "preview " .. i)
+      end
+      package.loaded["fzf-lua.previewer.builtin"] = nil
+    end)
+  end
+
+  for _, len in ipairs({ false, 3 }) do
+    it(("conceal mode masks a noautocmd float before its conceallevel is set (cloak_length %s)"):format(len), function()
+      open("main.lua", "x\n", { cloak = { render = "conceal", cloak_length = len } })
+      h.write(dir .. "/.env", "KEY=supersecret\n")
+      local env = vim.fn.bufadd(dir .. "/.env")
+      vim.fn.bufload(env)
+      local w = api.nvim_open_win(env, false, {
+        relative = "editor",
+        row = 3,
+        col = 2,
+        width = 30,
+        height = 2,
+        style = "minimal",
+        border = "none",
+        noautocmd = true,
+      })
+      vim.cmd("redraw")
+      vim.cmd("redraw")
+      assert.equal(0, vim.wo[w].conceallevel, "not applied yet")
+      local s = all_screen()
+      assert.falsy(s:find("supersecret", 1, true))
+      assert.falsy(s:find("ersecret", 1, true), "an exact (cloak_length) mask is padded as an overlay")
+    end)
+  end
+
+  it("a display-only provider leaves buffers without spans alone (wrap, completion)", function()
+    require("slop").setup({})
+    require("slop.core.secrets").register({
+      name = "test_display_only",
+      display = true,
+      spans = function(_, lines, first_row)
+        local out = {}
+        for i, l in ipairs(lines) do
+          local s, e = l:find("SECRET%w+")
+          if s then
+            out[#out + 1] = { row = first_row + i - 1, col = s - 1, end_col = e }
+          end
+        end
+        return out
+      end,
+    })
+    local _, buf = open("main.lua", "local x = 1\n")
+    vim.wait(30)
+    assert.is_true(vim.wo.wrap)
+    assert.is_nil(vim.b[buf].completion)
+    open("notes.txt", "a SECRETabc b\n")
+    vim.wait(30)
+    assert.are.same({ "a ********* b" }, screen(1))
+    assert.is_false(vim.wo.wrap, "a buffer with a drawn display span gets the side effects")
+  end)
+
+  it("nobuflisted = true unlists cloaked buffers while masked, so <C-n> elsewhere skips them", function()
+    local _, buf = open(".env", "STRIPE=sk_live_abc\n", { cloak = { nobuflisted = true } })
+    vim.wait(30)
+    assert.is_false(vim.bo[buf].buflisted)
+    vim.cmd("enew")
+    vim.bo.complete = "b"
+    h.feed("isk_l<C-n><Esc>")
+    assert.equal("sk_l", api.nvim_get_current_line())
+    require("slop").cloak.disable()
+    assert.is_true(vim.bo[buf].buflisted, "listed again when the masks are off (buffer hidden)")
+  end)
+
+  it("overlay masks follow 'tabstop' changes, 'vartabstop' and ^X control characters", function()
+    open(".env", "TAB=ab\tcdefgh\nC=ab\1cdefXY\n")
+    assert.are.same({ "TAB=**********", "C=**********" }, screen(2))
+    vim.bo.tabstop = 24
+    vim.cmd("redraw!")
+    assert.falsy(all_screen():find("cdefgh", 1, true), "tabstop changed without an edit")
+    vim.bo.tabstop = 8
+    vim.bo.vartabstop = "4,30"
+    vim.cmd("redraw!")
+    assert.falsy(all_screen():find("cdefgh", 1, true), "vartabstop")
+  end)
+
+  it("attach(0, path) masks the current buffer right away", function()
+    open("main.lua", "x\n")
+    local pbuf = api.nvim_create_buf(false, true)
+    api.nvim_win_set_buf(0, pbuf)
+    api.nvim_buf_set_lines(pbuf, 0, -1, false, { "TOKEN=abcdef" })
+    vim.cmd("redraw")
+    require("slop").cloak.attach(0, dir .. "/.env")
+    vim.cmd("redraw") -- a normal redraw: attach() must have marked the window itself
+    assert.are.same({ "TOKEN=******" }, screen(1))
+    assert.is_false(vim.wo.wrap)
+  end)
+
+  it("live setup(): render mode options are swapped, cloak_on_leave and fzf_lua re-applied", function()
+    local function count(event, pattern)
+      return #api.nvim_get_autocmds({ group = "slop.cloak", event = event, pattern = pattern })
+    end
+    local _, buf = open(".env", "A=secret\n", { cloak = { render = "conceal" } })
+    assert.equal(2, vim.wo.conceallevel)
+    require("slop").setup({
+      cloak = { render = "overlay", cloak_on_leave = true, fzf_lua = false, cloak_telescope = false },
+    })
+    assert.equal(0, vim.wo.conceallevel, "conceal options restored after switching to overlay")
+    assert.equal("", vim.wo.concealcursor)
+    assert.is_false(vim.wo.wrap)
+    assert.is_nil(require("slop.modules.cloak.render")._state.fallback_path)
+    assert.equal(0, count("FileType", "fzf"))
+    assert.equal(0, count("User", "TelescopePreviewerLoaded"))
+    require("slop").cloak.disable()
+    vim.cmd("enew")
+    assert.is_true(require("slop").cloak.is_enabled(buf), "cloak_on_leave turned on live")
+    require("slop").setup({ cloak = { fzf_lua = true } })
+    assert.equal(1, count("FileType", "fzf"))
+    assert.equal(1, count("User", "TelescopePreviewerLoaded"))
+    assert.equal(0, count("BufWinLeave"), "cloak_on_leave turned off live")
+    assert.not_nil(require("slop.modules.cloak.render")._state.fallback_path)
   end)
 end)
