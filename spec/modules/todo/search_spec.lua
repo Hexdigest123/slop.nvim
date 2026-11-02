@@ -147,6 +147,91 @@ describe("todo search", function()
     seen.opts.on_select(nil)
   end)
 
+  it("qf and the picker show secrets of cloaked / blocked files redacted", function()
+    require("slop").setup({
+      todo = { search = { backend = "lua" } },
+      cloak = { patterns = { { file_pattern = "*.yaml", cloak_pattern = "(password: )%S+", replace = "%1" } } },
+    })
+    local p = h.tmpdir("todo-redact")
+    h.write(p .. "/app.yaml", "password: s3cr3t # FIXME: rotate\n")
+    h.write(p .. "/deploy/credentials.txt", "TODO: rotate token abc123\n")
+    h.write(p .. "/main.lua", "-- TODO: normal\n")
+    todo.qf({ root = p, open = false })
+    assert.is_true(vim.wait(5000, function()
+      return #vim.fn.getqflist() == 3
+    end))
+    assert.are.same(
+      { "password: <redacted> # FIXME: rotate", "<redacted>", "-- TODO: normal" },
+      vim.tbl_map(function(i)
+        return i.text
+      end, vim.fn.getqflist())
+    )
+    local seen
+    package.loaded["slop.core.ui.picker"] = {
+      pick = function(items, opts)
+        items(function(list)
+          seen = { list = list, opts = opts }
+        end)
+      end,
+    }
+    todo.list({ root = p })
+    assert.is_true(vim.wait(5000, function()
+      return seen ~= nil
+    end))
+    assert.are.same(
+      { " rotate", " <redacted>", " normal" },
+      vim.tbl_map(function(r)
+        return seen.opts.format(r)[4][1]
+      end, seen.list)
+    )
+    assert.equal("TODO: rotate token abc123", seen.list[2].line, "search() results stay raw")
+  end)
+
+  it("user rg / git configuration does not change the parsed output", function()
+    if vim.fn.executable("rg") == 0 or vim.fn.executable("git") == 0 then
+      return pending("rg or git not installed")
+    end
+    local rc = h.tmpdir("rgrc") .. "/ripgreprc"
+    h.write(rc, "--column\n--trim\n--max-columns=10\n")
+    local old = vim.env.RIPGREP_CONFIG_PATH
+    vim.env.RIPGREP_CONFIG_PATH = rc
+    local ok, res = pcall(search, { backend = "rg" })
+    vim.env.RIPGREP_CONFIG_PATH = old
+    assert.is_true(ok, res)
+    assert.are.same(EXPECTED, short(res))
+    h.write(root .. "/.gitignore", ".hidden/\nbin.dat\n")
+    vim.system({ "git", "init", "-q" }, { cwd = root }):wait()
+    vim.system({ "git", "config", "grep.column", "true" }, { cwd = root }):wait()
+    vim.system({ "git", "config", "grep.fullName", "true" }, { cwd = root }):wait()
+    assert.are.same(EXPECTED, short(search({ backend = "git" })))
+  end)
+
+  it("all backends skip the same files (ignored, hidden, node_modules, > 1 MiB) and agree on boundaries", function()
+    if vim.fn.executable("rg") == 0 or vim.fn.executable("git") == 0 then
+      return pending("rg or git not installed")
+    end
+    local p = h.tmpdir("todo-parity")
+    h.write(p .. "/.gitignore", "build/\n")
+    h.write(p .. "/src/a.lua", "-- TODO: kept\n")
+    h.write(p .. "/src/uni.txt", "éTODO: after a non-ASCII letter\n")
+    h.write(p .. "/.github/ci.yml", "# TODO: hidden, tracked\n")
+    h.write(p .. "/build/gen.c", "// TODO: gitignored\n")
+    h.write(p .. "/node_modules/x/i.js", "// TODO: node_modules\n")
+    h.write(p .. "/src/big.c", "// TODO: big\n" .. ("x"):rep(1024 * 1024) .. "\n")
+    vim.system({ "git", "init", "-q" }, { cwd = p }):wait()
+    vim.system({ "git", "add", "-A" }, { cwd = p }):wait()
+    for _, backend in ipairs({ "rg", "git", "lua" }) do
+      local r = search({ backend = backend, root = p })
+      assert.are.same(
+        { "src/a.lua:1:4 TODO kept", "src/uni.txt:1:3 TODO after a non-ASCII letter" },
+        vim.tbl_map(function(x)
+          return ("%s:%d:%d %s %s"):format(vim.fs.relpath(p, x.path), x.lnum, x.col, x.keyword, x.message)
+        end, r),
+        backend
+      )
+    end
+  end)
+
   it(":Slop todo qf KEYWORDS and completion", function()
     vim.cmd.cd(root)
     require("slop").setup({ todo = { search = { backend = "lua" } } })

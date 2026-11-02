@@ -172,8 +172,10 @@ Comment check (`highlight.comments_only = true`):
 - With a treesitter parser (no need for treesitter highlighting to be on),
   the keyword must be inside a node whose type contains "comment" (`comment`,
   `line_comment`, `comment_content`, ...), injected languages included. The
-  comment text highlight stops where the comment node ends, e.g. before `*/`
-  in `/* TODO: x */ code`.
+  comment text highlight stops where the comment node ends, e.g. after the
+  `*/` of `/* TODO: x */ code` (`code` is not highlighted). Only the rows the
+  treesitter highlighter parses anyway are parsed, so todo highlighting
+  never makes it re-parse injected languages.
 - Without a parser, the 'commentstring' leader (`--`, `//`, `#`, ...) must
   appear before the keyword on the same line, or the line must continue a
   block comment (` * TODO: x`). The text highlight stops at the block end.
@@ -196,14 +198,32 @@ when they scroll into view.
 `:Slop todo list` and `:Slop todo qf` search the project root
 (|slop-project|) of the current buffer. With `search.backend = "auto"`:
 
-1. `rg` when it is installed (respects .gitignore, skips hidden and binary
-   files; `search.args` are passed to it),
+1. `rg` when it is installed (`search.args` are passed to it),
 2. else `git grep --untracked` inside a git repository,
-3. else an asynchronous Lua walk (skips hidden entries, node_modules, binary
-   files and files over 1 MiB).
+3. else an asynchronous Lua walk.
 
-All backends find the same todos; the search does not check for comments
-(files are not parsed).
+Every backend skips the same files: ignored ones (`.gitignore`,
+`.git/info/exclude` and git's global excludes, inside a git repository),
+hidden entries (names starting with `.`, at any depth), `node_modules`,
+files over 1 MiB and binary files. Your rg/git configuration
+(`RIPGREP_CONFIG_PATH`, `grep.column`, ...) does not change the results. The
+search does not check for comments (files are not parsed).
+
+What still differs between the backends:
+- `search.args` only reach rg (e.g. `--hidden` searches hidden files with rg
+  only).
+- Binary files: rg skips a file with a NUL byte anywhere; git grep and the
+  Lua walk look for one in the first 8000 bytes.
+- `.ignore` and `.rgignore` files are only read by rg.
+- A file that is tracked although it matches `.gitignore`: rg skips it, git
+  grep and the Lua walk search it.
+- Git submodules: rg searches them, git grep and the Lua walk inside a
+  repository do not.
+
+The quickfix list and the picker show lines and messages redacted by
+|slop-secrets| (`<redacted>`), like the text sent to AI, so a todo next to a
+secret or in a blocked file does not put the secret on screen.
+`todo.search()` results stay raw.
 
 ==============================================================================
 8. LUA API                                                     *slop-todo-api*
@@ -239,7 +259,8 @@ jump {opts}: `keywords`, `wrap` (default 'wrapscan'), `count` (default
 `SlopTodoKeyword`       stacked on the keyword for the badge (bold, reverse)
 
 A configured `color` replaces the default link; otherwise colorschemes can
-set these groups.
+set these groups. Changing a `color` with a later `setup()` applies right
+away.
 
 `User SlopTodoToggled`   data `{ enabled }`
 

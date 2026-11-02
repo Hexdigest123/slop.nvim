@@ -100,17 +100,32 @@ describe("todo keywords", function()
 
   it("search regexes match exactly what the Lua matcher matches", function()
     local rg, ere = K.patterns({ TODO = true, FIX = true, FIXME = true })
-    assert.equal([[\b(FIXME|TODO|FIX)(:|\([^)]*\))]], rg)
+    -- ASCII word boundary like the Lua matcher's [%w_] (rg's plain \b is Unicode-aware)
+    assert.equal([[(?-u:\b)(FIXME|TODO|FIX)(:|\([^)]*\))]], rg)
     assert.equal([[(^|[^[:alnum:]_])(FIXME|TODO|FIX)(:|\([^)]*\))]], ere)
-    local lines = { "x -- TODO: a", "FIX(bob) b", "-- TODO c", "MYTODO: d", "FIXME:e" }
+    local lines = { "x -- TODO: a", "FIX(bob) b", "-- TODO c", "MYTODO: d", "FIXME:e", "éTODO: f" }
     local tmp = h.tmpdir("todo-re") .. "/f.txt"
     h.write(tmp, table.concat(lines, "\n") .. "\n")
-    local res = vim.system({ "grep", "-nE", ere, tmp }, { text = true }):wait()
-    local got = {}
-    for l in vim.gsplit(vim.trim(res.stdout), "\n") do
-      got[#got + 1] = tonumber(l:match("^(%d+):"))
+    local want = {}
+    for i, l in ipairs(lines) do
+      if #K.match(l, kw.by_word) > 0 then
+        want[#want + 1] = i
+      end
     end
-    assert.are.same({ 1, 2, 5 }, got)
+    assert.are.same({ 1, 2, 5, 6 }, want)
+    local function lnums(cmd, env)
+      local got = {}
+      local res = vim.system(cmd, { text = true, env = env }):wait()
+      for l in vim.gsplit(vim.trim(res.stdout), "\n") do
+        got[#got + 1] = tonumber(l:match("^(%d+):"))
+      end
+      return got
+    end
+    -- the git backend runs with LC_ALL=C: [:alnum:] is ASCII then
+    assert.are.same(want, lnums({ "grep", "-nE", ere, tmp }, { LC_ALL = "C" }))
+    if vim.fn.executable("rg") == 1 then
+      assert.are.same(want, lnums({ "rg", "--no-config", "-n", "-e", rg, tmp }))
+    end
   end)
 
   it("color_def: color name (first existing group), highlight group, #hex", function()

@@ -67,6 +67,7 @@ for name, kw in pairs(M.defaults) do
 end
 
 local forced = {} ---@type table<string, boolean>  built-in groups whose configured color replaced the link
+local custom = {} ---@type table<string, vim.api.keyset.highlight>  user groups: definition last applied
 
 --- Validation errors of a user `keywords` table (paths relative to the module).
 ---@param keywords any
@@ -176,7 +177,13 @@ function M.apply_highlights(kw, colors)
     local def = M.color_def(g.color, colors)
     local builtin = M.highlights[g.hl]
     if not builtin then
+      local changed = custom[g.hl] ~= nil and not vim.deep_equal(custom[g.hl], def)
+      custom[g.hl] = def
       util.hl({ [g.hl] = def, [g.hl_text] = { link = g.hl } })
+      if changed then
+        -- a later setup() changed the color: `default = true` would keep the previous definition
+        vim.api.nvim_set_hl(0, g.hl, def)
+      end
     elseif not vim.deep_equal(def, builtin) then
       forced[g.hl] = true
       vim.api.nvim_set_hl(0, g.hl, def)
@@ -278,7 +285,8 @@ function M.match(line, words)
   return out
 end
 
---- Search regexes for the given words: rust-regex (rg) and POSIX ERE (git grep -E).
+--- Search regexes for the given words: rust-regex (rg) and POSIX ERE (git grep -E, run with LC_ALL=C). Both
+--- use ASCII word boundaries like M.match's [%w_] (rg's \b is Unicode-aware: "éTODO:" would not match).
 ---@param words table<string, any>
 ---@return string rg, string ere
 function M.patterns(words)
@@ -287,7 +295,7 @@ function M.patterns(words)
     return #a > #b or (#a == #b and a < b)
   end)
   local alt = table.concat(list, "|")
-  return ([[\b(%s)(:|\([^)]*\))]]):format(alt), ([[(^|[^[:alnum:]_])(%s)(:|\([^)]*\))]]):format(alt)
+  return ([[(?-u:\b)(%s)(:|\([^)]*\))]]):format(alt), ([[(^|[^[:alnum:]_])(%s)(:|\([^)]*\))]]):format(alt)
 end
 
 return M

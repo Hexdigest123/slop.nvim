@@ -307,6 +307,53 @@ describe("todo render", function()
     assert.not_nil(items(0, 0, 1)[1])
     vim.cmd("doautocmd ColorScheme")
     assert.equal(0xff0000, api.nvim_get_hl(0, { name = "SlopTodoTodo" }).fg)
+    -- a later setup() changing a user group's color applies right away (not only after :colorscheme)
+    require("slop").setup({ todo = { keywords = { SAFETY = { color = "#00ff00", icon = "!" } } } })
+    assert.equal(0x00ff00, api.nvim_get_hl(0, { name = "SlopTodoSafety" }).fg)
+    vim.cmd("doautocmd ColorScheme")
+    assert.equal(0x00ff00, api.nvim_get_hl(0, { name = "SlopTodoSafety" }).fg)
+  end)
+
+  it("parses only the highlighter's ranges: edits cause no extra injected-tree re-parses", function()
+    local L = { "local M = {}" }
+    for i = 1, 30 do
+      L[#L + 1] = ('vim.cmd("highlight G%d guifg=#%06x")'):format(i, i)
+      L[#L + 1] = ("local y%d = %d -- TODO: tidy %d"):format(i, i, i)
+    end
+    vim.g._ts_force_sync_parsing = true
+    local buf = open("inj.lua", table.concat(L, "\n") .. "\n")
+    vim.treesitter.start(buf, "lua")
+    vim.fn.winrestview({ topline = 25, lnum = 35, col = 2 })
+    vim.cmd("redraw!")
+    local LT = getmetatable(vim.treesitter.get_parser(buf)).__index
+    local orig, reparsed = LT._parse_regions, 0
+    LT._parse_regions = function(self, ...)
+      local changes, n, t = orig(self, ...)
+      if self:lang() == "vim" then
+        reparsed = reparsed + (n or 0)
+      end
+      return changes, n, t
+    end
+    local function edits()
+      reparsed = 0
+      for _ = 1, 5 do
+        local line = api.nvim_buf_get_lines(buf, 34, 35, false)[1]
+        local c = line:find(" =", 1, true) -- inside "local yN", a row without an injection
+        api.nvim_buf_set_text(buf, 34, c - 1, 34, c - 1, { "x" })
+        vim.cmd("redraw")
+      end
+      return reparsed
+    end
+    local ok, res = pcall(function()
+      local with = edits()
+      todo.disable()
+      return { with, edits() }
+    end)
+    LT._parse_regions = orig
+    vim.g._ts_force_sync_parsing = nil
+    assert.is_true(ok, res)
+    assert.truthy(res[2] > 0, "the highlighter re-parses some injections anyway")
+    assert.equal(res[2], res[1], "todo highlighting adds none")
   end)
 
   it("rejects invalid config", function()

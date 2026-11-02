@@ -124,9 +124,36 @@ end
 
 ---@class slop.todo.Ctx
 ---@field buf integer
----@field first integer   rows parsed lazily on the first check
+---@field first integer   rows whose lines are fetched (incl. the multiline look-back above `top`)
 ---@field last integer
+---@field top? integer    rows that must be parsed (default first..last), parsed lazily on the first check
+---@field bot? integer
 ---@field parsed? boolean
+
+--- Ranges to parse: exactly the treesitter highlighter's (each window of the tabpage showing `buf`, w0-1 ..
+--- w$+1, see TSHighlighter._on_start), plus top..bot when no window shows them. 0.12 drops injected trees
+--- outside a partial parse's ranges, so any other range would make the highlighter re-parse them next redraw.
+---@param buf integer
+---@param top integer
+---@param bot integer
+---@return Range2[]
+local function parse_ranges(buf, top, bot)
+  local ranges, covered = {}, false
+  for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_buf(w) == buf then
+      local s, e = vim.fn.line("w0", w) - 1, vim.fn.line("w$", w) + 1
+      ranges[#ranges + 1] = { s, e }
+      covered = covered or (top >= s and bot < e)
+    end
+  end
+  if not covered then
+    ranges[#ranges + 1] = { top, bot + 1 }
+  end
+  table.sort(ranges, function(a, b)
+    return a[1] < b[1]
+  end)
+  return ranges
+end
 
 --- Is (row, col) in a comment? Second value: comment end column on that row (nil = end of line).
 ---@param ctx slop.todo.Ctx
@@ -142,7 +169,7 @@ local function comment_at(ctx, row, col, line)
   if parser then
     if not ctx.parsed then
       ctx.parsed = true
-      pcall(parser.parse, parser, { ctx.first, ctx.last + 1 })
+      pcall(parser.parse, parser, parse_ranges(ctx.buf, ctx.top or ctx.first, ctx.bot or ctx.last))
     end
     return ts_comment(parser, row, col)
   end
@@ -367,7 +394,7 @@ local function reconcile_signs(buf, st, top, bot)
     table.insert(have[m[2]], { id = m[1], hl = m[4].sign_hl_group, invalid = m[4].invalid })
   end
   local first = first_row(top)
-  local ctx = { buf = buf, first = first, last = bot }
+  local ctx = { buf = buf, first = first, last = bot, top = top, bot = bot }
   local get = lines_getter(buf, first, bot)
   for row = top, bot do
     if st.signed[row] ~= st.tick then
@@ -456,7 +483,7 @@ local function on_win(_, win, buf, top, bot)
     return false
   end
   local first = first_row(top)
-  local ctx = { buf = buf, first = first, last = bot }
+  local ctx = { buf = buf, first = first, last = bot, top = top, bot = bot }
   local get = lines_getter(buf, first, bot)
   local nsh = ns()
   for row = top, bot do
@@ -495,7 +522,7 @@ function M.items(buf, srow, erow)
     return out
   end
   local first = first_row(srow)
-  local ctx = { buf = buf, first = first, last = erow }
+  local ctx = { buf = buf, first = first, last = erow, top = srow, bot = erow }
   local get = lines_getter(buf, first, erow)
   for row = srow, erow do
     local items = row_items(st, ctx, row, get)

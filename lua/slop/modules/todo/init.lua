@@ -60,6 +60,28 @@ function api.search(opts, cb)
   require("slop.modules.todo.search").run(opts, words_for(opts.keywords), cb)
 end
 
+local shown_cache = setmetatable({}, { __mode = "k" }) ---@type table<slop.todo.Result, string[]>
+
+--- Line and message of a result as the quickfix list / picker show them: redacted by core.secrets, so a todo
+--- on a secret's line (or in a blocked file) does not put the secret on screen.
+---@param r slop.todo.Result
+---@return string line, string message
+local function shown(r)
+  local c = shown_cache[r]
+  if not c then
+    local red = (require("slop.core.secrets").redact_lines(r.path, { r.line }, r.lnum - 1))[1] or r.line
+    c = { r.line, r.message }
+    if red ~= r.line then
+      local words = {} ---@type table<string, any>
+      words[r.keyword] = true
+      local m = keywords.match(red, words)[1]
+      c = { red, m and m.message or vim.trim(red) }
+    end
+    shown_cache[r] = c
+  end
+  return c[1], c[2]
+end
+
 ---@param r slop.todo.Result
 ---@param root string
 ---@return slop.picker.Chunks
@@ -67,11 +89,12 @@ local function format(r, root)
   local g = state.kw and state.kw.groups[r.group]
   local hl = g and g.hl or "Comment"
   local rel = vim.fs.relpath(root, r.path) or vim.fn.fnamemodify(r.path, ":~")
+  local _, message = shown(r)
   return {
     { (g and g.icon ~= "" and g.icon or "") .. r.keyword, hl },
     { " " },
     { ("%s:%d"):format(rel, r.lnum), "SlopDim" },
-    { " " .. r.message },
+    { " " .. message },
   }
 end
 
@@ -131,7 +154,7 @@ function api.qf(opts)
     end
     local items = {}
     for _, r in ipairs(results) do
-      items[#items + 1] = { filename = r.path, lnum = r.lnum, col = r.col, text = vim.trim(r.line) }
+      items[#items + 1] = { filename = r.path, lnum = r.lnum, col = r.col, text = vim.trim((shown(r))) }
     end
     vim.fn.setqflist({}, " ", { title = "slop todo", items = items })
     if #items == 0 then
