@@ -4,6 +4,8 @@
 --- Rules: never blocks (vim.system; callbacks run on the main loop); body goes via stdin
 --- (`--data-binary @-`, never argv); `--globoff`; metadata from `-w '%{json}'` (no stderr parsing of -v output);
 --- optional cookie jar (`-b/-c <path>`); every request is cancellable and has a timeout.
+--- Every curl run (M.curl) starts with `-q` (~/.curlrc is ignored) and gets its `-H` values from a 0600 file in
+--- Neovim's private temp dir (`-H @file`), so API keys never appear on argv (ps, /proc/<pid>/cmdline).
 ---
 --- request() layout of a curl run:
 ---   stdout  = response body (streamed through a decoder when `stream` is set)
@@ -342,7 +344,104 @@ end
 ---@field on_exit fun(code: integer, stdout: string, stderr: string, signal: integer)  main loop; not called after cancel()
 ---@field on_cancel? fun()                      main loop, right after cancel()
 
---- Low-level: run curl with raw args (used by request() and by rest's runner).
+-- curl options that take a value: the value must not be mistaken for an option when looking for `-H`
+local SHORT_VALUE = "XHdFbcoDwuUAeTKxmErzYyQPtC"
+local LONG_VALUE_NAMES = [[
+  request header data data-binary data-raw data-ascii data-urlencode json form form-string cookie
+  cookie-jar output dump-header write-out url user proxy-user user-agent referer upload-file config proxy
+  max-time connect-timeout max-redirs cacert capath cert cert-type key key-type pass resolve connect-to
+  interface limit-rate retry retry-delay retry-max-time oauth2-bearer unix-socket abstract-unix-socket
+  proxy-header aws-sigv4 range time-cond variable url-query expect100-timeout keepalive-time local-port
+  dns-servers ciphers tls-max stderr trace trace-ascii netrc-file speed-limit speed-time quote hsts
+  alt-svc etag-save etag-compare preproxy proxy-cacert noproxy max-filesize output-dir request-target
+  continue-at telnet-option ftp-port socks5 socks5-hostname
+]]
+local LONG_VALUE = {}
+for o in LONG_VALUE_NAMES:gmatch("%S+") do
+  LONG_VALUE["--" .. o] = true
+end
+
+--- Split curl args into the argv without the `-H` values and those values (`-H @file` references stay).
+---@param args string[]
+---@return string[] argv, string[] headers
+local function take_headers(args)
+  local argv, headers, i = {}, {}, 1
+  local function header(flag, v)
+    if v == nil or v:sub(1, 1) == "@" then
+      argv[#argv + 1] = flag
+      argv[#argv + 1] = v
+    else
+      headers[#headers + 1] = v
+    end
+  end
+  while i <= #args do
+    local a = args[i]
+    if a == "-H" or a == "--header" then
+      header(a, args[i + 1])
+      i = i + 1
+    elseif LONG_VALUE[a] then
+      vim.list_extend(argv, { a, args[i + 1] })
+      i = i + 1
+    elseif a:match("^%-[^-]") then
+      -- short cluster ("-sS", "-sSX" + value, "-XPOST", "-HX: 1"): the first letter taking a value consumes the
+      -- rest of the cluster, or the next argument when it is the last letter
+      local p = 2
+      while p <= #a and not SHORT_VALUE:find(a:sub(p, p), 1, true) do
+        p = p + 1
+      end
+      local letter, attached = a:sub(p, p), a:sub(p + 1)
+      if p > #a then
+        argv[#argv + 1] = a
+      elseif letter == "H" then
+        if p > 2 then
+          argv[#argv + 1] = a:sub(1, p - 1)
+        end
+        if attached ~= "" then
+          header("-H", attached)
+        else
+          header("-H", args[i + 1])
+          i = i + 1
+        end
+      else
+        argv[#argv + 1] = a
+        if attached == "" then
+          argv[#argv + 1] = args[i + 1]
+          i = i + 1
+        end
+      end
+    else
+      argv[#argv + 1] = a
+    end
+    i = i + 1
+  end
+  return argv, headers
+end
+
+--- Write header lines to a new 0600 file in Neovim's private temp dir (curl reads it via `-H @file`).
+---@param headers string[]
+---@return string? path, string? err
+local function header_file(headers)
+  local path = vim.fn.tempname()
+  local fd, err = uv.fs_open(path, "w", 384) -- 0600
+  if not fd then
+    return nil, err
+  end
+  local lines = {}
+  for i, h in ipairs(headers) do
+    lines[i] = (h:gsub("[\r\n]+", " ")) -- one header per line (LF only: curl keeps a CR in the value)
+  end
+  local ok, werr = uv.fs_write(fd, table.concat(lines, "\n") .. "\n")
+  uv.fs_close(fd)
+  if not ok then
+    os.remove(path)
+    return nil, werr
+  end
+  return path
+end
+
+--- Low-level: run curl with raw args (used by request() and by rest's runner). Call from the main loop.
+--- `-q` is prepended (~/.curlrc is ignored) and every `-H <value>` is passed through a private 0600 header file
+--- (`-H @file`, removed when the run ends), so header values (API keys) never show up on curl's argv.
 ---@param args string[]                          curl arguments (without "curl")
 ---@param opts slop.http.CurlOpts
 ---@return slop.http.Handle
@@ -352,6 +451,17 @@ function M.curl(args, opts)
   local active = true
   local proc ---@type vim.SystemObj?
   local out, err = {}, {}
+  local argv, headers = take_headers(args)
+  local hfile, herr ---@type string?, string?
+  if #headers > 0 then
+    hfile, herr = header_file(headers)
+  end
+  local function cleanup()
+    if hfile then
+      os.remove(hfile)
+      hfile = nil
+    end
+  end
 
   function handle:is_active()
     return active
@@ -365,10 +475,24 @@ function M.curl(args, opts)
     if proc then
       pcall(proc.kill, proc, 15)
     end
+    cleanup()
     if opts.on_cancel then
       vim.schedule(opts.on_cancel)
     end
   end
+
+  if herr then
+    active = false
+    vim.schedule(function()
+      opts.on_exit(-1, "", "spawn failed: cannot write the curl header file: " .. tostring(herr), 0)
+    end)
+    return handle
+  end
+  local cmd = { "curl", "-q" } -- must stay the first argument
+  if hfile then
+    vim.list_extend(cmd, { "-H", "@" .. hfile })
+  end
+  vim.list_extend(cmd, argv)
 
   local sys_opts = {
     stdin = opts.stdin,
@@ -396,7 +520,8 @@ function M.curl(args, opts)
       end
     end,
   }
-  local ok, res = pcall(vim.system, vim.list_extend({ "curl" }, args), sys_opts, function(r)
+  local ok, res = pcall(vim.system, cmd, sys_opts, function(r)
+    cleanup()
     vim.schedule(function()
       if not active then
         return
@@ -406,6 +531,7 @@ function M.curl(args, opts)
     end)
   end)
   if not ok then
+    cleanup()
     active = false
     vim.schedule(function()
       opts.on_exit(-1, "", "spawn failed: " .. tostring(res), 0)
@@ -488,9 +614,12 @@ function M.request(opts)
   local decode ---@type fun(data: string?)?
   local raw_body = {}
   local raw_size = 0
+  -- not handle:is_active(): curl's handle is already inactive when on_exit flushes the decoder (the final event
+  -- of a stream without a trailing blank line / newline must still be delivered)
+  local cancelled = false
   if opts.stream then
     local function emit(chunk)
-      if done or not handle:is_active() or not opts.on_chunk then
+      if done or cancelled or not opts.on_chunk then
         return
       end
       local ok, cb_err = pcall(opts.on_chunk, chunk, handle)
@@ -554,7 +683,12 @@ function M.request(opts)
       if code == -1 then
         return finish(nil, { kind = "spawn", message = "could not run curl: " .. errtext })
       end
-      if code == 28 or (code ~= 0 and signal ~= 0) or code == 124 then
+      -- killed by a signal that is not our own timeout (OOM killer, pkill): luv reports code 0 for it, so the
+      -- truncated output must not pass as a success
+      if signal ~= 0 and code ~= 124 then
+        return finish(nil, { kind = "curl", message = ("curl was killed by signal %d"):format(signal), code = code })
+      end
+      if code == 28 or code == 124 then
         return finish(nil, {
           kind = "timeout",
           message = ("timed out after %s ms"):format(timeout),
@@ -575,6 +709,11 @@ function M.request(opts)
       finish(res, nil)
     end,
   })
+  local curl_cancel = handle.cancel
+  function handle:cancel()
+    cancelled = true
+    return curl_cancel(self)
+  end
   return handle
 end
 

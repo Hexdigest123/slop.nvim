@@ -281,5 +281,224 @@ describe("core.http", function()
       end)
       assert.are.same({ 0, "raw!" }, got)
     end)
+
+    it("delivers a final SSE event / NDJSON line that has no trailing newline", function()
+      srv = mock.start(function(_, res)
+        res.stream(200, { "data: a\n\n", "data: b" })
+      end)
+      local chunks = {}
+      local out = run({
+        url = srv.url,
+        stream = "sse",
+        on_chunk = function(ev)
+          chunks[#chunks + 1] = ev.data
+        end,
+      })
+      assert.is_nil(out.err)
+      assert.are.same({ "a", "b" }, chunks)
+      srv.stop()
+      srv = mock.start(function(_, res)
+        res.stream(200, { '{"n":1}\n', '{"n":2}' }, { headers = { ["Content-Type"] = "application/x-ndjson" } })
+      end)
+      local objs = {}
+      run({
+        url = srv.url,
+        stream = "ndjson",
+        on_chunk = function(o)
+          objs[#objs + 1] = o.n
+        end,
+      })
+      assert.are.same({ 1, 2 }, objs)
+    end)
+  end)
+
+  describe("curl invocation", function()
+    local real_system, calls
+    before_each(function()
+      -- record every spawned argv (and the process) while still running the real curl
+      real_system, calls = vim.system, {}
+      vim.system = function(cmd, opts, cb)
+        local call = { cmd = vim.deepcopy(cmd) }
+        calls[#calls + 1] = call
+        call.obj = real_system(cmd, opts, cb)
+        return call.obj
+      end
+    end)
+    after_each(function()
+      vim.system = real_system
+    end)
+
+    local function header_file(cmd)
+      for i, a in ipairs(cmd) do
+        if a == "-H" and (cmd[i + 1] or ""):sub(1, 1) == "@" then
+          return cmd[i + 1]:sub(2)
+        end
+      end
+    end
+
+    it("starts curl with -q and passes every -H value through a private file, never on argv", function()
+      srv = mock.start(function(req, res)
+        res.json(
+          200,
+          { key = req.headers["x-api-key"], auth = req.headers.authorization, empty = req.headers["x-empty"] }
+        )
+      end)
+      local args = http.build_args({
+        url = srv.url,
+        headers = { { "x-api-key", "sk-FAKE-argv-secret" }, { "Authorization", "Bearer tok-123" }, { "X-Empty", "" } },
+      })
+      local snapshot = vim.deepcopy(args)
+      local got, file, mode, content
+      http.curl(args, {
+        on_exit = function(code, stdout)
+          got = { code = code, body = vim.json.decode(stdout) }
+        end,
+      })
+      local cmd = calls[1].cmd
+      file = header_file(cmd)
+      local st = file and vim.uv.fs_stat(file)
+      mode = st and st.mode % 512
+      content = file and table.concat(vim.fn.readfile(file), "\n")
+      mock.wait(function()
+        return got ~= nil
+      end)
+      assert.equal("curl", cmd[1])
+      assert.equal("-q", cmd[2], "-q must be the first curl argument (~/.curlrc is ignored)")
+      for _, a in ipairs(cmd) do
+        assert.falsy(a:find("sk-FAKE", 1, true) or a:find("tok-123", 1, true), "secret on argv: " .. a)
+      end
+      assert.truthy(file, "no -H @file in " .. table.concat(cmd, " "))
+      assert.equal(384, mode, "header file must be 0600")
+      assert.equal("x-api-key: sk-FAKE-argv-secret\nAuthorization: Bearer tok-123\nX-Empty;", content)
+      assert.are.same(snapshot, args, "the caller's args are not modified")
+      assert.equal(0, got.code)
+      assert.are.same({ key = "sk-FAKE-argv-secret", auth = "Bearer tok-123", empty = "" }, got.body)
+      assert.is_nil(vim.uv.fs_stat(file), "header file removed after the run")
+    end)
+
+    it("finds -H in short clusters and does not take option values for -H", function()
+      srv = mock.start(function(req, res)
+        res.send(200, (req.headers["x-a"] or "-") .. "," .. (req.headers["x-b"] or "-"))
+      end)
+      local got
+      http.curl({ "-w", "|-H", "-HX-A: 1", "-sH", "X-B: 2", "--url", srv.url }, {
+        on_exit = function(_, stdout)
+          got = stdout
+        end,
+      })
+      mock.wait(function()
+        return got ~= nil
+      end)
+      assert.equal("1,2|-H", got)
+      local cmd = calls[1].cmd
+      assert.falsy(vim.tbl_contains(cmd, "-HX-A: 1") or vim.tbl_contains(cmd, "X-B: 2"))
+      assert.truthy(vim.tbl_contains(cmd, "|-H"), "-w value stays")
+      assert.truthy(vim.tbl_contains(cmd, "-s"), "the rest of the -sH cluster stays")
+    end)
+
+    it("removes the header file on cancel, timeout, HTTP error and spawn failure", function()
+      local function file_after(handler, extra)
+        srv = mock.start(handler)
+        local n = #calls
+        local done
+        local o = vim.tbl_extend("force", {
+          url = srv.url,
+          headers = { Authorization = "Bearer x" },
+          on_done = function(_, err)
+            done = err and err.kind or "ok"
+          end,
+        }, extra or {})
+        local hd = http.request(o)
+        local file = header_file(calls[n + 1].cmd)
+        assert.truthy(vim.uv.fs_stat(file), "header file exists while curl runs")
+        if o.cancel_after then
+          vim.wait(o.cancel_after)
+          hd:cancel()
+        end
+        mock.wait(function()
+          return done ~= nil
+        end, 5000)
+        srv.stop()
+        srv = nil
+        vim.wait(50)
+        return done, vim.uv.fs_stat(file)
+      end
+      local kind, st = file_after(function(_, res)
+        res.hang()
+      end, { cancel_after = 100 })
+      assert.equal("cancelled", kind)
+      assert.is_nil(st)
+      kind, st = file_after(function(_, res)
+        res.hang()
+      end, { timeout = 300 })
+      assert.equal("timeout", kind)
+      assert.is_nil(st)
+      kind, st = file_after(function(_, res)
+        res.json(401, {})
+      end)
+      assert.equal("http", kind)
+      assert.is_nil(st)
+      -- curl not on PATH: nothing is left behind either
+      local path, n = vim.env.PATH, #calls
+      vim.env.PATH = "/nonexistent"
+      local err
+      http.request({
+        url = "http://127.0.0.1:9/",
+        headers = { Authorization = "Bearer x" },
+        on_done = function(_, e)
+          err = e
+        end,
+      })
+      vim.env.PATH = path
+      mock.wait(function()
+        return err ~= nil
+      end)
+      assert.equal("spawn", err.kind)
+      local file = header_file(calls[n + 1].cmd)
+      assert.truthy(file)
+      assert.is_nil(vim.uv.fs_stat(file))
+    end)
+
+    it("ignores ~/.curlrc (--fail / --include / --verbose there do not change results)", function()
+      local home = h.tmpdir("curlhome")
+      vim.fn.writefile({ "--fail", "--include", "--verbose" }, home .. "/.curlrc")
+      srv = mock.start(function(_, res)
+        res.json(401, { error = { message = "bad key" } })
+      end)
+      local out = run({ url = srv.url, env = { CURL_HOME = home }, headers = { ["x-api-key"] = "sk-FAKE-rc" } })
+      assert.equal("http", out.err.kind)
+      assert.equal(401, out.err.code)
+      assert.equal("bad key", out.err.response:json().error.message)
+      srv.stop()
+      srv = mock.start(function(_, res)
+        res.stream(200, { "short" }, { headers = { ["Content-Length"] = "100" } })
+      end)
+      out = run({ url = srv.url, env = { CURL_HOME = home }, headers = { ["x-api-key"] = "sk-FAKE-rc" } })
+      assert.equal("curl", out.err.kind)
+      assert.falsy(out.err.message:find("sk-FAKE-rc", 1, true), "a verbose trace leaked the key into the error")
+    end)
+
+    it("reports a curl killed by a signal as an error, not as a truncated success", function()
+      srv = mock.start(function(_, res)
+        res.stream(200, { 'data: {"t":"partial"}\n\n' }, { hang = true })
+      end)
+      local out = {}
+      http.request({
+        url = srv.url,
+        stream = "sse",
+        on_chunk = function() end,
+        on_done = function(res, err)
+          out.res, out.err, out.n = res, err, (out.n or 0) + 1
+        end,
+      })
+      vim.wait(300)
+      vim.uv.kill(calls[1].obj.pid, "sigkill")
+      mock.wait(function()
+        return out.n ~= nil
+      end)
+      assert.is_nil(out.res)
+      assert.equal("curl", out.err.kind)
+      assert.matches("signal 9", out.err.message)
+    end)
   end)
 end)
