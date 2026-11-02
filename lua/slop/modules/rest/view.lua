@@ -39,7 +39,12 @@ end
 ---@return boolean
 function M.is_binary(body, ctype)
   local t = (ctype or ""):lower()
-  if t:match("^image/") or t:match("octet%-stream") or t:match("^audio/") or t:match("^video/") or t:match("pdf") then
+  -- image/svg+xml (like every +xml type) is text
+  local text = t:match("[/+]xml") ~= nil
+  if
+    not text
+    and (t:match("^image/") or t:match("octet%-stream") or t:match("^audio/") or t:match("^video/") or t:match("pdf"))
+  then
     return true
   end
   return body:sub(1, 1024):find("%z") ~= nil
@@ -236,15 +241,31 @@ function M.running(e)
   require("slop.core.ui.scratch").set_winbar(buf, M.winbar(e))
 end
 
---- Show a finished entry: { req, resolved?, res?, err?, env? }.
+--- The request shown as running will never finish (cancelled): say so in the winbar. Nothing is (re)opened.
+---@param msg string
+function M.stopped(msg)
+  if not (current and current.running) then
+    return
+  end
+  current = vim.tbl_extend("force", current, { running = false, err = msg })
+  local buf = require("slop.core.ui.scratch").find(M.NAME)
+  if buf then
+    require("slop.core.ui.scratch").set_winbar(buf, M.winbar(current))
+  end
+end
+
+--- Show a finished entry: { req, resolved?, res?, err?, env? } (with both err and res: the response is shown).
 ---@param e table
 ---@param on_shown? fun(buf: integer)
 function M.show(e, on_shown)
   current = e
+  -- a pretty-print of an older response still running must not overwrite this one
+  local token = {}
+  M._token = token
   local scratch = require("slop.core.ui.scratch")
   local buf = open()
   scratch.set_winbar(buf, M.winbar(e))
-  if e.err then
+  if e.err and not e.res then
     scratch.get(M.NAME, { filetype = "text" })
     local lines = vim.split(e.err, "\n", { plain = true })
     vim.list_extend(lines, { "", "(" .. (e.req.method or "") .. " " .. (e.req.url or "") .. ")" })
@@ -266,13 +287,13 @@ function M.show(e, on_shown)
     return
   end
   local ft = M.filetype(res.content_type)
-  local token = {}
-  M._token = token
   M.format(res.body, ft, cfg().result.format, function(text)
     if M._token ~= token or not api.nvim_buf_is_valid(buf) then
       return
     end
     scratch.get(M.NAME, { filetype = ft })
+    -- CRLF bodies would show ^M on every line; the final newline is not an extra empty line
+    text = text:gsub("\r\n", "\n"):gsub("\n$", "")
     scratch.set_lines(buf, vim.split(text, "\n", { plain = true }))
     render_headers(buf)
     if on_shown then

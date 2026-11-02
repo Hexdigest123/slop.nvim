@@ -26,9 +26,10 @@ M.TTL = 30 -- seconds
 ---@field files string[]        absolute .http/.rest paths, sorted
 ---@field env_files string[]    http-client(.private).env.json paths
 ---@field time number
+---@field env_names? string[]   env names of env_files (read once, for statuslines)
 
 local roots = {} ---@type table<string, slop.rest.Discovered>
-local parsed = {} ---@type table<string, {mtime: integer, size: integer, data: slop.rest.File}>
+local parsed = {} ---@type table<string, {mtime: integer, nsec: integer, size: integer, data: slop.rest.File}>
 
 ---@return table<string, boolean>, string[]
 local function cfg_sets()
@@ -91,6 +92,13 @@ function M.get(root, force)
   return d
 end
 
+--- The discovery of `root` if a scan already ran (possibly older than the TTL); never scans (statuslines).
+---@param root string
+---@return slop.rest.Discovered?
+function M.cached(root)
+  return roots[root]
+end
+
 --- Drop the cached file list (all roots, or one) and the parse cache of `file`.
 ---@param root? string
 ---@param file? string
@@ -105,13 +113,25 @@ function M.invalidate(root, file)
   end
 end
 
---- Loaded buffer for a path, if any.
----@param path string
+--- Loaded buffer of the file `path`: exact name match (vim.fn.bufnr() also accepts a buffer whose name merely
+--- matches the path as a pattern, e.g. "api.http.orig" for "api.http"), or the same file reached via a symlink.
+---@param path string  normalized absolute path
 ---@return integer?
-local function loaded_buf(path)
-  local nr = vim.fn.bufnr(path)
-  if nr > 0 and vim.api.nvim_buf_is_loaded(nr) then
-    return nr
+function M.loaded_buf(path)
+  local base, real = vim.fs.basename(path), nil
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) then
+      local name = vim.fs.normalize(vim.api.nvim_buf_get_name(b))
+      if name == path then
+        return b
+      end
+      if name ~= "" and vim.fs.basename(name) == base then
+        real = real or uv.fs_realpath(path) or false
+        if real and uv.fs_realpath(name) == real then
+          return b
+        end
+      end
+    end
   end
   return nil
 end
@@ -122,7 +142,7 @@ end
 function M.parse(path)
   path = vim.fs.normalize(path)
   local parser = require("slop.modules.rest.parser")
-  local buf = loaded_buf(path)
+  local buf = M.loaded_buf(path)
   if buf then
     return parser.parse(vim.api.nvim_buf_get_lines(buf, 0, -1, false), path)
   end
@@ -131,12 +151,13 @@ function M.parse(path)
     return { file = path, vars = {}, requests = {}, warnings = {} }
   end
   local c = parsed[path]
-  if c and c.mtime == stat.mtime.sec and c.size == stat.size then
+  -- nsec too: a rewrite within the same second with the same size (e.g. a changed password) is a new version
+  if c and c.mtime == stat.mtime.sec and c.nsec == stat.mtime.nsec and c.size == stat.size then
     return c.data
   end
   local text = require("slop.core.project").read_file(path) or ""
   local data = parser.parse(vim.split(text, "\n", { plain = true }), path)
-  parsed[path] = { mtime = stat.mtime.sec, size = stat.size, data = data }
+  parsed[path] = { mtime = stat.mtime.sec, nsec = stat.mtime.nsec, size = stat.size, data = data }
   return data
 end
 

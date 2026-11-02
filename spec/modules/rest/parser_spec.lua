@@ -91,6 +91,11 @@ local fixtures = {
     { { url = "/a", headers = { { "Accept", "x" } }, body = "body" } },
   },
   {
+    "UTF-8 BOM before the first line (file read from disk)",
+    "\239\187\191### Login\r\nGET /a",
+    { { title = "Login", name = "Login", url = "/a", start = 1 } },
+  },
+  {
     "blocks without a request line are not requests",
     "@a = 1\n# just a comment\n\n### empty\n\n### real\nGET /x",
     { { title = "real", url = "/x" } },
@@ -143,6 +148,18 @@ describe("rest parser", function()
     assert.matches("script blocks", out.warnings[1].msg)
     assert.matches("not supported", out.warnings[2].msg)
     assert.equal(2, #out.requests[1].warnings)
+  end)
+
+  it("a response redirect / handler right after the request line or headers is not the body", function()
+    local out = parse("GET /a\n>> ./out.json\n### b\nGET /b\nAccept: x\n> ./handler.js\n### c\nGET /c\n>>! ./o.json")
+    assert.equal(3, #out.requests)
+    for _, r in ipairs(out.requests) do
+      assert.is_nil(r.body, r.url)
+      assert.equal(1, #r.warnings, r.url)
+      assert.matches("not supported", r.warnings[1].msg)
+    end
+    assert.are.same({ { "Accept", "x" } }, out.requests[2].headers)
+    assert.equal(3, #out.warnings)
   end)
 
   it("warns about a missing blank line before the body (lenient)", function()

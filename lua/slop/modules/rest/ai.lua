@@ -40,8 +40,25 @@ Rules:
 
 -- Masking -------------------------------------------------------------------------------------------
 
-local SENSITIVE =
-  { "authorization", "cookie", "token", "secret", "password", "passwd", "api[-_]?key", "apikey", "session" }
+local SENSITIVE = {
+  "authorization",
+  "cookie",
+  "token",
+  "secret",
+  "password",
+  "passwd",
+  "api[-_]?key",
+  "apikey",
+  "session",
+  "credential",
+  "jwt",
+  "bearer",
+  "private[-_]?key",
+  "signature",
+}
+-- short words that are sensitive only as a whole part of a name ("X-Auth", "db_pass", "userPin"), not inside
+-- longer words ("author", "passenger", "keyboard", "spinner")
+local SENSITIVE_PARTS = { auth = true, pass = true, pwd = true, pw = true, pin = true, otp = true, key = true }
 
 ---@param name string
 ---@return boolean
@@ -52,7 +69,12 @@ function M.sensitive(name)
       return true
     end
   end
-  return n == "key" or n:match("[-_]key$") ~= nil
+  for part in name:gsub("(%l)(%u)", "%1_%2"):lower():gmatch("[^%-_%.%s]+") do
+    if SENSITIVE_PARTS[part] then
+      return true
+    end
+  end
+  return false
 end
 
 local PLACEHOLDER = "<redacted>"
@@ -72,16 +94,57 @@ function M.mask_headers(list)
   return out
 end
 
---- Mask JSON string values of sensitive keys and sensitive header / file-var lines in free text.
+--- Mask JSON string values of sensitive keys. Escape-aware: a `\"` inside the value does not end it.
+---@param text string
+---@return string
+local function mask_json(text)
+  local out, pos = {}, 1
+  while true do
+    local s, e, key = text:find('"([^"\\]*)"%s*:%s*"', pos)
+    if not s then
+      break
+    end
+    local i = e + 1
+    while i <= #text do
+      local c = text:byte(i)
+      if c == 92 then -- backslash: skip the escaped character
+        i = i + 2
+      elseif c == 34 then -- closing quote
+        break
+      else
+        i = i + 1
+      end
+    end
+    local value = text:sub(e + 1, i - 1)
+    out[#out + 1] = text:sub(pos, e)
+    out[#out + 1] = (M.sensitive(key) and not value:match("^{{.-}}$")) and PLACEHOLDER or value
+    if i <= #text then
+      out[#out + 1] = '"'
+    end
+    pos = i + 1
+  end
+  out[#out + 1] = text:sub(pos)
+  return table.concat(out)
+end
+
+--- Mask `name=value` pairs of sensitive names (query strings, form bodies, form-encoded responses).
+---@param line string
+---@return string
+local function mask_pairs(line)
+  return (
+    line:gsub("([%w%-_%.%[%]]+)=([^&%s;#\"',]*)", function(name, value)
+      if value ~= "" and M.sensitive(name) and not value:match("^{{.-}}$") then
+        return name .. "=" .. PLACEHOLDER
+      end
+    end)
+  )
+end
+
+--- Mask values of sensitive JSON fields, header lines, file variables and name=value pairs in free text.
 ---@param text string
 ---@return string
 function M.mask_text(text)
-  text = text:gsub('("([^"]-)"%s*:%s*)"([^"]*)"', function(prefix, key, value)
-    if M.sensitive(key) and not value:match("^{{.-}}$") then
-      return prefix .. '"' .. PLACEHOLDER .. '"'
-    end
-    return nil
-  end)
+  text = mask_json(text)
   local lines = {}
   for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
     local hname, hval = line:match("^([%w%-_]+)%s*:%s*(.+)$")
@@ -90,6 +153,8 @@ function M.mask_text(text)
       line = hname .. ": " .. PLACEHOLDER
     elseif vname and M.sensitive(vname) and not vval:match("^{{.-}}$") then
       line = "@" .. vname .. " = " .. PLACEHOLDER
+    else
+      line = mask_pairs(line)
     end
     lines[#lines + 1] = line
   end
@@ -135,12 +200,31 @@ end
 ---@param buf integer
 ---@return boolean
 function M.is_openapi(buf)
-  for _, l in ipairs(api.nvim_buf_get_lines(buf, 0, math.min(60, api.nvim_buf_line_count(buf)), false)) do
+  local lines = api.nvim_buf_get_lines(buf, 0, math.min(60, api.nvim_buf_line_count(buf)), false)
+  for _, l in ipairs(lines) do
     if l:match('^%s*"?openapi"?%s*:') or l:match('^%s*"?swagger"?%s*:') then
       return true
     end
   end
-  return false
+  -- minified JSON (the whole spec on one line): `{"openapi":"3.1.0",...`
+  local head = table.concat(lines, "\n"):sub(1, 4096)
+  return head:match("^%s*{") ~= nil
+    and (head:find('"openapi"%s*:%s*"%d') ~= nil or head:find('"swagger"%s*:%s*"%d') ~= nil)
+end
+
+--- `text` cut to `max` bytes (never inside a UTF-8 sequence) plus a marker; 2nd result: whether it was cut.
+---@param text string
+---@param max integer
+---@return string, boolean
+local function truncate(text, max)
+  if #text <= max then
+    return text, false
+  end
+  local cut = max
+  while cut > 0 and text:byte(cut + 1) >= 0x80 and text:byte(cut + 1) < 0xC0 do
+    cut = cut - 1
+  end
+  return text:sub(1, cut) .. "\n… (truncated)", true
 end
 
 --- Description of the target .http file: titles, file vars (sensitive values masked), env names.
@@ -327,11 +411,15 @@ end
 
 ---@param lines string[]
 ---@param title string
-local function raw_output(lines, title)
+---@param why? string  default: the answer contained no valid request
+local function raw_output(lines, title, why)
   local scratch = require("slop.core.ui.scratch")
   local buf = scratch.open("rest/ai-output", { layout = "split", filetype = "markdown" })
   scratch.set_lines(buf, lines)
-  log().notify(title .. ": the AI answer contained no valid request (raw output shown)", vim.log.levels.WARN)
+  log().notify(
+    ("%s: %s (raw output shown)"):format(title, why or "the AI answer contained no valid request"),
+    vim.log.levels.WARN
+  )
 end
 
 ---@param buf integer
@@ -400,7 +488,12 @@ function M.gen_message(opts, src_buf, target, root)
     if hint then
       parts[#parts + 1] = hint
     end
-    parts[#parts + 1] = "```" .. vim.bo[src_buf].filetype .. "\n" .. M.mask_text(table.concat(lines, "\n")) .. "\n```"
+    -- a minified file is one huge line: the ±50 lines window alone is no size limit
+    local code, cut = truncate(M.mask_text(table.concat(lines, "\n")), M.MAX_CONTEXT)
+    if cut then
+      log().warn("code context truncated to %d bytes", M.MAX_CONTEXT)
+    end
+    parts[#parts + 1] = "```" .. vim.bo[src_buf].filetype .. "\n" .. code .. "\n```"
     parts[#parts + 1] = "Generate requests for every endpoint/method this code handles."
       .. (opts.text and opts.text ~= "" and ("\nExtra instructions: " .. opts.text) or "")
   elseif opts.mode == "openapi" then
@@ -409,8 +502,8 @@ function M.gen_message(opts, src_buf, target, root)
       return nil, "this file is blocked by core.secrets; refusing to send it"
     end
     local text
-    local b = vim.fn.bufnr(path)
-    if b > 0 and api.nvim_buf_is_loaded(b) then
+    local b = require("slop.modules.rest.discover").loaded_buf(vim.fs.normalize(path))
+    if b then
       text = table.concat(api.nvim_buf_get_lines(b, 0, -1, false), "\n")
     else
       text = project.read_file(path)
@@ -418,8 +511,9 @@ function M.gen_message(opts, src_buf, target, root)
     if not text then
       return nil, "cannot read " .. path
     end
-    if #text > M.MAX_CONTEXT then
-      text = text:sub(1, M.MAX_CONTEXT) .. "\n… (truncated)"
+    local cut
+    text, cut = truncate(text, M.MAX_CONTEXT)
+    if cut then
       log().warn("OpenAPI file truncated to %d bytes", M.MAX_CONTEXT)
     end
     parts[#parts + 1] = ("OpenAPI specification (%s):"):format(project.relpath(path, root))
@@ -537,10 +631,7 @@ function M.fix_message(entry, block)
   if res then
     parts[#parts + 1] = ("Response status: %d %s"):format(res.status or 0, res.reason or "")
     parts[#parts + 1] = "Response headers:\n" .. M.redact(table.concat(M.mask_headers(res.headers), "\n"), nil)
-    local body = res.body or ""
-    if #body > M.MAX_BODY then
-      body = body:sub(1, M.MAX_BODY) .. "\n… (truncated)"
-    end
+    local body = truncate(res.body or "", M.MAX_BODY)
     if body ~= "" then
       parts[#parts + 1] = "Response body:\n" .. M.redact(body, nil)
     end
@@ -557,7 +648,14 @@ function M.fix()
     local cur = rest.request_at_cursor(0)
     if cur then
       local function same(e)
-        return e and e.req and e.req.file == cur.file and (e.req.name == cur.name or e.req.line == cur.line)
+        if not (e and e.req and e.req.file == cur.file) then
+          return false
+        end
+        -- untitled requests have no name: nil == nil must not make all of them "the same request"
+        if e.req.name and cur.name then
+          return e.req.name == cur.name
+        end
+        return e.req.line == cur.line
       end
       entry = (same(failed) and failed) or (same(last) and last) or { req = cur, err = "(not run yet)" }
     end
@@ -585,7 +683,24 @@ function M.fix()
   local user = M.fix_message(vim.tbl_extend("force", entry, { req = req }), block)
   local root = require("slop.core.project").root(buf)
   local system = "You fix .http requests.\n" .. M.SYNTAX .. "\n" .. M.RULES
+  -- the buffer may be edited while the AI answers: track the block instead of trusting its line numbers
+  local ns = require("slop.core.util").ns("rest.fix")
+  local okm, mark = pcall(api.nvim_buf_set_extmark, buf, ns, req.start - 1, 0, {
+    end_row = req.stop - 1,
+    end_col = #(block[#block] or ""),
+    invalidate = true,
+  })
   M.ask(system, user, root, function(text, aerr)
+    local range = { req.start - 1, req.stop }
+    local gone = false
+    if okm and api.nvim_buf_is_valid(buf) then
+      local pos = api.nvim_buf_get_extmark_by_id(buf, ns, mark, { details = true })
+      api.nvim_buf_del_extmark(buf, ns, mark)
+      gone = not pos[1] or pos[3].invalid == true
+      if not gone then
+        range = { pos[1], pos[3].end_row + 1 }
+      end
+    end
     if aerr then
       log().notify("AI request failed: " .. aerr, vim.log.levels.ERROR)
       return
@@ -597,7 +712,10 @@ function M.fix()
     if not api.nvim_buf_is_valid(buf) then
       return
     end
-    preview(buf, { req.start - 1, req.stop }, lines, "slop rest fix")
+    if gone then
+      return raw_output(vim.split(text or "", "\n", { plain = true }), "fix", "the request block was deleted meanwhile")
+    end
+    preview(buf, range, lines, "slop rest fix")
   end)
 end
 

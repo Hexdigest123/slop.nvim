@@ -19,7 +19,7 @@ local M = {}
 ---@class slop.rest.VarCtx
 ---@field prompt? table<string, string>
 ---@field file? table<string, string>
----@field env? table<string, string>
+---@field env? table<string, any>          decoded JSON values (numbers, booleans, tables are stringified)
 ---@field dotenv? table<string, string>
 ---@field process? boolean|fun(name: string): string?   default true (os.getenv)
 ---@field dynamic? table<string, fun(args: string): string?>
@@ -89,6 +89,14 @@ end
 local function stringify(v)
   if type(v) == "string" then
     return v
+  elseif v == nil or v == vim.NIL then -- a found JSON null (luanil decodes a top-level null to nil)
+    return "null"
+  elseif type(v) == "number" then
+    -- tostring() is %.14g: 100000000000001 -> "1e+14", 3.141592653589793 -> "3.1415926535898"
+    if v == math.floor(v) and math.abs(v) < 2 ^ 63 then
+      return ("%d"):format(v)
+    end
+    return vim.json.encode(v) -- shortest round-trip form
   elseif type(v) == "table" then
     return vim.json.encode(v)
   end

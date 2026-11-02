@@ -50,6 +50,35 @@ describe("rest ai (pure helpers)", function()
     assert.truthy(out:find('"accessToken": "{{t}}"', 1, true))
   end)
 
+  it("sensitive(): short words only as a whole part of the name", function()
+    for _, n in ipairs({ "X-Auth", "db_pass", "userPwd", "pw", "card-pin", "otp", "jwt", "client_secret", "Bearer" }) do
+      assert.is_true(ai.sensitive(n), n)
+    end
+    for _, n in ipairs({ "author", "passenger", "spinner", "keyboard", "options" }) do
+      assert.is_false(ai.sensitive(n), n)
+    end
+  end)
+
+  it("mask_text() masks query strings, form bodies, X-Auth, pass/pwd/jwt keys, escaped quotes", function()
+    local text = table.concat({
+      "POST https://api.x/oauth/token?client_id=web&api_key=QUERY-SECRET",
+      "X-Auth: hdr-secret",
+      "",
+      "grant_type=password&username=ann&password=FORM-SECRET",
+      "access_token=RESPONSE-SECRET&scope=repo&token_type=bearer",
+      '{"pass": "p1", "pwd": "p2", "jwt": "p3", "password": "esc\\"TAIL-SECRET", "name": "ann"}',
+      "GET /a?token={{token}}",
+    }, "\n")
+    local out = ai.mask_text(text)
+    for _, s in ipairs({ "QUERY-SECRET", "hdr-secret", "FORM-SECRET", "RESPONSE-SECRET", "p1", "p2", "p3", "TAIL" }) do
+      assert.falsy(out:find(s, 1, true), s .. " leaked:\n" .. out)
+    end
+    assert.truthy(out:find("client_id=web&api_key=<redacted>", 1, true))
+    assert.truthy(out:find("grant_type=password&username=ann&password=<redacted>", 1, true))
+    assert.truthy(out:find('"password": "<redacted>", "name": "ann"', 1, true))
+    assert.truthy(out:find("GET /a?token={{token}}", 1, true))
+  end)
+
   local hints = {
     { "/r/src/routes/api/users/+server.ts", "/api/users" },
     { "/r/src/routes/(app)/api/items/[id]/+server.js", "/api/items/{id}" },
@@ -227,6 +256,83 @@ describe("rest ai gen/fix", function()
     assert.equal(f, vim.api.nvim_buf_get_name(d.buf))
     assert.are.same({ 2, 7 }, d.range)
     assert.equal("Content-Type: application/json", d.lines[4])
+  end)
+
+  local FIX_FILE = '@b = http://x\n\n### Create\n# @name create\nPOST {{b}}/items\n\n{"a": 1,}\n\n### Other\nGET /o\n'
+  local FIX_ANSWER = '```http\n### Create\n# @name create\nPOST {{b}}/items\n\n{"a": 1}\n```'
+
+  local function fail_create(f)
+    h.write(f, FIX_FILE)
+    local req = require("slop.modules.rest.discover").parse(f).requests[1]
+    require("slop.modules.rest.api")._state.failed[root] = { req = req, err = "HTTP 400" }
+    answer = FIX_ANSWER
+  end
+
+  it("fix keeps targeting the block when lines are added above it while the AI answers", function()
+    local f = root .. "/moved.http"
+    fail_create(f)
+    require("slop").rest.fix()
+    -- the answer arrives asynchronously; meanwhile the user edits above the block
+    local buf = vim.fn.bufadd(f)
+    vim.api.nvim_buf_set_lines(buf, 0, 0, false, { "@extra = 1", "" })
+    wait_diff()
+    assert.are.same({ 4, 9 }, diff_calls[1].range)
+    assert.equal("### Create", vim.api.nvim_buf_get_lines(buf, 4, 5, false)[1])
+  end)
+
+  it("fix shows the answer raw when the block was deleted while the AI answered", function()
+    local f = root .. "/gone.http"
+    fail_create(f)
+    require("slop").rest.fix()
+    vim.api.nvim_buf_set_lines(vim.fn.bufadd(f), 2, 8, false, {})
+    assert.is_true(vim.wait(2000, function()
+      return vim.iter(notes):any(function(n)
+        return n.msg:find("the request block was deleted", 1, true) ~= nil
+      end)
+    end, 10))
+    assert.equal(0, #diff_calls)
+    assert.truthy(require("slop.core.ui.scratch").find("rest/ai-output"))
+  end)
+
+  it("fix with untitled requests fixes the one under the cursor, not the last failed one", function()
+    local f = root .. "/untitled.http"
+    h.write(f, "###\nGET http://x/nope\n\n###\nDELETE http://x/other\n")
+    vim.cmd.edit(f)
+    local first = require("slop.modules.rest.api").request_at_cursor(0)
+    require("slop.modules.rest.api")._state.failed[root] = { req = first, err = "HTTP 404" }
+    vim.api.nvim_win_set_cursor(0, { 5, 0 })
+    answer = "```http\n###\nDELETE http://x/other/fixed\n```"
+    require("slop").rest.fix()
+    wait_diff()
+    local msg = chat_reqs[1].messages[1].content
+    assert.matches("DELETE http://x/other", msg)
+    assert.falsy(msg:find("/nope", 1, true))
+    assert.are.same({ 3, 5 }, diff_calls[1].range)
+  end)
+
+  it("gen detects a minified OpenAPI JSON file and caps every context at MAX_CONTEXT", function()
+    local ai = require("slop.modules.rest.ai")
+    local paths = {}
+    for i = 1, 3000 do
+      paths[i] = ('"/items/%d":{"get":{"summary":"Get item %d"}}'):format(i, i)
+    end
+    h.write(root .. "/openapi.json", '{"openapi":"3.1.0","paths":{' .. table.concat(paths, ",") .. "}}\n")
+    vim.cmd.edit(root .. "/openapi.json")
+    assert.is_true(ai.is_openapi(0))
+    require("slop").rest.gen()
+    wait_diff()
+    local msg = chat_reqs[1].messages[1].content
+    assert.matches("OpenAPI specification", msg)
+    assert.truthy(#msg < ai.MAX_CONTEXT + 4096, #msg)
+    -- a minified bundle in code mode: the ±50 lines window is a single huge line
+    h.write(root .. "/bundle.js", "function GET(){" .. string.rep("x();", 50000) .. "}\n")
+    vim.cmd.edit(root .. "/bundle.js")
+    assert.is_false(ai.is_openapi(0))
+    require("slop").rest.gen({ mode = "code" })
+    wait_diff(2)
+    msg = chat_reqs[2].messages[1].content
+    assert.matches("truncated", msg)
+    assert.truthy(#msg < ai.MAX_CONTEXT + 4096, #msg)
   end)
 
   it("fix without any failure warns", function()

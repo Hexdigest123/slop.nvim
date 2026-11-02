@@ -57,6 +57,14 @@ describe("rest module", function()
         })
       elseif req.path == "/fail" then
         res.send(500, "boom", { ["Content-Type"] = "text/plain" })
+      elseif req.path == "/auth" then
+        if req.body:find('"pw": "right"', 1, true) then
+          res.json(200, { token = "tok-right" })
+        else
+          res.json(401, { error = "bad password" })
+        end
+      elseif req.path == "/hang" then
+        res.hang()
       else
         res.send(404, "nope")
       end
@@ -329,7 +337,7 @@ describe("rest module", function()
     rest.pick()
     local prompt = vim.api.nvim_get_current_buf()
     vim.api.nvim_buf_set_lines(prompt, 0, -1, false, { "beta" })
-    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = prompt })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buf = prompt })
     run_and_wait(function()
       h.feed("<CR>")
     end)
@@ -385,5 +393,275 @@ describe("rest module", function()
     local d = vim.diagnostic.get(0)
     assert.equal(1, #d)
     assert.matches("script blocks", d[1].message)
+  end)
+
+  it("<CR> runs the request under the cursor of the CURRENT window (buffer shown twice)", function()
+    local f = http_file("two.http", ("### one\nGET %s/me?one\n\n### two\nGET %s/me?two"):format(srv.url, srv.url))
+    vim.cmd.edit(f)
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    vim.cmd("belowright split")
+    vim.api.nvim_win_set_cursor(0, { 5, 0 })
+    assert.not_equal(vim.api.nvim_get_current_win(), vim.fn.bufwinid(0)) -- the first window is the other one
+    run_and_wait(function()
+      h.feed("<CR>")
+    end)
+    assert.equal("two", srv.requests[1].query)
+  end)
+
+  it("a dependency answering >= 400 stops the run, and runs again the next time", function()
+    local f = http_file(
+      "dep.http",
+      table.concat({
+        "@pw = wrong",
+        "### Auth",
+        "# @name auth",
+        ("POST %s/auth"):format(srv.url),
+        "",
+        '{"pw": "{{pw}}"}',
+        "",
+        "### Me",
+        "# @name me",
+        ("GET %s/me"):format(srv.url),
+        "Authorization: Bearer {{auth.response.body.$.token}}",
+      }, "\n")
+    )
+    vim.cmd.edit(f)
+    vim.api.nvim_win_set_cursor(0, { 10, 0 })
+    local api = require("slop.modules.rest.api")
+    local entry
+    local function run()
+      entry = nil
+      api.run(api.request_at_cursor(0), {
+        on_done = function(e)
+          entry = e
+        end,
+      })
+      wait_for(function()
+        return entry ~= nil
+      end)
+    end
+    run()
+    assert.equal("dependency 'auth' failed: HTTP 401 Unauthorized", entry.err)
+    assert.equal(401, entry.res.status) -- the dependency's response is what the view shows
+    assert.equal(1, #srv.requests)
+    -- the password is fixed: the failed response must not count as "auth already ran"
+    vim.api.nvim_buf_set_lines(0, 0, 1, false, { "@pw = right" })
+    run()
+    assert.is_nil(entry.err)
+    assert.are.same({ "/auth", "/auth", "/me" }, {
+      srv.requests[1].path,
+      srv.requests[2].path,
+      srv.requests[3].path,
+    })
+    assert.equal("Bearer tok-right", vim.json.decode(entry.res.body).auth)
+  end)
+
+  it("an unwritable project root does not stop requests (no history, no jar, warned once)", function()
+    local ro = h.tmpdir("readonly")
+    vim.fn.mkdir(ro .. "/.git", "p")
+    h.write(ro .. "/ro.http", ("GET %s/me"):format(srv.url))
+    vim.cmd.edit(ro .. "/ro.http")
+    vim.uv.fs_chmod(ro, 365) -- 0555
+    local enforced = vim.fn.filewritable(ro) == 0 -- (root ignores permissions)
+    local ok, err = pcall(function()
+      run_and_wait(function()
+        rest.run_cursor()
+      end)
+      run_and_wait(function()
+        rest.run_cursor()
+      end)
+    end)
+    vim.uv.fs_chmod(ro, 493)
+    assert.is_true(ok, tostring(err))
+    assert.equal(2, #srv.requests)
+    if enforced then
+      local warned = vim.tbl_filter(function(n)
+        return n.msg:find("cannot create the state folder", 1, true) ~= nil
+      end, notes)
+      assert.equal(1, #warned)
+      assert.is_nil(vim.uv.fs_stat(ro .. "/.nvim"))
+    end
+  end)
+
+  it("keeps the state folder, the history and the cookie jar private", function()
+    local f = http_file("p.http", ('POST %s/login\n\n{"user": "p"}'):format(srv.url))
+    vim.cmd.edit(f)
+    run_and_wait(function()
+      rest.run_cursor()
+    end)
+    local dir = root .. "/.nvim/state/rest"
+    assert.equal(448, vim.uv.fs_stat(dir).mode % 512)
+    assert.equal(384, vim.uv.fs_stat(dir .. "/cookies.txt").mode % 512)
+    assert.equal(384, vim.uv.fs_stat(dir .. "/history.json").mode % 512)
+  end)
+
+  it("cancel replaces the running state of the view", function()
+    local f = http_file("hang.http", ("GET %s/hang"):format(srv.url))
+    vim.cmd.edit(f)
+    rest.run_cursor()
+    wait_for(function()
+      return #srv.requests == 1
+    end)
+    local win = require("slop.core.ui.scratch").win("rest/result")
+    assert.matches("running", vim.wo[win].winbar)
+    assert.is_true(rest.cancel())
+    assert.matches("request cancelled", vim.wo[win].winbar)
+    assert.falsy(vim.wo[win].winbar:find("running", 1, true))
+  end)
+
+  it("r in the result window reruns in the project of the request, not the cwd's", function()
+    local other = h.tmpdir("other")
+    vim.fn.mkdir(other .. "/.git", "p")
+    h.write(other .. "/http-client.env.json", vim.json.encode({ dev = { base = srv.url } }))
+    h.write(other .. "/o.http", "### o\n# @name o\nGET {{base}}/me")
+    vim.cmd.edit(other .. "/o.http") -- the cwd stays `root`
+    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    run_and_wait(function()
+      rest.run_cursor()
+    end)
+    vim.api.nvim_set_current_win(require("slop.core.ui.scratch").win("rest/result"))
+    local api = require("slop.modules.rest.api")
+    assert.equal(other, api.root())
+    run_and_wait(function()
+      h.feed("r")
+    end)
+    assert.equal(2, #srv.requests)
+    assert.is_nil(api._state.results[root])
+    assert.equal(200, api._state.results[other].res.status)
+  end)
+
+  it("chains inside an unnamed http buffer", function()
+    vim.cmd("enew")
+    vim.bo.filetype = "http"
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, {
+      "@base = " .. srv.url,
+      "### Login",
+      "# @name login",
+      "POST {{base}}/login",
+      "",
+      '{"user": "unnamed"}',
+      "",
+      "### Me",
+      "# @name me",
+      "GET {{base}}/me",
+      "Authorization: Bearer {{login.response.body.$.token}}",
+    })
+    vim.api.nvim_win_set_cursor(0, { 10, 0 })
+    run_and_wait(function()
+      rest.run_cursor()
+    end)
+    wait_for(function()
+      return #srv.requests == 2
+    end)
+    assert.are.same({ "/login", "/me" }, { srv.requests[1].path, srv.requests[2].path })
+    assert.equal("Bearer tok-unnamed", srv.requests[2].headers.authorization)
+  end)
+
+  it("a loaded <file>.orig buffer does not replace the requests of <file>", function()
+    local f = http_file("api.http", "### Real\n# @name real\nGET http://x/real")
+    h.write(root .. "/api.http.orig", "### Old\n# @name old\nDELETE http://x/old")
+    vim.cmd.edit(root .. "/api.http.orig") -- only the backup is loaded
+    local p = require("slop.modules.rest.discover").parse(f)
+    assert.are.same({ "real", "GET", "http://x/real" }, { p.requests[1].name, p.requests[1].method, p.requests[1].url })
+    local of_file = vim.tbl_filter(function(r)
+      return r.file == f
+    end, rest.requests(root))
+    assert.are.same(
+      { "real" },
+      vim.tbl_map(function(r)
+        return r.name
+      end, of_file)
+    )
+  end)
+
+  it("status() never scans the project", function()
+    h.write(root .. "/http-client.env.json", vim.json.encode({ dev = { base = "x" } }))
+    local discover = require("slop.modules.rest.discover")
+    local scan, scans = discover.scan, 0
+    discover.scan = function(...)
+      scans = scans + 1
+      return scan(...)
+    end
+    discover.invalidate()
+    for _ = 1, 5 do
+      assert.equal("", rest.status())
+    end
+    assert.equal(0, scans)
+    discover.get(root) -- a picker / run scanned meanwhile
+    assert.equal("rest[dev]", rest.status())
+    require("slop.modules.rest.history").set_env(root, "prod")
+    assert.equal("rest[prod]", rest.status())
+    assert.equal(1, scans)
+  end)
+
+  it("running a request does not scan the project (the dev default comes from the env files it sees)", function()
+    h.write(root .. "/api/http-client.env.json", vim.json.encode({ dev = { base = srv.url } }))
+    local f = http_file("api/e.http", "GET {{base}}/me")
+    local discover = require("slop.modules.rest.discover")
+    local scan, scans = discover.scan, 0
+    discover.scan = function(...)
+      scans = scans + 1
+      return scan(...)
+    end
+    discover.invalidate()
+    vim.cmd.edit(f)
+    local entry
+    local api = require("slop.modules.rest.api")
+    api.run(api.request_at_cursor(0), {
+      on_done = function(e)
+        entry = e
+      end,
+    })
+    wait_for(function()
+      return entry ~= nil
+    end)
+    assert.equal(200, entry.res.status)
+    assert.equal("dev", entry.env)
+    assert.equal(0, scans)
+  end)
+
+  it("the parse cache notices a same-size rewrite within the same second", function()
+    local f = http_file("same.http", "GET http://x/aaaa")
+    local discover = require("slop.modules.rest.discover")
+    assert.equal("http://x/aaaa", discover.parse(f).requests[1].url)
+    h.write(f, "GET http://x/bbbb")
+    assert.equal("http://x/bbbb", discover.parse(f).requests[1].url)
+  end)
+
+  it("a late pretty-print of an older response does not overwrite a newer result", function()
+    local view = require("slop.modules.rest.view")
+    local format, pending = view.format, nil
+    view.format = function(body, _, _, cb)
+      pending = function()
+        cb(body)
+      end
+    end
+    local old = { status = 200, headers = {}, body = '{"old": true}', content_type = "application/json" }
+    view.show({ req = { method = "GET", url = "/a" }, res = old })
+    view.format = format
+    view.show({ req = { method = "GET", url = "/b" }, err = "GET /b: unresolved variable: {{id}}" })
+    pending() -- the old pretty-printer finishes last
+    local buf = assert(result_buf())
+    assert.equal("GET /b: unresolved variable: {{id}}", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+  end)
+
+  it("shows CRLF text bodies without CRs and SVG as XML", function()
+    local view = require("slop.modules.rest.view")
+    local function show(ctype, body)
+      local shown
+      local res = { status = 200, headers = {}, body = body, content_type = ctype }
+      view.show({ req = { method = "GET", url = "/x" }, res = res }, function(b)
+        shown = b
+      end)
+      wait_for(function()
+        return shown ~= nil
+      end)
+      return vim.api.nvim_buf_get_lines(shown, 0, -1, false), vim.bo[shown].filetype
+    end
+    assert.are.same({ "line one", "line two" }, (show("text/plain", "line one\r\nline two\r\n")))
+    local lines, ft = show("image/svg+xml", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+    assert.equal("xml", ft)
+    assert.truthy(table.concat(lines, "\n"):find("<svg", 1, true))
+    assert.is_true(view.is_binary("\0\1", "image/png"))
   end)
 end)

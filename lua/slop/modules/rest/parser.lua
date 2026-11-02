@@ -43,6 +43,8 @@ M.METHODS = {
 ---@field body? string                    raw body text (lines joined by "\n"); "< path" lines kept verbatim
 ---@field meta slop.rest.Meta
 ---@field warnings {lnum: integer, msg: string}[]
+---@field _vars? {name: string, value: string, line: integer}[]  unnamed buffers: the buffer's file variables
+---@field _requests? slop.rest.Request[]  unnamed buffers: every request of the buffer (dependency lookup)
 
 ---@class slop.rest.File
 ---@field file? string
@@ -111,6 +113,15 @@ function M.request_line(line)
     return method, url, version
   end
   return method, target, nil
+end
+
+local HANDLER_WARNING = "response handlers / redirects (> / >>) are not supported and were ignored"
+
+--- "> ./handler.js" / ">> ./out.json" / ">>! ./out.json" (unsupported response handler or redirect).
+---@param line string
+---@return boolean
+local function handler(line)
+  return line:match("^%s*>>!?%s+%S") ~= nil or line:match("^%s*>%s+%S") ~= nil
 end
 
 local function header(line)
@@ -214,6 +225,9 @@ function M.parse(lines, file)
 
   for lnum, raw in ipairs(lines) do
     local line = raw:gsub("\r$", "")
+    if lnum == 1 then
+      line = line:gsub("^\239\187\191", "") -- UTF-8 BOM (files read from disk; buffers strip it themselves)
+    end
     local title = line:match("^###(.*)$")
     if in_script then
       if line:find("%%}") then
@@ -229,8 +243,8 @@ function M.parse(lines, file)
         in_script = lnum
       end
     elseif state == "body" then
-      if line:match("^%s*>>!?%s+%S") or line:match("^%s*>%s+%S") then
-        warn(lnum, "response handlers / redirects (> / >>) are not supported and were ignored")
+      if handler(line) then
+        warn(lnum, HANDLER_WARNING)
       else
         block._body[#block._body + 1] = line
       end
@@ -256,6 +270,10 @@ function M.parse(lines, file)
     else -- url / headers
       if state == "url" and line:match("^%s+[/?&#]") then
         block.url = block.url .. trim(line)
+      elseif handler(line) then
+        -- right after the request line / headers (no body): must not become the body of the request
+        state = "headers"
+        warn(lnum, HANDLER_WARNING)
       else
         state = "headers"
         if line:match("^%s*$") then

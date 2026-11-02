@@ -7,11 +7,33 @@ local M = {}
 M.MAX = 50
 
 local cache = {} ---@type table<string, table>
+local unwritable = {} ---@type table<string, boolean>  roots already reported as not writable
 
 ---@param root string
 ---@return string
 local function read_path(root)
   return require("slop.core.project").dir({ root = root }, "state", "rest", "history.json")
+end
+
+--- `<root>/.nvim/state/rest/<name>` (the directory is created, private: 0700). nil when it cannot be created
+--- (unwritable root, e.g. cwd "/" or a read-only checkout; reported once): requests still run, but history and
+--- the cookie jar are not kept.
+---@param root string
+---@param name string
+---@return string?
+function M.state_file(root, name)
+  local ok, path = pcall(require("slop.core.project").state, "rest", name, { root = root })
+  if not ok then
+    if not unwritable[root] then
+      unwritable[root] = true
+      local msg = "cannot create the state folder of %s (%s): no history, no cookie jar"
+      require("slop.core.log").scope("rest").warn(msg, root, tostring(path))
+    end
+    return nil
+  end
+  -- cookies and history are nobody else's business
+  vim.uv.fs_chmod(vim.fs.dirname(path), 448)
+  return path
 end
 
 ---@param root string
@@ -32,17 +54,21 @@ end
 ---@param root string
 function M.save(root)
   local data = M.load(root)
-  local project = require("slop.core.project")
-  local path = project.state("rest", "history.json", { root = root })
-  local ok, err = project.write_json(path, data)
-  if not ok then
+  local path = M.state_file(root, "history.json")
+  if not path then
+    return
+  end
+  local ok, err = require("slop.core.project").write_json(path, data)
+  if ok then
+    vim.uv.fs_chmod(path, 384)
+  else
     require("slop.core.log").scope("rest").warn("could not write %s: %s", path, tostring(err))
   end
 end
 
 --- Forget the in-memory cache (tests / root changes).
 function M.reset()
-  cache = {}
+  cache, unwritable = {}, {}
 end
 
 --- Stable id of a request: "<relpath>#<name>" or "<relpath>#L<line>".

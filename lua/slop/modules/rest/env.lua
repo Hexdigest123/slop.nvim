@@ -5,10 +5,21 @@ local M = {}
 M.PUBLIC = "http-client.env.json"
 M.PRIVATE = "http-client.private.env.json"
 
+local reported = {} ---@type table<string, string>  path -> "mtime:size" of the broken version already reported
+
 ---@param path string
 ---@return table?
 local function read_json(path)
-  local data = require("slop.core.project").read_json(path)
+  local data, err = require("slop.core.project").read_json(path)
+  if data == nil and err and not err:find("ENOENT", 1, true) then
+    -- otherwise a typo (trailing comma...) only shows up later as "unresolved variables"
+    local st = vim.uv.fs_stat(path)
+    local version = st and (st.mtime.sec .. ":" .. st.size) or ""
+    if reported[path] ~= version then
+      reported[path] = version
+      require("slop.core.log").scope("rest").warn("env file ignored: %s", err)
+    end
+  end
   return type(data) == "table" and data or nil
 end
 

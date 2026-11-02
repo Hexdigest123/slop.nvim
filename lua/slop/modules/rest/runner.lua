@@ -11,7 +11,7 @@ local vars = require("slop.modules.rest.vars")
 ---@field version? string
 ---@field headers {[1]: string, [2]: string}[]
 ---@field body? string
----@field timeout integer                ms
+---@field timeout integer                ms (0 = no limit)
 ---@field follow boolean
 ---@field cookie_jar? string             path (nil = no jar)
 ---@field insecure? boolean
@@ -123,23 +123,50 @@ function M.resolve(req, opts)
   }
 end
 
+local follow_flag ---@type string?
+
+--- Redirect flag for requests with a custom method (-X): "--follow" when the installed curl has it (8.16+: the
+--- method becomes GET on 301/302/303 like in a browser, and is kept on 307/308), else "-L" (curl then keeps the
+--- method on every hop).
+---@return string
+function M.follow_flag()
+  if not follow_flag then
+    local ok, out = pcall(vim.fn.system, { "curl", "--version" })
+    local major, minor = (ok and type(out) == "string" and out or ""):match("^curl (%d+)%.(%d+)")
+    follow_flag = major and tonumber(major) * 1000 + tonumber(minor) >= 8016 and "--follow" or "-L"
+  end
+  return follow_flag
+end
+
 --- Pure: curl argv (without "curl") and stdin for a resolved request.
 ---@param r slop.rest.Resolved
 ---@param files {headers: string, body: string}  temp files for -D / -o
+---@param opts? {follow?: string}  redirect flag for custom methods (see follow_flag(); default "-L")
 ---@return string[] args, string? stdin
-function M.build_args(r, files)
+function M.build_args(r, files, opts)
   local args = { "-sS", "--globoff" }
+  -- -X fixes the method of EVERY hop: with -L a POST answered by 301/302/303 would be re-sent as a body-less
+  -- POST. A GET without body and a POST with one are what curl sends by itself (switching to GET like a browser).
+  local inferred = (r.method == "GET" and r.body == nil) or (r.method == "POST" and r.body ~= nil)
+  local custom = r.method ~= "HEAD" and not inferred
   if r.method == "HEAD" then
     args[#args + 1] = "--head"
-  else
+  elseif custom then
     vim.list_extend(args, { "-X", r.method })
   end
-  local has_cookie = false
+  local has_cookie, compressed = false, false
   for _, h in ipairs(r.headers) do
-    if h[1]:lower() == "cookie" then
+    local name = h[1]:lower()
+    if name == "cookie" then
       has_cookie = true
+    elseif name == "accept-encoding" then
+      compressed = true
     end
     vim.list_extend(args, { "-H", h[2] == "" and (h[1] .. ";") or (h[1] .. ": " .. h[2]) })
+  end
+  if compressed then
+    -- the server may now answer gzip/br/...: let curl decode the body (the request's own header is kept)
+    args[#args + 1] = "--compressed"
   end
   local stdin
   if r.body ~= nil and r.method ~= "HEAD" then
@@ -147,7 +174,7 @@ function M.build_args(r, files)
     stdin = r.body
   end
   if r.follow then
-    vim.list_extend(args, { "-L", "--max-redirs", "10" })
+    vim.list_extend(args, { custom and opts and opts.follow or "-L", "--max-redirs", "10" })
   end
   if r.timeout and r.timeout > 0 then
     vim.list_extend(args, { "--max-time", ("%g"):format(r.timeout / 1000) })
@@ -237,7 +264,7 @@ M.REASONS = {
 function M.execute(r, on_done)
   local base = vim.fn.tempname()
   local files = { headers = base .. ".h", body = base .. ".b" }
-  local args, stdin = M.build_args(r, files)
+  local args, stdin = M.build_args(r, files, { follow = M.follow_flag() })
   local project = require("slop.core.project")
   local done = false
   local function cleanup()
@@ -245,14 +272,20 @@ function M.execute(r, on_done)
     os.remove(files.body)
   end
   local started = vim.uv.hrtime()
+  local limit = r.timeout or 30000
   local handle = require("slop.core.http").curl(args, {
     stdin = stdin,
-    timeout = (r.timeout or 30000) + 5000,
+    -- backstop in case curl hangs past --max-time; `# @timeout 0` means no limit at all
+    timeout = limit > 0 and limit + 5000 or nil,
     on_exit = function(code, stdout, stderr)
       if done then
         return
       end
       done = true
+      if r.cookie_jar then
+        -- curl writes the jar with the umask (usually 0644): session cookies stay private
+        vim.uv.fs_chmod(r.cookie_jar, 384)
+      end
       local ok_meta, meta = pcall(vim.json.decode, stdout or "", { luanil = { object = true, array = true } })
       meta = ok_meta and type(meta) == "table" and meta or {}
       local hdr = project.read_file(files.headers) or ""

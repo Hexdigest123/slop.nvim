@@ -140,6 +140,30 @@ describe("rest vars", function()
       assert.equal(1, #m1)
       assert.equal(1, #m2)
     end)
+    it("numbers keep every digit (no %.14g), JSON null is null", function()
+      local nums = {
+        status = 200,
+        headers = {},
+        body = '{"id": 100000000000001, "neg": -42, "pi": 3.141592653589793, "half": 0.5, "n": {"id": 123456789012345}}',
+      }
+      local nctx = {
+        response = function(name)
+          return name == "c" and nums or (name == "nul" and { status = 200, headers = {}, body = "null" }) or nil
+        end,
+      }
+      for path, want in pairs({
+        ["$.id"] = "100000000000001",
+        ["$.neg"] = "-42",
+        ["$.pi"] = "3.141592653589793",
+        ["$.half"] = "0.5",
+        ["$.n"] = '{"id":123456789012345}',
+      }) do
+        assert.equal(want, (vars.expand("{{c.response.body." .. path .. "}}", nctx)), path)
+      end
+      assert.equal("null", (vars.expand("{{nul.response.body.$}}", nctx)))
+      assert.equal("/orders/8080", (vars.expand("/orders/{{port}}", { env = { port = 8080 }, process = false })))
+    end)
+
     it("chain_ref() and refs()", function()
       assert.are.same({ "a.b", "login", "body", "$.x" }, {
         "a.b",
@@ -198,6 +222,23 @@ describe("rest env files", function()
     local none = env.load(root .. "/api/x.http", root, nil)
     assert.are.same({ s = "root-shared", a = "shared" }, none)
     assert.are.same({ "dev", "prod" }, env.names(files))
+  end)
+
+  it("reports an env file with invalid JSON once (instead of silently ignoring it)", function()
+    local notes = {}
+    vim.notify = function(msg)
+      notes[#notes + 1] = msg
+    end
+    local root = h.tmpdir("badenv")
+    h.write(root .. "/http-client.env.json", '{ "dev": { "base": "http://h", }, }')
+    h.write(root .. "/x.http", "GET {{base}}/")
+    local v, files = env.load(root .. "/x.http", root, "dev")
+    assert.are.same({}, v)
+    assert.are.same({}, files)
+    env.names({ root .. "/http-client.env.json" })
+    env.load(root .. "/x.http", root, "dev")
+    assert.equal(1, #notes)
+    assert.matches("env file ignored: invalid json in " .. vim.pesc(root .. "/http-client.env.json"), notes[1])
   end)
 
   it("nearest .env upward to the root", function()

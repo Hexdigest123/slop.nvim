@@ -28,10 +28,19 @@ local S = {
 }
 M._state = S
 
---- Project root for rest (the current buffer's root).
+--- Project root for rest: the buffer's root (default: current); for the result buffer, the root of the request
+--- it shows (not the cwd's).
 ---@param buf? integer
 ---@return string
 function M.root(buf)
+  buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf --[[@as integer]]
+  local view = package.loaded["slop.modules.rest.view"]
+  if view and require("slop.core.ui.scratch").name(buf) == view.NAME then
+    local e = view.current()
+    if e and e.root then
+      return e.root
+    end
+  end
   return require("slop.core.project").root(buf)
 end
 
@@ -41,9 +50,12 @@ local function responses(root)
 end
 
 --- Effective env name for a root: the persisted selection, else "dev" when it exists.
----@param root string
+---@param root? string
+---@param opts? {cached?: boolean, file?: string}  cached: never scan (statuslines; an earlier discovery is used);
+---  file: only the env files this .http file sees (running a request must not scan the whole root: seconds for
+---  "/" or $HOME)
 ---@return string?
-function M.current_env(root)
+function M.current_env(root, opts)
   root = root or M.root()
   local sel = history().env(root)
   if sel == false then
@@ -52,8 +64,21 @@ function M.current_env(root)
   if type(sel) == "string" then
     return sel
   end
-  local names = require("slop.modules.rest.env").names(discover().get(root).env_files)
-  if vim.tbl_contains(names, "dev") then
+  local env = require("slop.modules.rest.env")
+  local names
+  if opts and opts.file then
+    names = env.names(select(2, env.load(opts.file, root, nil)))
+  elseif opts and opts.cached then
+    local d = discover().cached(root)
+    if d then
+      -- read the env files once per scan, not on every statusline redraw
+      d.env_names = d.env_names or env.names(d.env_files)
+      names = d.env_names
+    end
+  else
+    names = env.names(discover().get(root).env_files)
+  end
+  if vim.tbl_contains(names or {}, "dev") then
     return "dev"
   end
   return nil
@@ -66,7 +91,29 @@ local function parsed_of(req)
   if req.file then
     return discover().parse(req.file)
   end
-  return { vars = req._vars or {}, requests = { req }, warnings = {} }
+  return { vars = req._vars or {}, requests = req._requests or { req }, warnings = {} }
+end
+
+--- Resolve a request name: the requests of an unnamed buffer first (no file to look in), else discover.lookup()
+--- (same file, then anywhere under the root).
+---@param name string
+---@param from slop.rest.Request|{}
+---@param root string
+---@return slop.rest.Request?, string? err
+local function lookup(name, from, root)
+  for _, r in ipairs(not from.file and from._requests or {}) do
+    if r.name == name then
+      return r
+    end
+  end
+  return discover().lookup(name, from --[[@as slop.rest.Request]], root)
+end
+
+--- Path from which env files are looked up for `req` (unnamed buffers: the cwd).
+---@param req slop.rest.Request
+---@return string
+local function env_file(req)
+  return req.file or (vim.fn.getcwd() .. "/[buffer].http")
 end
 
 --- Variable context for `req`.
@@ -77,8 +124,8 @@ end
 function M.ctx(req, root, prompt)
   local c = cfg()
   local env = require("slop.modules.rest.env")
-  local file = req.file or (vim.fn.getcwd() .. "/[buffer].http")
-  local envvars = env.load(file, root, M.current_env(root))
+  local file = env_file(req)
+  local envvars = env.load(file, root, M.current_env(root, { file = file }))
   local dot = env.dotenv(file, root, c.env_file)
   return {
     prompt = prompt,
@@ -109,8 +156,7 @@ local function buf_of(file)
   if not file then
     return nil
   end
-  local nr = vim.fn.bufnr(file)
-  return nr > 0 and api.nvim_buf_is_loaded(nr) and nr or nil
+  return discover().loaded_buf(vim.fs.normalize(file))
 end
 
 --- Parser warnings (+ `extra` errors) as diagnostics in an http buffer.
@@ -163,12 +209,22 @@ end
 
 -- Running -----------------------------------------------------------------------------------------
 
+--- The result view still says "running" for a request that will never finish: say what happened instead.
+---@param msg string
+local function show_stopped(msg)
+  local view = package.loaded["slop.modules.rest.view"]
+  if view then
+    view.stopped(msg)
+  end
+end
+
 --- Cancel the request in flight.
 function M.cancel()
   if S.handle and S.handle:is_active() then
     S.handle:cancel()
     S.handle = nil
     S.seq = S.seq + 1
+    show_stopped("request cancelled")
     log().notify("request cancelled", vim.log.levels.INFO)
     return true
   end
@@ -176,14 +232,16 @@ function M.cancel()
 end
 
 ---@param root string
----@return table
+---@param ctx slop.rest.VarCtx
+---@return slop.rest.ResolveOpts
 local function resolve_opts(root, ctx)
   local c = cfg()
   return {
     ctx = ctx,
     timeout = c.timeout,
     follow_redirects = c.follow_redirects,
-    cookie_jar = c.cookies and require("slop.core.project").state("rest", "cookies.txt", { root = root }) or false,
+    -- nil (no jar) when the root is not writable
+    cookie_jar = c.cookies and history().state_file(root, "cookies.txt") or false,
     insecure = c.insecure,
     headers = c.headers,
   }
@@ -191,7 +249,7 @@ end
 
 ---@class slop.rest.RunOpts
 ---@field root? string
----@field on_done? fun(entry: table)   final entry {req, resolved?, res?, err?}
+---@field on_done? fun(entry: table)   final entry {req, resolved?, res?, err?, env?, root}
 ---@field show? boolean                 show in the result view (default true)
 
 --- Run one request (plus its missing dependencies first).
@@ -206,14 +264,16 @@ function M.run(req, opts)
   M.cancel()
   S.seq = S.seq + 1
   local seq = S.seq
-  local env = M.current_env(root)
+  local env = M.current_env(root, { file = env_file(req) })
 
   local plan, perr = require("slop.modules.rest.chain").plan(req, {
     lookup = function(name, from)
-      return discover().lookup(name, from, root)
+      return lookup(name, from, root)
     end,
     has_response = function(r)
-      return r.name ~= nil and responses(root)[r.name] ~= nil
+      -- a failed response (>= 400) does not satisfy a dependency: it runs again
+      local res = r.name and responses(root)[r.name]
+      return res ~= nil and (res.status or 0) < 400
     end,
     file_vars = function(r)
       return require("slop.modules.rest.parser").file_vars(parsed_of(r), r)
@@ -225,7 +285,7 @@ function M.run(req, opts)
       return
     end
     S.handle = nil
-    entry.env = env
+    entry.env, entry.root = env, root
     S.results[root] = entry
     if entry.err or (entry.res and entry.res.status >= 400) then
       S.failed[root] = entry
@@ -260,8 +320,9 @@ function M.run(req, opts)
         return
       end
       if not answers then
-        log().notify("request cancelled (prompt)", vim.log.levels.INFO)
         S.seq = S.seq + 1
+        show_stopped("request cancelled (prompt)")
+        log().notify("request cancelled (prompt)", vim.log.levels.INFO)
         return
       end
       local resolved, err = require("slop.modules.rest.runner").resolve(r, resolve_opts(root, M.ctx(r, root, answers)))
@@ -283,6 +344,7 @@ function M.run(req, opts)
           req = r,
           resolved = resolved,
           env = env,
+          root = root,
           running = is_target and true or ("dependency " .. label(r)),
         })
       end
@@ -310,6 +372,12 @@ function M.run(req, opts)
         if is_target then
           return finish({ req = r, resolved = resolved, res = res })
         end
+        if res.status >= 400 then
+          -- the target would only fail on {{name.response...}} (or use a failed login): stop and show why
+          local msg = vim.trim(("dependency '%s' failed: HTTP %d %s"):format(label(r), res.status, res.reason or ""))
+          log().notify(msg, vim.log.levels.ERROR)
+          return finish({ req = r, resolved = resolved, res = res, err = msg })
+        end
         step()
       end)
     end)
@@ -327,13 +395,16 @@ function M.request_at_cursor(buf)
   local name = api.nvim_buf_get_name(buf)
   local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
   local parsed = require("slop.modules.rest.parser").parse(lines, name ~= "" and vim.fs.normalize(name) or nil)
-  local win = vim.fn.bufwinid(buf)
+  -- bufwinid() is the FIRST window showing the buffer, not necessarily the one the user is in
+  local win = buf == api.nvim_get_current_buf() and api.nvim_get_current_win() or vim.fn.bufwinid(buf)
   local lnum = win ~= -1 and api.nvim_win_get_cursor(win)[1] or 1
-  local req = require("slop.modules.rest.parser").at(parsed, lnum)
-  if req and name == "" then
-    req._vars = parsed.vars
+  if name == "" then
+    -- no file to re-read later: the buffer's variables and requests (dependencies) travel with each request
+    for _, r in ipairs(parsed.requests) do
+      r._vars, r._requests = parsed.vars, parsed.requests
+    end
   end
-  return req
+  return require("slop.modules.rest.parser").at(parsed, lnum)
 end
 
 --- Run the request under the cursor (http buffers).
@@ -352,7 +423,7 @@ end
 function M.find(name)
   local root = M.root()
   local cur = M.request_at_cursor(0)
-  local r = discover().lookup(name, cur or {}, root)
+  local r = lookup(name, cur or {}, root)
   return r
 end
 
@@ -565,13 +636,14 @@ function M.rerun_view()
       end
     end
   end
-  M.run(req)
+  -- the project of the shown request (env, cookie jar, responses), not the cwd's
+  M.run(req, { root = e.root })
 end
 
---- Statusline helper: "rest[env]" or "".
+--- Statusline helper: "rest[env]" or "". Never scans the project (persisted selection or an earlier discovery).
 ---@return string
 function M.status()
-  local ok, env = pcall(M.current_env)
+  local ok, env = pcall(M.current_env, nil, { cached = true })
   return ok and env and ("rest[" .. env .. "]") or ""
 end
 

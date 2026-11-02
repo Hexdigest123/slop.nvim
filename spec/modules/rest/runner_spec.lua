@@ -23,11 +23,12 @@ describe("rest runner", function()
 
   describe("build_args()", function()
     local tail = { "-D", "/t/h", "-o", "/t/b", "-w", "%{json}", "--url" }
+    -- GET without body / POST with body carry no -X: with -L, -X would keep the method on 301/302/303 hops
     local cases = {
       {
         "plain GET",
         base(),
-        { "-sS", "--globoff", "-X", "GET", "--max-time", "30" },
+        { "-sS", "--globoff", "--max-time", "30" },
         nil,
       },
       {
@@ -36,8 +37,6 @@ describe("rest runner", function()
         {
           "-sS",
           "--globoff",
-          "-X",
-          "POST",
           "-H",
           "A: 1",
           "-H",
@@ -60,25 +59,75 @@ describe("rest runner", function()
       {
         "redirects, timeout, insecure, http2",
         base({ follow = true, timeout = 2500, insecure = true, version = "HTTP/2" }),
-        { "-sS", "--globoff", "-X", "GET", "-L", "--max-redirs", "10", "--max-time", "2.5", "-k", "--http2" },
+        { "-sS", "--globoff", "-L", "--max-redirs", "10", "--max-time", "2.5", "-k", "--http2" },
         nil,
+        { follow = "--follow" },
       },
       {
         "cookie jar -b/-c",
         base({ cookie_jar = "/j.txt", version = "HTTP/1.1" }),
-        { "-sS", "--globoff", "-X", "GET", "--max-time", "30", "-b", "/j.txt", "-c", "/j.txt", "--http1.1" },
+        { "-sS", "--globoff", "--max-time", "30", "-b", "/j.txt", "-c", "/j.txt", "--http1.1" },
         nil,
       },
       {
         "explicit Cookie header skips -b but keeps -c",
         base({ cookie_jar = "/j.txt", headers = { { "Cookie", "a=b" } } }),
-        { "-sS", "--globoff", "-X", "GET", "-H", "Cookie: a=b", "--max-time", "30", "-c", "/j.txt" },
+        { "-sS", "--globoff", "-H", "Cookie: a=b", "--max-time", "30", "-c", "/j.txt" },
+        nil,
+      },
+      {
+        "custom methods keep -X and follow redirects with the given flag",
+        base({ method = "PUT", body = "{}", follow = true }),
+        {
+          "-sS",
+          "--globoff",
+          "-X",
+          "PUT",
+          "--data-binary",
+          "@-",
+          "--follow",
+          "--max-redirs",
+          "10",
+          "--max-time",
+          "30",
+        },
+        "{}",
+        { follow = "--follow" },
+      },
+      {
+        "custom method without a follow flag falls back to -L",
+        base({ method = "DELETE", follow = true }),
+        { "-sS", "--globoff", "-X", "DELETE", "-L", "--max-redirs", "10", "--max-time", "30" },
+        nil,
+      },
+      {
+        "POST without a body keeps -X POST",
+        base({ method = "POST" }),
+        { "-sS", "--globoff", "-X", "POST", "--max-time", "30" },
+        nil,
+      },
+      {
+        "GET with a body keeps -X GET",
+        base({ body = "q" }),
+        { "-sS", "--globoff", "-X", "GET", "--data-binary", "@-", "--max-time", "30" },
+        "q",
+      },
+      {
+        "Accept-Encoding makes curl decode the body (--compressed)",
+        base({ headers = { { "accept-encoding", "gzip" } } }),
+        { "-sS", "--globoff", "-H", "accept-encoding: gzip", "--compressed", "--max-time", "30" },
+        nil,
+      },
+      {
+        "@timeout 0: no --max-time",
+        base({ timeout = 0 }),
+        { "-sS", "--globoff" },
         nil,
       },
     }
     for _, c in ipairs(cases) do
       it(c[1], function()
-        local args, stdin = runner.build_args(c[2], FILES)
+        local args, stdin = runner.build_args(c[2], FILES, c[5])
         local want = vim.list_extend(vim.deepcopy(c[3]), tail)
         want[#want + 1] = c[2].url
         assert.are.same(want, args)
@@ -231,5 +280,77 @@ describe("rest runner", function()
       assert.equal("curl", err.kind)
       assert.matches("onnect", err.message)
     end)
+
+    local function see_other(req, res)
+      if req.path == "/form" then
+        res.send(303, "", { Location = "/done" })
+      else
+        res.send(200, req.method)
+      end
+    end
+
+    it("follows a 303 after a POST with a GET (like a browser)", function()
+      srv = mock.start(see_other)
+      local res, err = run(base({ method = "POST", url = srv.url .. "/form", body = "a=1", follow = true }))
+      assert.is_nil(err)
+      assert.equal("GET", res.body)
+      assert.are.same({ "POST", "GET" }, { srv.requests[1].method, srv.requests[2].method })
+    end)
+
+    it("follows a 303 after a PUT with a GET when curl has --follow (8.16+)", function()
+      if runner.follow_flag() ~= "--follow" then
+        return -- older curl keeps the custom method on every hop (documented)
+      end
+      srv = mock.start(see_other)
+      local res, err = run(base({ method = "PUT", url = srv.url .. "/form", body = "{}", follow = true }))
+      assert.is_nil(err)
+      assert.equal("GET", res.body)
+    end)
+
+    it("decodes a compressed response when the request sets Accept-Encoding", function()
+      local json = '{"token": "abc"}'
+      local ok, gz = pcall(function()
+        return vim.system({ "gzip", "-c", "-n" }, { stdin = json }):wait().stdout
+      end)
+      if not ok or not gz or gz == "" then
+        return -- no gzip binary to build the fixture
+      end
+      srv = mock.start(function(_, res)
+        res.send(200, gz, { ["Content-Type"] = "application/json", ["Content-Encoding"] = "gzip" })
+      end)
+      local res, err = run(base({ url = srv.url .. "/gz", headers = { { "Accept-Encoding", "gzip" } } }))
+      assert.is_nil(err)
+      assert.equal(json, res.body)
+    end)
+
+    it("keeps the cookie jar private (0600)", function()
+      srv = mock.start(function(_, res)
+        res.send(200, "ok", { ["Set-Cookie"] = "sid=abc; Path=/" })
+      end)
+      local jar = h.tmpdir("jarmode") .. "/cookies.txt"
+      run(base({ url = srv.url .. "/login", cookie_jar = jar }))
+      assert.equal(384, vim.uv.fs_stat(jar).mode % 512)
+    end)
+  end)
+
+  it("@timeout 0 runs curl without the backstop timeout", function()
+    local real = package.loaded["slop.core.http"]
+    local seen = {}
+    package.loaded["slop.core.http"] = {
+      curl = function(_, o)
+        seen[#seen + 1] = { timeout = o.timeout }
+        return {
+          cancel = function() end,
+          is_active = function()
+            return true
+          end,
+        }
+      end,
+    }
+    runner.execute(base({ timeout = 0 }), function() end)
+    runner.execute(base({ timeout = 2500 }), function() end)
+    package.loaded["slop.core.http"] = real
+    assert.is_nil(seen[1].timeout)
+    assert.equal(7500, seen[2].timeout)
   end)
 end)
