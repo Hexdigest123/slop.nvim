@@ -63,6 +63,18 @@ describe("doc prompt", function()
       assert.is_nil((prompt.parse("/** Add. */ int x;", target(), {}, langs.syntax.c)))
     end)
 
+    it("drops tool directives the model echoed with the comment (they stay above the item)", function()
+      local text = "```ts\n/** Doubles n. */\n// eslint-disable-next-line @typescript-eslint/no-explicit-any\n```"
+      local code = { "// eslint-disable-next-line @typescript-eslint/no-explicit-any", "function double(n: any) {" }
+      assert.are.same(
+        { "/** Doubles n. */" },
+        prompt.parse(text, target({ indent = "" }), code, langs.syntax.typescript)
+      )
+      local lines, err = prompt.parse("//go:noinline", target(), {}, langs.syntax.go)
+      assert.is_nil(lines)
+      assert.matches("not a comment", err)
+    end)
+
     it("commentstring fallback syntax", function()
       local syn = langs.syntax_for("unknownft", "; %s")
       assert.are.same({ "  ; Does a thing." }, prompt.parse("; Does a thing.", target(), {}, syn))

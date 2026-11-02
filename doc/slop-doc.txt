@@ -34,8 +34,10 @@ treesitter parser for the buffer.
 1. Target. Treesitter finds the innermost item of the requested kind
    (`func`, `class` or `type`; any kind for `generate`) that contains the
    cursor. Two positions on the cursor line are tried: the cursor column
-   (or the first non-blank one) and the end of the line. The innermost
-   result wins, so `local M = {}` is found with the cursor on `local`.
+   (or the first non-blank one) and the end of the line (before a trailing
+   `;` or `,`). The innermost result wins, so `local M = {}` and
+   `export const f = (a) => a * 2;` are found with the cursor at the start
+   of the line.
    - A cursor on a doc comment, a decorator or an attribute targets the item
      below it.
    - An anonymous function or table counts only as the value of a
@@ -44,12 +46,18 @@ treesitter parser for the buffer.
      is skipped and the enclosing item is used instead.
    - The item includes the wrappers that start on its line (`export`,
      `local x =`, `type X struct`), its decorators and C++ `template <...>`
-     line, and the Rust `#[...]` attributes above it. The comment goes above
-     all of these.
+     line, the Rust `#[...]` attributes above it, and the tool directives
+     directly above it (`// eslint-disable-next-line`, `// @ts-ignore`,
+     `// NOLINT...`, `//go:...`, `//nolint`, `---@diagnostic`,
+     `-- stylua: ignore`, `# shellcheck`, `# rubocop:`, ...). The comment
+     goes above all of these; directives are kept as they are.
 2. Existing doc comment. Comment lines, or one block comment, directly above
    the item (no blank line in between, each comment on its own line) count
-   as its doc comment. A shebang line (`#!`) and Rust `//!` lines never do.
-   In Python the existing doc is the leading docstring of the body.
+   as its doc comment. A shebang line (`#!`), Rust `//!` lines and license
+   headers (`Copyright ...`, `SPDX-License-Identifier`) never do.
+   In Python the existing doc is the leading docstring of the body; a body
+   on the header's line (also after a multi-line signature: `): return a`)
+   is not supported.
 3. Request. These are sent to the provider, all redacted (|slop-doc-privacy|):
    - the relative path and the filetype;
    - the kind and name of the item;
@@ -66,14 +74,15 @@ treesitter parser for the buffer.
    new request in the same buffer cancels the running one.
 5. Answer. `<think>` blocks and the code fence are removed. Code that the
    model echoed after the comment is dropped (a line equal to or a prefix of
-   one of the item's lines). What is left must be comment lines, or one
-   docstring for Python. Anything else is reported as an error and nothing
-   is inserted. The raw answer is in `:Slop log`. The lines are then
-   re-indented to the item's indentation (Python: the body's).
+   one of the item's lines), and so are echoed tool directives. What is left
+   must be comment lines, or one docstring for Python. Anything else is
+   reported as an error and nothing is inserted. The raw answer is in
+   `:Slop log`. The lines are then re-indented to the item's indentation
+   (Python: the body's).
 6. Review. |slop-edit-diff| applies the lines as a preview. Keys
-   (buffer-local, normal mode): `ga` accept the hunk, `gr` reject it,
-   `gA` / `gR` all, `]h` / `[h` next / previous hunk. The whole review is
-   one undo step. If
+   (buffer-local, normal mode, see |slop-edit-workflow| step 4): `ga`
+   accept the hunk, `gr` reject it, `gA` / `gR` all, `]h` / `[h` next /
+   previous hunk. The whole review is one undo step. If
    the lines being replaced changed while the request ran, the answer is
    discarded with a warning. Lines added above the item are fine: the target
    is tracked with an extmark.
@@ -201,7 +210,9 @@ Everything sent to the provider goes through |slop-secrets| first:
 - a buffer matching a secret glob (`.env*`, `*.pem`, `*.key`, ..., and the
   cloak rules) is refused: nothing is sent;
 - secret spans in the context, the code and the existing doc are replaced by
-  `<redacted>`, and the prompt tells the model never to guess them.
+  `<redacted>`, and the prompt tells the model never to guess them. An answer
+  that contains `<redacted>` while the replaced lines did not is refused:
+  it would overwrite the hidden value.
 Toggling the cloak display (`:Slop cloak toggle`) does not turn redaction
 off. Only the lines described in |slop-doc-flow| are sent, never the whole
 file.

@@ -238,6 +238,32 @@ describe("doc module", function()
     assert.are.same({ 9, 9 }, diff_calls[1].range)
   end)
 
+  it("never writes the secret placeholder over a redacted value of the existing doc", function()
+    require("slop.core.secrets").register({
+      name = "test",
+      spans = function(_, ls, first)
+        local out = {}
+        for i, l in ipairs(ls) do
+          local s, e = l:find("sk%-live%-%w+")
+          if s then
+            out[#out + 1] = { row = first + i - 1, col = s - 1, end_col = e }
+          end
+        end
+        return out
+      end,
+    })
+    open("p.lua", { "---Calls the API (test key: sk-live-abc123).", "local function call() end" })
+    answer = { "---Calls the API (test key: <redacted>).", "---@return nil" }
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    require("slop").doc.generate()
+    assert.is_true(vim.wait(2000, function()
+      return noted("secret placeholder")
+    end, 10))
+    assert.falsy(chat_reqs[1].messages[1].content:find("sk-live-abc123", 1, true))
+    assert.equal(0, #diff_calls)
+    assert.is_false(require("slop").doc.is_running())
+  end)
+
   it("styles and instructions come from the config", function()
     require("slop").setup({ doc = { styles = { lua = "doxygen" }, instructions = "Use British spelling." } })
     open("m.lua")

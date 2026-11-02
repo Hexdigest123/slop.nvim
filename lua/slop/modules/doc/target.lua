@@ -32,6 +32,22 @@ local function is_comment(node)
   return node:type():find("comment", 1, true) ~= nil
 end
 
+--- Does any of `lines` (trimmed) match one of the Lua patterns?
+---@param lines string[]
+---@param pats string[]
+---@return boolean
+local function matches(lines, pats)
+  for _, l in ipairs(lines) do
+    local t = vim.trim(l)
+    for _, pat in ipairs(pats) do
+      if t:match(pat) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 --- Last row a node covers (an end at column 0 belongs to the previous row).
 ---@param node TSNode
 ---@return integer
@@ -49,7 +65,8 @@ end
 ---@return string?
 local function name_of(node, buf)
   local n
-  for _, f in ipairs({ "name", "key", "left" }) do
+  -- `property`: JS/TS class fields (`static f = () => {}`)
+  for _, f in ipairs({ "name", "key", "left", "property" }) do
     local ok, names = pcall(node.field, node, f)
     n = n or (ok and names and names[1]) or nil
   end
@@ -99,6 +116,10 @@ local function probe(buf, tree, row, col)
   end
   if not node or not (is_comment(node) or attrs[node:type()]) then
     return row, col
+  end
+  -- inside the comment's text (lua: comment > comment_content): the comment node itself
+  while is_comment(node) and node:parent() and is_comment(node:parent()) do
+    node = node:parent()
   end
   local cur = node
   local nxt = cur:next_named_sibling()
@@ -179,8 +200,8 @@ local function docstring(node, buf)
   if not body then
     return nil, "", {}, "definition without a body"
   end
-  local brow = body:range()
-  if brow <= node:range() then
+  local brow, bcol = body:range()
+  if brow <= node:range() or line(buf, brow):sub(1, bcol):find("%S") then
     return nil, "", {}, "one-line definitions are not supported (put the body on its own line)"
   end
   local first
@@ -210,6 +231,7 @@ end
 local function doc_above(node, buf, syntax)
   local s = node:range()
   local skip = syntax and syntax.skip or {}
+  local license = require("slop.modules.doc.langs").license
   local prev = node:prev_named_sibling()
   while prev and is_comment(prev) do
     local srow, scol, erow, ecol = prev:range()
@@ -219,16 +241,28 @@ local function doc_above(node, buf, syntax)
     if not attached or not own_line then
       break
     end
-    local trimmed = vim.trim(text)
-    for _, pat in ipairs(skip) do
-      if trimmed:match(pat) then
-        return s
-      end
+    if matches({ text }, skip) or matches(api.nvim_buf_get_lines(buf, srow, last_row(prev) + 1, false), license) then
+      return s
     end
     s = srow
     prev = prev:prev_named_sibling()
   end
   return s
+end
+
+--- A tool directive on its own line (`// eslint-disable-next-line`, `//go:noinline`, `---@diagnostic ...`): it
+--- belongs to the item below it, so the doc goes above it and never replaces it.
+---@param node TSNode
+---@param buf integer
+---@param syntax? slop.doc.Syntax
+---@return boolean
+local function is_directive(node, buf, syntax)
+  if not (syntax and syntax.directives and is_comment(node)) then
+    return false
+  end
+  local srow, scol = node:range()
+  local text = line(buf, srow)
+  return scol == #indent_of(text) and matches({ text }, syntax.directives)
 end
 
 ---@param node TSNode
@@ -315,7 +349,7 @@ function M.find(buf, pos, kind)
   -- probe at the cursor column and at the end of the line (`local M = {}` with the cursor on `local`); both
   -- results contain the cursor row, the innermost one wins
   local best, best_node
-  local eol = #(line(buf, row):gsub("%s+$", "")) - 1
+  local eol = #(line(buf, row):gsub("[%s;,]+$", "")) - 1
   for _, c in ipairs({ col, math.max(eol, 0) }) do
     local node, anchor, k = search(tree, row, c, lang, kind)
     if node and (not best_node or span(anchor) < span(best_node[2])) then
@@ -338,10 +372,12 @@ end
 ---@param lang? slop.doc.Lang
 ---@return slop.doc.Target? target, string? err
 function M.build(buf, node, anchor, kind, lname, lang)
+  local syntax = require("slop.modules.doc.langs").syntax_for(vim.bo[buf].filetype, vim.bo[buf].commentstring)
   local first = anchor
   local attrs = lang and lang.attrs or {}
   local prev = first:prev_named_sibling()
-  while prev and attrs[prev:type()] and last_row(prev) >= first:range() - 1 do
+  -- attributes (`#[derive]`) and tool directives directly above belong to the item: the doc goes above them
+  while prev and (attrs[prev:type()] or is_directive(prev, buf, syntax)) and last_row(prev) >= first:range() - 1 do
     first = prev
     prev = first:prev_named_sibling()
   end
@@ -376,7 +412,6 @@ function M.build(buf, node, anchor, kind, lname, lang)
     target.range, target.indent, target.doc = range, indent, doc
     return target
   end
-  local syntax = require("slop.modules.doc.langs").syntax_for(vim.bo[buf].filetype, vim.bo[buf].commentstring)
   local ds = doc_above(first, buf, syntax)
   target.indent = indent_of(line(buf, srow))
   target.range = { ds, srow }

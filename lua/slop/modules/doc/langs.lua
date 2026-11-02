@@ -247,20 +247,73 @@ end
 ---@field block? {[1]: string, [2]: string}  block delimiters
 ---@field docstring? boolean                 python: the answer is a docstring
 ---@field skip? string[]                     Lua patterns of comment lines that are never part of a doc (shebang)
+---@field directives? string[]               Lua patterns of tool directives (`// eslint-disable-next-line`): they
+---                                          belong to the item below them, the doc goes above them
 
-local SLASH = { line = { "//" }, block = { "/*", "*/" } }
-local HASH = { line = { "#" }, skip = { "^#!" } }
+--- License headers are never a doc comment (matched against every line of a comment).
+M.license = { "SPDX%-License%-Identifier", "^[%p%s]*[Cc]opyright%f[%W]" }
+
+-- Tool directives bound to the next line or declaration. A doc inserted between them and the item would break them
+-- (`eslint-disable-next-line` would apply to the doc), and the model must not rewrite them. Matched against the
+-- trimmed first line of a comment.
+local SLASH_DIRECTIVES = {
+  "^//%s*eslint%-",
+  "^/%*%s*eslint%-",
+  "^//%s*@ts%-",
+  "^//%s*prettier%-ignore",
+  "^/%*%s*prettier%-ignore",
+  "^//%s*biome%-ignore",
+  "^//%s*deno%-lint%-ignore",
+  "^/%*%s*istanbul ignore",
+  "^/%*%s*c8 ignore",
+  "^//%s*c8 ignore",
+  "^//%s*NOLINT",
+  "^/%*%s*NOLINT",
+  "^//%s*clang%-format ",
+  "^/%*%s*clang%-format ",
+  "^//%s*IWYU pragma",
+  "^//%s*cppcheck%-suppress",
+  "^//%s*NOSONAR",
+  "^//%s*noinspection",
+  "^//%s*@formatter:",
+  "^//%s*swiftlint:",
+  "^//%s*ktlint%-",
+}
+local GO_DIRECTIVES = { "^//go:", "^//%s*nolint", "^//%s*lint:ignore", "^//export ", "^//line ", "^//%s*#nosec" }
+local HASH_DIRECTIVES = {
+  "^#%s*shellcheck ",
+  "^#%s*rubocop:",
+  "^#%s*:nocov:",
+  "^#%s*noqa",
+  "^#%s*type:",
+  "^#%s*pylint:",
+  "^#%s*fmt:",
+  "^#%s*nolint",
+  "^#%s*yamllint ",
+  "^#%s*credo:",
+}
+
+local SLASH = { line = { "//" }, block = { "/*", "*/" }, directives = SLASH_DIRECTIVES }
+local HASH = { line = { "#" }, skip = { "^#!" }, directives = HASH_DIRECTIVES }
 
 ---@type table<string, slop.doc.Syntax>
 M.syntax = {
-  lua = { line = { "--" }, block = { "--[[", "]]" } },
+  lua = {
+    line = { "--" },
+    block = { "--[[", "]]" },
+    directives = { "^%-%-%-@diagnostic", "^%-%-%s*luacheck:", "^%-%-%s*stylua: ignore", "^%-%-#?%s*selene:" },
+  },
   python = { line = { "#" }, docstring = true },
   javascript = SLASH,
   javascriptreact = SLASH,
   typescript = SLASH,
   typescriptreact = SLASH,
-  go = SLASH,
-  rust = { line = { "//" }, block = { "/*", "*/" }, skip = { "^//!" } },
+  go = {
+    line = { "//" },
+    block = { "/*", "*/" },
+    directives = vim.list_extend(vim.deepcopy(SLASH_DIRECTIVES), GO_DIRECTIVES),
+  },
+  rust = { line = { "//" }, block = { "/*", "*/" }, skip = { "^//!" }, directives = SLASH_DIRECTIVES },
   java = SLASH,
   kotlin = SLASH,
   c = SLASH,
@@ -271,7 +324,19 @@ M.syntax = {
   scala = SLASH,
   dart = SLASH,
   zig = { line = { "//" } },
-  php = { line = { "//", "#" }, block = { "/*", "*/" }, skip = { "^#!", "^#%[" } },
+  php = {
+    line = { "//", "#" },
+    block = { "/*", "*/" },
+    skip = { "^#!", "^#%[" },
+    directives = vim.list_extend(vim.deepcopy(SLASH_DIRECTIVES), {
+      "^//%s*phpcs:",
+      "^#%s*phpcs:",
+      "^//%s*@phpstan%-",
+      "^/%*%*?%s*@phpstan%-",
+      "^//%s*@psalm%-",
+      "^/%*%*?%s*@psalm%-",
+    }),
+  },
   sh = HASH,
   bash = HASH,
   zsh = HASH,

@@ -222,6 +222,18 @@ function M.generate(kind, opts)
           log().notify(perr .. "; nothing inserted (see :Slop log)", vim.log.levels.ERROR)
           return
         end
+        -- the existing doc was sent redacted: writing the placeholder back would destroy the real value
+        local ph = require("slop.core.secrets").placeholder()
+        if table.concat(lines, "\n"):find(ph, 1, true) and not table.concat(job.old, "\n"):find(ph, 1, true) then
+          finish(job, "failed", "failed")
+          log().notify(
+            ("the AI answer contains the secret placeholder %s (the doc or code hides a secret); nothing inserted"):format(
+              ph
+            ),
+            vim.log.levels.ERROR
+          )
+          return
+        end
         apply(job, lines)
         finish(job, "success", "done")
       end,

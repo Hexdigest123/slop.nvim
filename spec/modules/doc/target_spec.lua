@@ -74,6 +74,9 @@ describe("doc target (lua)", function()
     local t = assert(find(0, 0))
     assert.equal("foo", t.name)
     assert.are.same({ 0, 2 }, t.range)
+    -- inside the comment's text (a comment_content node)
+    assert.equal("foo", assert(find(0, 5)).name)
+    assert.equal("foo", assert(find(1, 8)).name)
   end)
 
   it("tables assigned to variables are classes (cursor anywhere on the line)", function()
@@ -122,6 +125,35 @@ describe("doc target (lua)", function()
     local ty, terr = find(3, 4, "type")
     assert.is_nil(ty)
     assert.matches("no type", terr)
+  end)
+
+  it("a trailing ',' or ';' does not hide a function value from the end-of-line probe", function()
+    buf = scratch({ "local M = {", "  f = function() end,", "}", "local h = function() end;" }, "lua")
+    local t = assert(find(1, 2))
+    assert.equal("func", t.kind)
+    assert.equal("f", t.name)
+    assert.are.same({ 1, 1 }, t.range)
+    t = assert(find(3, 0))
+    assert.equal("h", t.name)
+  end)
+
+  it("tool directives stay attached to the item: the doc goes above them", function()
+    buf = scratch({
+      "---Old.", --  0
+      "---@diagnostic disable-next-line: unused-local", --  1
+      "local function k(a) end", --  2
+      "-- stylua: ignore", --  3
+      "local function s() end", --  4
+    }, "lua")
+    local t = assert(find(2, 0))
+    assert.are.same({ 0, 1 }, t.range)
+    assert.are.same({ "---Old." }, t.doc)
+    assert.are.same({ 1, 2 }, t.rows)
+    t = assert(find(4, 0))
+    assert.are.same({ 3, 3 }, t.range)
+    assert.are.same({}, t.doc)
+    t = assert(find(3, 3)) -- on the directive: the item below it
+    assert.equal("s", t.name)
   end)
 end)
 
@@ -173,6 +205,25 @@ describe("doc target (c)", function()
     assert.equal("g", t.name)
     assert.are.same({}, t.doc)
   end)
+
+  it("a directive keeps its place above the item; a license header is never the doc", function()
+    buf = scratch({
+      "/** Old. */", --  0
+      "// NOLINTNEXTLINE(readability-identifier-naming)", --  1
+      "int Bad_Name(void) { return 0; }", --  2
+      "/*", --  3
+      " * Copyright (c) 2024 Example", --  4
+      " * SPDX-License-Identifier: MIT", --  5
+      " */", --  6
+      "int main(void) { return 0; }", --  7
+    }, "c")
+    local t = assert(find(2, 4))
+    assert.are.same({ 0, 1 }, t.range)
+    assert.are.same({ "/** Old. */" }, t.doc)
+    t = assert(find(7, 4))
+    assert.are.same({ 7, 7 }, t.range)
+    assert.are.same({}, t.doc)
+  end)
 end)
 
 describe("doc target (other)", function()
@@ -201,6 +252,42 @@ describe("doc target (other)", function()
     local t = require("slop").doc.find(buf, { 1, 2 })
     assert.not_nil(t)
     assert.equal("func", t.kind)
+  end)
+
+  it("python: a body on the header's last line is a one-line definition", function()
+    -- Nvim bundles no python parser: drive build() with the few node methods it uses
+    local function node(t, range, fields)
+      return {
+        type = function()
+          return t
+        end,
+        range = function()
+          return unpack(range)
+        end,
+        field = function(_, name)
+          return (fields or {})[name] or {}
+        end,
+        parent = function() end,
+        prev_named_sibling = function() end,
+        named_child = function() end,
+        iter_children = function()
+          return function() end
+        end,
+      }
+    end
+    local langs = require("slop.modules.doc.langs")
+    local target = require("slop.modules.doc.target")
+    local buf = scratch({ "def h(", "    a,", "): return a" }, "python")
+    local def = node("function_definition", { 0, 0, 2, 11 }, { body = { node("block", { 2, 3, 2, 11 }) } })
+    local t, err = target.build(buf, def, def, "func", "python", langs.langs.python)
+    assert.is_nil(t)
+    assert.matches("one%-line definitions", err)
+    -- the body on its own line: the docstring goes at its start
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "def h(", "    a,", "):", "    return a" })
+    def = node("function_definition", { 0, 0, 3, 12 }, { body = { node("block", { 3, 4, 3, 12 }) } })
+    t = assert(target.build(buf, def, def, "func", "python", langs.langs.python))
+    assert.are.same({ 3, 3 }, t.range)
+    assert.equal("    ", t.indent)
   end)
 
   it("syntax_for() falls back to 'commentstring'", function()

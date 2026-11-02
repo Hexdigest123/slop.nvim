@@ -443,7 +443,20 @@ function M.parse(text, target, code, syntax)
   if #rest > 0 and not echoed(rest[1], known) then
     return nil, "the AI answer contains code after the comment"
   end
-  return M.reindent(vim.list_slice(lines, 1, n), target.indent)
+  -- tool directives (`// eslint-disable-next-line`) stay above the item in the buffer: drop an echoed copy
+  local doc = vim.tbl_filter(function(l)
+    local t = vim.trim(l)
+    for _, pat in ipairs(syntax.directives or {}) do
+      if t:match(pat) then
+        return false
+      end
+    end
+    return true
+  end, vim.list_slice(lines, 1, n))
+  if #doc == 0 then
+    return nil, "the AI answer is not a comment"
+  end
+  return M.reindent(doc, target.indent)
 end
 
 return M
