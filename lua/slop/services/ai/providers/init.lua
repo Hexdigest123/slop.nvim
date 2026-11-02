@@ -87,13 +87,16 @@ end
 
 -- Shared helpers for adapters --------------------------------------------------------------------
 
---- Remove nil-ish values (vim.NIL) from a shallow table.
+--- Remove nil-ish values (vim.NIL) from a request body, nested tables included (`params` uses vim.NIL to drop a
+--- field, e.g. generationConfig = { temperature = vim.NIL }).
 ---@param t table
 ---@return table
 function M.compact(t)
   for k, v in pairs(t) do
     if v == vim.NIL then
       t[k] = nil
+    elseif type(v) == "table" then
+      M.compact(v)
     end
   end
   return t

@@ -20,19 +20,20 @@ function M.chat(p, req, key)
     messages[1] = { role = "system", content = system }
   end
   vim.list_extend(messages, rest)
-  return {
-    url = p.url,
-    method = "POST",
-    headers = P.bearer(key),
-    body = {
-      model = p.model,
-      messages = messages,
-      max_tokens = req.max_tokens,
-      temperature = req.temperature,
-      stop = req.stop and #req.stop > 0 and req.stop or nil,
-      stream = req.stream ~= false,
-    },
+  local body = {
+    model = p.model,
+    messages = messages,
+    temperature = req.temperature,
+    stop = req.stop and #req.stop > 0 and req.stop or nil,
+    stream = req.stream ~= false,
   }
+  if p.service == "openai" then
+    -- api.openai.com: reasoning models (o-series, gpt-5) reject max_tokens; every chat model takes this one
+    body.max_completion_tokens = req.max_tokens
+  else
+    body.max_tokens = req.max_tokens
+  end
+  return { url = p.url, method = "POST", headers = P.bearer(key), body = body }
 end
 
 local function choice_text(c)

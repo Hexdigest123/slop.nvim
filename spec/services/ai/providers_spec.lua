@@ -466,4 +466,133 @@ describe("services.ai providers", function()
     assert.equal("OK", (oa.delta({ data = text })))
     assert.equal("OK", (oa.delta({ data = vim.json.encode({ choices = { { delta = { content = "OK" } } } }) })))
   end)
+
+  it(
+    "openai: max_completion_tokens (reasoning models reject max_tokens); compatible services keep max_tokens",
+    function()
+      srv = mock.start(function(_, res)
+        res.json(200, { choices = { { message = { content = "ok" } } } })
+      end)
+      setup({
+        oa = { kind = "chat", service = "openai", url = srv.url, model = "o3", api_key = api_key },
+        orr = { kind = "chat", service = "openrouter", url = srv.url, model = "x", api_key = api_key },
+      })
+      for _, name in ipairs({ "oa", "orr" }) do
+        wait_done(function(done)
+          ai.chat({
+            provider = name,
+            max_tokens = 100,
+            messages = { { role = "user", content = "hi" } },
+            on_done = done,
+          })
+        end)
+      end
+      local oa, orr = vim.json.decode(srv.requests[1].body), vim.json.decode(srv.requests[2].body)
+      assert.equal(100, oa.max_completion_tokens)
+      assert.is_nil(oa.max_tokens)
+      assert.equal(100, orr.max_tokens)
+      assert.is_nil(orr.max_completion_tokens)
+    end
+  )
+
+  it("params: a vim.NIL value removes the field from the request body (also nested)", function()
+    srv = mock.start(function(_, res)
+      res.json(200, { candidates = { { content = { parts = { { text = "ok" } } } } } })
+    end)
+    setup({
+      oa = {
+        kind = "chat",
+        service = "openai",
+        url = srv.url,
+        model = "o3",
+        api_key = api_key,
+        params = { temperature = vim.NIL, reasoning_effort = "low" },
+      },
+      gm = {
+        kind = "chat",
+        service = "gemini",
+        url = srv.url,
+        model = "g",
+        api_key = api_key,
+        params = { generationConfig = { temperature = vim.NIL } },
+      },
+    })
+    for _, name in ipairs({ "oa", "gm" }) do
+      wait_done(function(done)
+        ai.chat({
+          provider = name,
+          temperature = 0.4,
+          stream = false,
+          messages = { { role = "user", content = "hi" } },
+          on_done = done,
+        })
+      end)
+    end
+    local oa, gm = vim.json.decode(srv.requests[1].body), vim.json.decode(srv.requests[2].body)
+    assert.is_nil(oa.temperature)
+    assert.equal("low", oa.reasoning_effort)
+    assert.is_nil(gm.generationConfig.temperature)
+    assert.equal("hi", gm.contents[1].parts[1].text)
+  end)
+
+  it("a request that cannot be built never throws: on_done once with a config error, events paired", function()
+    setup({ nourl = { kind = "chat", service = "openai", model = "m", api_key = false } })
+    local seen = {}
+    for _, ev in ipairs({ "RequestStarted", "RequestFinished" }) do
+      require("slop.core.events").on("ai", ev, function(d)
+        seen[#seen + 1] = ev .. "#" .. d.id
+      end)
+    end
+    local out = wait_done(function(done)
+      local ok, err =
+        pcall(ai.chat, { provider = "nourl", messages = { { role = "user", content = "x" } }, on_done = done })
+      assert(ok, err)
+    end)
+    assert.equal("config", out.err.kind)
+    assert.matches("invalid request", out.err.message)
+    assert.are.same({ "RequestStarted#1", "RequestFinished#1" }, seen)
+  end)
+
+  it("chat-FIM: inline <think> reasoning is dropped; a streaming fence never freezes the live preview", function()
+    local cf = require("slop.services.ai.chat_fim")
+    assert.are.same(
+      { "radius ** 2", "r * r" },
+      cf.parse("<think>\nThe area: radius squared.\n</think>\n\nradius ** 2\n<END>\nr * r")
+    )
+    assert.are.same({ "    return 1" }, cf.parse("<think>x</think>\n    return 1"))
+    assert.equal("", cf.first_partial("<think>\nstill thinking"))
+    assert.equal("x = 1", cf.first_partial("<think>a</think>\nx = 1"))
+    assert.equal("", cf.first_partial("``"))
+    assert.equal("", cf.first_partial("```lu"))
+    assert.equal("foo", cf.first_partial("```lua\nfoo"))
+    assert.equal("foo", cf.first_partial("```lua\nfoo\n``"))
+
+    local chunks = { "``", "`lua", "\n", "radius", " ** 2", "\n```" }
+    srv = mock.start(function(_, res)
+      res.stream(
+        200,
+        vim.tbl_map(function(t)
+          return mock.sse({ choices = { { delta = { content = t } } } })
+        end, chunks)
+      )
+    end)
+    setup({ oc = { kind = "chat", service = "openrouter", url = srv.url, model = "m", api_key = api_key } })
+    local shown = {}
+    local out = wait_done(function(done)
+      ai.complete_fim({
+        provider = "oc",
+        prompt = "return math.pi * ",
+        suffix = "\n",
+        on_chunk = function(_, t)
+          shown[#shown + 1] = t
+        end,
+        on_done = done,
+      })
+    end)
+    assert.are.same({ "radius ** 2" }, out.value)
+    assert.equal("radius ** 2", shown[#shown])
+    for _, t in ipairs(shown) do
+      assert.is_nil(t:find("`", 1, true), t)
+    end
+  end)
 end)

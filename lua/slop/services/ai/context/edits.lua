@@ -7,7 +7,9 @@
 --- Ring: chunks of recently yanked / visited / saved text (llama.vim-style "ring buffer" idea), deduplicated by
 --- Jaccard similarity, used as extra volatile context.
 ---
---- Only buffers that are not blocked by core.secrets are tracked; texts are stored RAW and redacted when rendered.
+--- Only buffers that are not blocked by core.secrets are tracked; edit diffs are stored RAW and redacted when rendered
+--- (hunk-aware), ring chunks are redacted when captured (with look-back, the buffer is at hand then) and again when
+--- rendered.
 ---@class slop.ai.context.edits
 local M = {}
 
@@ -74,7 +76,11 @@ local function truncate_hunks(diff, max)
     n = n + #text + 1
   end
   if #out == 0 then
-    return diff:sub(1, max)
+    local e = max
+    if vim.str_utf_end(diff, e) ~= 0 then -- never end inside a multibyte character (invalid UTF-8 request body)
+      e = e + vim.str_utf_start(diff, e) - 1
+    end
+    return diff:sub(1, e)
   end
   return table.concat(out, "\n")
 end
@@ -139,6 +145,12 @@ function M.ring_add(buf, srow, lines)
   if #lines < M.opts.ring_min_lines or not trackable(buf) then
     return
   end
+  -- redact now, with look-back: a chunk/yank that starts inside a PEM block never sees its BEGIN line later
+  local secrets = require("slop.core.secrets")
+  local from = math.max(0, srow - secrets.LOOKBACK)
+  local above = api.nvim_buf_get_lines(buf, from, srow, false)
+  local n_above = #above
+  lines = vim.list_slice(secrets.redact_lines(buf, vim.list_extend(above, lines), from), n_above + 1)
   local nb = require("slop.services.ai.context.neighbors")
   local set, n = nb.tokens(table.concat(lines, "\n"))
   if n < 3 then

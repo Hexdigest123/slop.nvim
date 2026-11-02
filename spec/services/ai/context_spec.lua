@@ -14,6 +14,40 @@ describe("services.ai.context", function()
     return b
   end
 
+  --- A PEM body line: 64 base64 characters at column 0, with a marker that makes a leak easy to find.
+  local function pem_body(i)
+    return ("MIIEkeyBODY%02d"):format(i) .. string.rep("Q", 51)
+  end
+
+  --- `lines` wrapped in a private key block (markers at column 0).
+  local function pem(n)
+    local out = { "-----BEGIN RSA PRIVATE KEY-----" }
+    for i = 1, n do
+      out[#out + 1] = pem_body(i)
+    end
+    out[#out + 1] = "-----END RSA PRIVATE KEY-----"
+    return out
+  end
+
+  local function valid_utf8(s)
+    local i = 1
+    while i <= #s do
+      local c = s:byte(i)
+      local len = c < 0x80 and 1 or c >= 0xF0 and 4 or c >= 0xE0 and 3 or c >= 0xC0 and 2 or 0
+      if len == 0 then
+        return false
+      end
+      for j = i + 1, i + len - 1 do
+        local b = s:byte(j)
+        if not b or b < 0x80 or b >= 0xC0 then
+          return false
+        end
+      end
+      i = i + len
+    end
+    return true
+  end
+
   before_each(function()
     h.reset()
     vim.notify = function() end
@@ -227,6 +261,109 @@ describe("services.ai.context", function()
         c.parts.ring
       )
     end)
+
+    it("recent edits: a private key pasted into an ordinary file is redacted in the diff", function()
+      local edits = require("slop.services.ai.context.edits")
+      local dir = h.tmpdir("pemed")
+      local o = file_buf(dir .. "/fixtures.lua", { "local M = {}", "", "return M" }, "lua")
+      edits.snapshot(o, true)
+      local key = vim.list_extend({ "M.key = [[" }, pem(4))
+      key[#key + 1] = "]]"
+      api.nvim_buf_set_lines(o, 1, 1, false, key)
+      edits.flush(o)
+      local b = file_buf(dir .. "/main.lua", { "x", "" }, "lua")
+      local c = ctx.fim(b, 1, 0, { neighbors = false, ring = false })
+      assert.matches("%-%- File: [^\n]*fixtures%.lua", c.parts.edits)
+      assert.matches("<redacted>", c.parts.edits)
+      assert.falsy(c.prompt:find("keyBODY", 1, true))
+    end)
+
+    it("neighbour snippets that start inside a PEM block of another buffer stay redacted", function()
+      local dir = h.tmpdir("pemnb")
+      local lines = vim.list_extend({ "local t = require('testing')", "", "local KEY = [[" }, pem(25))
+      lines[#lines + 1] = "]]"
+      for i = 1, 30 do
+        lines[#lines + 1] = ("t.filler_call(filler_value_%d)"):format(i)
+      end
+      for i = 1, 10 do
+        lines[#lines + 1] = ("t.check_signature(KEY, payload_%d, verify_token, decode_jwt)"):format(i)
+      end
+      file_buf(dir .. "/keys_test.lua", lines, "lua")
+      local b = file_buf(
+        dir .. "/main.lua",
+        { "local payload_1 = {}", "t.check_signature(KEY, payload_1, verify_token, decode_jwt)", "" },
+        "lua"
+      )
+      local ref = table.concat(api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+      local snips = require("slop.services.ai.context.neighbors").snippets(b, ref)
+      assert.equal(1, #snips)
+      assert.truthy(snips[1].srow > 3, "precondition: the best window starts below the BEGIN line")
+      local c = ctx.fim(b, 2, 0, { recent_edits = false, ring = false })
+      assert.matches("Compare this snippet from [^\n]*keys_test%.lua", c.parts.neighbors)
+      assert.falsy(c.prompt:find("keyBODY", 1, true))
+    end)
+
+    it("ring chunks captured inside a PEM block (a yank, the chunk around the cursor) are redacted", function()
+      local edits = require("slop.services.ai.context.edits")
+      ctx.track()
+      local dir = h.tmpdir("pemrg")
+      local lines = vim.list_extend({ "local KEY = [[" }, pem(25))
+      lines[#lines + 1] = "]]"
+      for i = 1, 40 do
+        lines[#lines + 1] = ("check(KEY, case_%d)"):format(i)
+      end
+      file_buf(dir .. "/keys_test.lua", lines, "lua")
+      vim.cmd("silent normal! 10GV15Gy") -- six body lines, without the BEGIN line
+      api.nvim_win_set_cursor(0, { 50, 0 }) -- BufLeave records the 64 lines around it (starts inside the key)
+      local b = file_buf(dir .. "/main.lua", { "local x = 1", "" }, "lua")
+      assert.truthy(#edits.ring() >= 1)
+      for _, chunk in ipairs(edits.ring()) do -- (a yank of nothing but key lines is not worth a ring entry at all)
+        assert.falsy(table.concat(chunk.lines, "\n"):find("keyBODY", 1, true))
+      end
+      local c = ctx.fim(b, 1, 0, { neighbors = false, recent_edits = false, budget = 40000 })
+      assert.matches("Compare this snippet from [^\n]*keys_test%.lua", c.parts.ring)
+      assert.falsy(c.prompt:find("keyBODY", 1, true))
+    end)
+
+    it("the FIM window starting inside a PEM block stays redacted (look-back above the window)", function()
+      local lines = vim.list_extend({ "local K = [[" }, pem(30))
+      lines[#lines + 1] = "]]"
+      for _ = 1, 500 do
+        lines[#lines + 1] = "x"
+      end
+      lines[#lines + 1] = ""
+      local b = file_buf(h.tmpdir("pemwin") .. "/w.lua", lines, "lua")
+      -- budget 4000 reads 520 rows above the cursor: the window starts in the key body
+      local c = ctx.fim(b, #lines - 1, 0, {
+        budget = 4000,
+        neighbors = false,
+        recent_edits = false,
+        ring = false,
+        scope = false,
+        diagnostics = false,
+      })
+      assert.truthy(c.meta.prefix_row > 1 and c.meta.prefix_row < 32, "precondition: prefix starts in the key")
+      assert.falsy(c.prompt:find("keyBODY", 1, true))
+    end)
+
+    it("prefix / suffix / recent-edit cuts never split a UTF-8 character", function()
+      local cjk = string.rep("中文", 1500) -- 3 bytes per character
+      for max = 5598, 5602 do
+        assert.is_true(valid_utf8(ctx.take_tail({ cjk }, max)[1]), "tail " .. max)
+        assert.is_true(valid_utf8(ctx.take_head({ cjk }, max)[1]), "head " .. max)
+      end
+      local edits = require("slop.services.ai.context.edits")
+      for _, head in ipairs({ "#", "# a", "# ab" }) do -- one of them cuts mid-character without the fix
+        edits.reset()
+        local o = file_buf(h.tmpdir("u8") .. "/notes.md", { head }, "markdown")
+        edits.snapshot(o, true)
+        api.nvim_buf_set_lines(o, 1, 1, false, { string.rep("这是一个很长的中文段落。", 100) })
+        edits.flush(o)
+        local diff = edits.events()[1].diff
+        assert.truthy(#diff <= edits.opts.max_event_chars)
+        assert.is_true(valid_utf8(diff), head)
+      end
+    end)
   end)
 
   describe("files / file / rules (edit)", function()
@@ -255,6 +392,43 @@ describe("services.ai.context", function()
       local big = ctx.file("big.txt", { root = dir, max_bytes = 11 })
       assert.is_true(big.truncated)
       assert.equal("x\nx\nx\nx\nx\n", big.text)
+    end)
+
+    it("file() reads a live buffer only on an EXACT name match, never another (blocked) buffer", function()
+      local dir = h.tmpdir("exact")
+      h.write(dir .. "/tls/server", "#!/bin/sh\n")
+      h.write(dir .. "/tls/server.key", "api_token = sk_live_0123456789abcdef\n")
+      h.write(dir .. "/foo.lua", "disk foo\n")
+      h.write(dir .. "/foo.lua.bak", "BAK\n")
+      -- loaded buffers whose names START with the requested paths (bufnr() pattern matching picked them)
+      vim.cmd.edit(vim.fn.fnameescape(dir .. "/tls/server.key"))
+      vim.cmd.edit(vim.fn.fnameescape(dir .. "/foo.lua.bak"))
+      vim.cmd.enew()
+      assert.equal("#!/bin/sh\n", ctx.file("tls/server", { root = dir }).text)
+      assert.equal("disk foo\n", ctx.file("foo.lua", { root = dir }).text)
+    end)
+
+    it("files() never blocks on a slow git: bounded first call, git's list replaces the walk later", function()
+      local dir = h.tmpdir("slowgit")
+      h.write(dir .. "/a.lua", "x\n")
+      local bin = h.tmpdir("bin")
+      h.write(bin .. "/git", "#!/bin/sh\nsleep 1\nprintf 'from_git.lua\\000a.lua\\000'\n")
+      vim.uv.fs_chmod(bin .. "/git", tonumber("755", 8))
+      local path = vim.env.PATH
+      vim.env.PATH = bin .. ":" .. path
+      ctx.files_wait = 50
+      local t0 = vim.uv.hrtime()
+      local ok, first = pcall(ctx.files, dir)
+      local ms = (vim.uv.hrtime() - t0) / 1e6
+      local got = ok
+        and vim.wait(5000, function()
+          return vim.tbl_contains(ctx.files(dir), "from_git.lua")
+        end, 20)
+      vim.env.PATH = path
+      assert(ok, first)
+      assert.truthy(ms < 500, ("first call took %d ms"):format(ms))
+      assert.are.same({ "a.lua" }, first) -- the bounded walk, meanwhile
+      assert.is_true(got)
     end)
 
     it("rules: existing files in order, walk-up from a subdir (root first)", function()

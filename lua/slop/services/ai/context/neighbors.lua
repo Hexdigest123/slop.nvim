@@ -179,8 +179,10 @@ function M.snippets(buf, ref_text, opts)
   local out = {}
   for i = 1, math.min(#best, opts.max_snippets or M.max_snippets) do
     local s = best[i]
-    local lines = api.nvim_buf_get_lines(s.buf, s.srow, s.srow + M.window, false)
-    s.lines = secrets.redact_lines(s.buf, lines, s.srow)
+    -- redact with look-back so multi-line rules (PEM bodies) that start above the window still apply
+    local from = math.max(0, s.srow - secrets.LOOKBACK)
+    local lines = api.nvim_buf_get_lines(s.buf, from, s.srow + M.window, false)
+    s.lines = vim.list_slice(secrets.redact_lines(s.buf, lines, from), s.srow - from + 1)
     s.path = api.nvim_buf_get_name(s.buf)
     table.insert(out, 1, s) -- best last
   end

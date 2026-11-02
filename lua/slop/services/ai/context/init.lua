@@ -51,7 +51,11 @@ function M.take_tail(lines, max)
   end
   local total = #lines[n]
   if total > max then
-    return { lines[n]:sub(-max) }, n == 1 and #lines[n] <= max
+    local l, i = lines[n], #lines[n] - max + 1
+    if vim.str_utf_start(l, i) ~= 0 then -- never start inside a multibyte character
+      i = i + vim.str_utf_end(l, i) + 1
+    end
+    return { l:sub(i) }, n == 1 and #lines[n] <= max
   end
   local first = n
   for i = n - 1, 1, -1 do
@@ -76,7 +80,11 @@ function M.take_head(lines, max)
   end
   local total = #lines[1]
   if total > max then
-    return { lines[1]:sub(1, max) }, false
+    local l, e = lines[1], max
+    if vim.str_utf_end(l, e) ~= 0 then -- never end inside a multibyte character
+      e = e + vim.str_utf_start(l, e) - 1
+    end
+    return { l:sub(1, e) }, false
   end
   local last = 1
   for i = 2, n do
@@ -266,7 +274,10 @@ local function edits_blocks(buf)
   for i = #ev, 1, -1 do -- most recent first (priority)
     local e = ev[i]
     if api.nvim_buf_is_valid(e.buf) and not secrets.is_blocked(e.path) then
-      local diff = secrets.redact_text(e.diff, e.path)
+      -- redact_diff is hunk-aware: it sees the lines without their "+"/"-"/" " prefix, so the PEM rule and the
+      -- path's providers apply (redact_text would miss a pasted key). It wants a git header, dropped again.
+      local hdr = ("diff --git a/%s b/%s\n"):format(e.path, e.path)
+      local diff = secrets.redact_diff(hdr .. e.diff):gsub("^[^\n]*\n", "", 1)
       local lines = { "File: " .. relpath(e.path, buf) }
       vim.list_extend(lines, vim.split(diff:gsub("\n$", ""), "\n", { plain = true }))
       out[#out + 1] = lines
@@ -327,7 +338,12 @@ function M.fim(buf, row, col, opts)
   local first = math.max(0, row - math.min(M.window.before, span))
   local last = math.min(nlines - 1, row + math.min(M.window.after, span))
   local raw = api.nvim_buf_get_lines(buf, first, last + 1, false)
-  local spans = secrets.spans(buf, raw, first)
+  -- spans over LOOKBACK more rows above the window: a PEM block that begins above it still covers its rows
+  local lb = math.max(0, first - secrets.LOOKBACK)
+  local above = api.nvim_buf_get_lines(buf, lb, first, false)
+  local spans = vim.tbl_filter(function(s)
+    return s.row >= first
+  end, secrets.spans(buf, vim.list_extend(above, raw), lb))
   local cur = raw[row - first + 1] or ""
   col = math.min(col, #cur)
   local before_spans, after_spans = {}, {}
@@ -510,7 +526,10 @@ local SKIP_DIRS = {
 }
 
 local files_cache = {} ---@type table<string, {time: number, files: string[]}>
+local files_jobs = {} ---@type table<string, true>  roots with a `git ls-files` in flight
 M.files_ttl = 30000
+M.files_wait = 500 -- ms the FIRST listing of a root waits for git (later ones return the cache, git refreshes it)
+M.files_walk_ms = 300 -- time budget of the directory walk (no git, not a repository, git still running)
 local files_au = false
 
 local function files_autocmds()
@@ -527,30 +546,11 @@ local function files_autocmds()
   })
 end
 
-local function list_files(root)
-  local res
-  if vim.fn.executable("git") == 1 then
-    local ok, obj = pcall(vim.system, {
-      "git",
-      "-C",
-      root,
-      "ls-files",
-      "--cached",
-      "--others",
-      "--exclude-standard",
-      "-z",
-    }, { text = true })
-    if ok then
-      res = obj:wait(3000)
-    end
-  end
-  local out = {}
-  if res and res.code == 0 then
-    for f in (res.stdout or ""):gmatch("[^%z]+") do
-      out[#out + 1] = f
-    end
-    return out
-  end
+--- Directory walk fallback, bounded in files and time (it runs on the main loop).
+---@param root string
+---@return string[]
+local function walk(root)
+  local out, t0 = {}, vim.uv.hrtime()
   for name, kind in
     vim.fs.dir(root, {
       depth = 20,
@@ -561,7 +561,7 @@ local function list_files(root)
   do
     if kind == "file" then
       out[#out + 1] = name
-      if #out >= 20000 then
+      if #out >= 20000 or vim.uv.hrtime() - t0 > M.files_walk_ms * 1e6 then
         break
       end
     end
@@ -569,20 +569,11 @@ local function list_files(root)
   return out
 end
 
---- Project files relative to `root` (git ls-files --cached --others --exclude-standard, else a directory walk),
---- secrets-filtered, cached per root (30 s; invalidated on file create/delete/rename). The first call per root
---- runs git synchronously (fast); later calls return the cache.
----@param root? string                    default core.project.root()
+--- Secrets-filtered, sorted copy of `rel` (paths relative to root).
+---@param root string
+---@param rel string[]
 ---@return string[]
-function M.files(root)
-  root = root or require("slop.core.project").root()
-  files_autocmds()
-  local c = files_cache[root]
-  local now = vim.uv.now()
-  if c and now - c.time < M.files_ttl then
-    return c.files
-  end
-  local rel = list_files(root)
+local function keep_files(root, rel)
   local abs = {}
   for i, f in ipairs(rel) do
     abs[i] = vim.fs.joinpath(root, f)
@@ -598,8 +589,75 @@ function M.files(root)
     end
   end
   table.sort(out)
-  files_cache[root] = { time = now, files = out }
   return out
+end
+
+--- Start `git ls-files` for `root` without waiting. `on_exit(list)` runs in the luv callback (fast context) with
+--- the relative paths, or false when git failed (e.g. not a repository). Returns false when git cannot start.
+---@param root string
+---@param on_exit fun(list: string[]|false)
+---@return boolean started
+local function git_ls(root, on_exit)
+  if vim.fn.executable("git") ~= 1 then
+    return false
+  end
+  local cmd = { "git", "-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z" }
+  local ok = pcall(vim.system, cmd, { text = true }, function(res)
+    local list = false ---@type string[]|false
+    if res.code == 0 then
+      list = {}
+      for f in (res.stdout or ""):gmatch("[^%z]+") do
+        list[#list + 1] = f
+      end
+    end
+    on_exit(list)
+  end)
+  return ok
+end
+
+--- Project files relative to `root` (git ls-files --cached --others --exclude-standard, else a directory walk),
+--- secrets-filtered, cached per root (30 s; invalidated on file create/delete/rename). Never blocks for long: git
+--- runs in the background; the first call per root waits up to `M.files_wait` ms for it (else it returns a walk
+--- bounded by `M.files_walk_ms`), later calls return the cache while git refreshes it.
+---@param root? string                    default core.project.root()
+---@return string[]
+function M.files(root)
+  root = root or require("slop.core.project").root()
+  files_autocmds()
+  local c = files_cache[root]
+  if c and vim.uv.now() - c.time < M.files_ttl then
+    return c.files
+  end
+  local result ---@type string[]|false|nil  nil = git still running
+  local used = false -- the git list was consumed right here (the scheduled refresh must not redo it)
+  if not files_jobs[root] then
+    files_jobs[root] = true
+    local started = git_ls(root, function(list)
+      result = list
+      vim.schedule(function()
+        files_jobs[root] = nil
+        if list and not used then
+          files_cache[root] = { time = vim.uv.now(), files = keep_files(root, list) }
+        end
+      end)
+    end)
+    if not started then
+      files_jobs[root] = nil
+      result = false
+    elseif not c then
+      -- fast events only (the git exit callback): also safe inside a completion function (textlock)
+      vim.wait(M.files_wait, function()
+        return result ~= nil
+      end, 10, true)
+    end
+  end
+  if result == nil and c then
+    return c.files -- stale but instant; the git listing in flight replaces it
+  end
+  used = result ~= nil
+  local list = keep_files(root, result or walk(root))
+  files_cache[root] = { time = vim.uv.now(), files = list }
+  return list
 end
 
 --- Invalidate the files cache (all roots or one).
@@ -635,10 +693,16 @@ function M.file(path, opts)
   if secrets.is_blocked(abs) then
     return nil, "blocked by secrets rules: " .. path
   end
-  local max = opts.max_bytes or 100 * 1024
+  local max = opts.max_bytes or (100 * 1024)
   local text
-  local b = vim.fn.bufnr(abs)
-  if b > 0 and api.nvim_buf_is_loaded(b) then
+  local b = -1 -- exact name match (bufnr() takes a file-pattern and accepts partial matches)
+  for _, x in ipairs(api.nvim_list_bufs()) do
+    if api.nvim_buf_is_loaded(x) and vim.fs.normalize(api.nvim_buf_get_name(x)) == abs then
+      b = x
+      break
+    end
+  end
+  if b > 0 then
     text = table.concat(api.nvim_buf_get_lines(b, 0, -1, false), "\n")
   else
     local st = vim.uv.fs_stat(abs)

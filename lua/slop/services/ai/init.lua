@@ -4,7 +4,7 @@
 --- Callers MUST redact every text they put into a request with core.secrets before calling.
 ---
 --- API-key resolution for provider <p> (see `M.api_key`):
----   1. `api_key = function() return "..." end`  -> its return value
+---   1. `api_key = function() return "..." end`  -> its return value (cached for `M.key_ttl` ms)
 ---   2. `api_key = "SOME_ENV_VAR"`               -> os.getenv("SOME_ENV_VAR")   (strings are ALWAYS env var
 ---                                                  names; literal keys in config are rejected)
 ---   3. `api_key = false`                        -> no key (local servers: ollama, llama.cpp)
@@ -24,13 +24,15 @@ local M = {
 ---@field model string
 ---@field api_key? string|false|fun(): string?  see resolution rules above
 ---@field format? string                  request/response dialect (provider adapter name), default from service
----@field params? table                   extra body params merged into the request body (top_p, reasoning, ...)
+---@field params? table                   extra body params merged into the request body (top_p, reasoning, ...);
+---                                        a vim.NIL value removes that field (e.g. temperature = vim.NIL)
 ---@field headers? table<string, string>  extra request headers
 ---@field transform? fun(req: slop.http.Request, info: {name: string?, kind: string, provider: slop.ai.ProviderConfig}): slop.http.Request?
 ---@field fim_template? false|"qwen"|"deepseek"|"codellama"|"starcoder"|"codestral"|fun(prompt: string, suffix: string): string
 ---@field chat_fim? table                 chat-model FIM prompt overrides (see services/ai/chat_fim.lua)
 ---@field stream? boolean                 false disables streaming for this provider
----@field timeout? integer                ms; minimum for every request to this provider (default 30000)
+---@field timeout? integer                ms; minimum for every request to this provider (unset: no minimum, the
+---                                        request's own timeout applies; 30000 when neither is set)
 ---@field max_tokens? integer             minimum max_tokens for every chat request (reasoning models think first)
 ---@field name? string                    display name
 
@@ -149,6 +151,30 @@ function M.api_key_source(p)
   return "none"
 end
 
+M.NOT_A_NAME = "api_key takes an environment variable NAME (or a function)"
+
+--- Can `var` be an environment variable NAME? (anything else is a key pasted into the config by mistake)
+---@param var any
+---@return boolean
+function M.valid_var(var)
+  return type(var) == "string" and var:match("^[%a_][%w_]*$") ~= nil
+end
+
+--- `$NAME` for messages, only for conventional names (UPPER_CASE with "_", or short): an api_key string may be an
+--- alphanumeric key pasted by mistake, and key values must never reach a message.
+---@param var string
+---@return string
+function M.var_label(var)
+  if type(var) == "string" and var:match("^[%u_][%u%d_]*$") and (var:find("_", 1, true) or #var <= 16) then
+    return "$" .. var
+  end
+  return "the environment variable named by api_key"
+end
+
+-- api_key functions often ask a password manager (pass, op, security): call them once, not on every keystroke
+M.key_ttl = 5 * 60 * 1000
+local key_cache = setmetatable({}, { __mode = "k" }) ---@type table<slop.ai.ProviderConfig, {key: string, time: number}>
+
 --- Resolve a provider's API key (never log the result).
 ---@param name_or_cfg string|slop.ai.ProviderConfig
 ---@return string? key, string? err
@@ -159,6 +185,10 @@ function M.api_key(name_or_cfg)
   end
   local source, var = M.api_key_source(p)
   if source == "function" then
+    local cached = key_cache[p]
+    if cached and vim.uv.now() - cached.time < M.key_ttl then
+      return cached.key
+    end
     local ok, key = pcall(p.api_key)
     if not ok then
       return nil, "api_key function failed: " .. tostring(key)
@@ -166,13 +196,17 @@ function M.api_key(name_or_cfg)
     if type(key) ~= "string" or key == "" then
       return nil, "api_key function returned no key"
     end
+    key_cache[p] = { key = key, time = vim.uv.now() }
     return key
   elseif source == "env" then
+    if not M.valid_var(var) then
+      return nil, M.NOT_A_NAME
+    end
     local key = os.getenv(var --[[@as string]])
     if key and key ~= "" then
       return key
     end
-    return nil, ("$%s is not set"):format(var)
+    return nil, ("%s is not set"):format(M.var_label(var --[[@as string]]))
   end
   return nil
 end
@@ -306,10 +340,11 @@ local function run(kind, req, finish, on_text)
   end
   local hreq = adapter[akind](p, areq, key)
   if type(hreq.body) == "table" then
-    providers.compact(hreq.body)
     if type(p.params) == "table" then
       hreq.body = vim.tbl_deep_extend("force", hreq.body, p.params)
     end
+    -- after the merge, so params = { temperature = vim.NIL } drops a field the model rejects
+    providers.compact(hreq.body)
   end
   if type(p.headers) == "table" then
     hreq.headers = vim.tbl_extend("force", hreq.headers or {}, p.headers)
@@ -422,7 +457,17 @@ local function run(kind, req, finish, on_text)
     return done(t, items, err)
   end
   events.emit("ai", "RequestStarted", info)
-  return require("slop.core.http").request(hreq)
+  local ok, handle = pcall(require("slop.core.http").request, hreq)
+  if not ok then
+    -- e.g. no url, a transform that returned a broken request, params that are not JSON: still exactly one
+    -- on_done (and RequestFinished), never an error thrown into the caller
+    local msg = ("provider %s: invalid request: %s"):format(label, (tostring(handle):gsub("^[^\n]-:%d+: ", "")))
+    vim.schedule(function()
+      finish(nil, nil, { kind = "config", message = msg })
+    end)
+    return dead_handle()
+  end
+  return handle
 end
 
 --- Fill-in-the-middle completion. A provider with kind = "chat" is driven through chat-FIM prompting.
@@ -454,13 +499,22 @@ function M.health()
     local p = c.providers[name]
     local source, var = M.api_key_source(p)
     local label = ("provider `%s` (%s, %s)"):format(name, tostring(p.kind), tostring(p.service))
-    if source == "env" then
+    if source == "env" and not M.valid_var(var) then
+      -- never echo the value: it is most likely the key itself
+      h.error(("%s: %s"):format(label, M.NOT_A_NAME), {
+        ('set ai.providers.%s.api_key = "SOME_ENV_VAR" (and export SOME_ENV_VAR=...) or a function'):format(name),
+      })
+    elseif source == "env" then
       local set = os.getenv(var --[[@as string]])
+      local shown = M.var_label(var --[[@as string]])
       if set and set ~= "" then
-        h.ok(("%s: key from $%s (set)"):format(label, var))
+        h.ok(("%s: key from %s (set)"):format(label, shown))
       else
-        h.warn(("%s: key from $%s (NOT set)"):format(label, var), {
-          ('export %s=... or set ai.providers.%s.api_key = "OTHER_ENV_VAR" | function'):format(var, name),
+        h.warn(("%s: key from %s (NOT set)"):format(label, shown), {
+          ('export %s=... or set ai.providers.%s.api_key = "OTHER_ENV_VAR" | function'):format(
+            shown:match("^%$(.+)$") or "<the variable>",
+            name
+          ),
         })
       end
     elseif source == "function" then

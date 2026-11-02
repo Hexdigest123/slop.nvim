@@ -107,12 +107,25 @@ function M.strip_fence(s)
   return body or s
 end
 
+--- Drop the leading <think>…</think> block of reasoning models that inline their thinking (ollama / llama.cpp
+--- without a reasoning parser). While it is still open (streaming) there is no answer yet.
+---@param s string
+---@return string
+local function strip_think(s)
+  -- only newlines after </think>: the answer itself may start with indentation
+  s = s:gsub("^%s*<think>.-</think>\n*", "", 1)
+  if s:match("^%s*<think>") then
+    return ""
+  end
+  return s
+end
+
 --- Split a chat reply into candidates.
 ---@param text string
 ---@return string[]
 function M.parse(text)
   local out = {}
-  text = (text or ""):gsub("\r\n", "\n")
+  text = strip_think(((text or ""):gsub("\r\n", "\n")))
   for part in (text .. "\n" .. M.separator):gmatch("(.-)\n?%s*" .. vim.pesc(M.separator)) do
     part = M.strip_fence(part):gsub("^\n", ""):gsub("%s+$", "")
     if part:match("%S") then
@@ -126,6 +139,7 @@ end
 ---@param text string
 ---@return string
 function M.first_partial(text)
+  text = strip_think(text)
   local at = text:find(M.separator, 1, true)
   local first = at and text:sub(1, at - 1) or text
   -- hide a partially streamed separator ("<EN") and the line break before a separator
@@ -135,6 +149,12 @@ function M.first_partial(text)
     first = first:gsub("\n%s*$", "")
   end
   first = first:gsub("^%s*```[%w_+%-]*\n", "")
+  -- an opening fence still streaming ("``", "```lu") would become the shown prefix and freeze the preview;
+  -- a closing fence starting to stream is not part of the answer either
+  if first:match("^%s*`+[%w_+%-]*$") then
+    return ""
+  end
+  first = first:gsub("\n`+$", "")
   return (first:gsub("^\n", ""))
 end
 
