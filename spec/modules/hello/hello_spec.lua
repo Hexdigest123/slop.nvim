@@ -24,6 +24,14 @@ describe("hello module (full contract)", function()
     assert.equal(1, hello.setups())
   end)
 
+  it("a later setup() takes effect without a second module setup", function()
+    local hello = require("slop").hello
+    assert.equal("Hi, world!", hello.greet())
+    require("slop").setup({ hello = { enabled = true, greeting = "Yo", target = "you", silent = true } })
+    assert.equal("Yo, you!", hello.greet())
+    assert.equal(1, hello.setups())
+  end)
+
   it("command, keymap and highlight", function()
     vim.cmd("Slop hello greet x")
     h.feed(" sH")

@@ -11,7 +11,7 @@
 ---   events           -> User SlopHelloGreet { text, count }
 local events = require("slop.core.events")
 
-local state = { cfg = nil, count = 0, setups = 0 }
+local state = { count = 0, setups = 0 }
 
 local api = {}
 
@@ -19,7 +19,8 @@ local api = {}
 ---@param target? string
 ---@return string text
 function api.greet(target)
-  local cfg = state.cfg or require("slop.config").get("hello")
+  -- read on every call (not cached by setup()): a later require("slop").setup() must take effect
+  local cfg = require("slop.config").get("hello")
   local text = ("%s, %s!"):format(cfg.greeting, target or cfg.target)
   state.count = state.count + 1
   if not cfg.silent then
@@ -57,8 +58,7 @@ return {
     check("target", cfg.target, "string")
     check("silent", cfg.silent, "boolean")
   end,
-  setup = function(cfg)
-    state.cfg = cfg
+  setup = function(_)
     state.setups = state.setups + 1
   end,
   commands = {
