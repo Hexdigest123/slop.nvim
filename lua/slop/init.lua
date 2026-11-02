@@ -6,7 +6,7 @@
 ---@field config slop.ConfigModule
 local M = {}
 
-M.version = "0.0.0" -- x-release-please-version
+M.version = "1.0.0" -- x-release-please-version
 
 --- Configure slop. Optional: the plugin works with defaults / `vim.g.slop`.
 --- Safe to call any number of times, before or after plugin/slop.lua is sourced.
