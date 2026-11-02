@@ -9,6 +9,7 @@ local M = {}
 
 local api = vim.api
 local registered = false
+local source_id ---@type integer? cmp.register_source() result, for unregister_source()
 
 local function engine()
   return require("slop.modules.complete.engine")
@@ -25,7 +26,15 @@ function source:get_debug_name()
   return "slop"
 end
 
+-- A cmp that keeps the source after the module was disabled must not get answers (they send buffer text).
+local function module_loaded()
+  return require("slop.core.registry").is_loaded("complete")
+end
+
 function source:is_available()
+  if not module_loaded() then
+    return false
+  end
   return (engine().allowed(api.nvim_get_current_buf(), true))
 end
 
@@ -64,7 +73,7 @@ end
 
 function source:complete(params, callback)
   local buf = (params.context and params.context.bufnr) or api.nvim_get_current_buf()
-  if vim.b[buf].completion == false then
+  if vim.b[buf].completion == false or not module_loaded() then
     return callback({ items = {}, isIncomplete = false })
   end
   local eng = engine()
@@ -101,13 +110,23 @@ function M.register()
   if type(cmp) ~= "table" or type(cmp.register_source) ~= "function" then
     return false
   end
-  local ok, err = pcall(cmp.register_source, "slop", source.new())
+  local ok, res = pcall(cmp.register_source, "slop", source.new())
   if not ok then
-    require("slop.core.log").scope("complete").debug("cmp.register_source failed: %s", err)
+    require("slop.core.log").scope("complete").debug("cmp.register_source failed: %s", res)
     return false
   end
   registered = true
+  source_id = type(res) == "number" and res or nil
   return true
+end
+
+--- Unregister the source (module teardown; a later setup() registers it again).
+function M.unregister()
+  local cmp = package.loaded["cmp"]
+  if registered and source_id and type(cmp) == "table" and type(cmp.unregister_source) == "function" then
+    pcall(cmp.unregister_source, source_id)
+  end
+  registered, source_id = false, nil
 end
 
 ---@return boolean

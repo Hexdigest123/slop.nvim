@@ -166,8 +166,35 @@ function api.cmp_map(action, otherwise)
   end
 end
 
+-- Keys of the native popup menu (ins-completion-menu: 0.12 'autocomplete', i_CTRL-N, omnifunc/LSP). The menu and
+-- the ghost text are often visible together; a slop key bound to one of them yields to the menu meanwhile.
+local MENU_KEYS = { "<C-n>", "<C-p>", "<C-y>", "<C-e>" }
+
+---@param fn string                         action name (also the keymaps config key)
+---@return boolean
+local function menu_owns(fn)
+  if vim.fn.pumvisible() ~= 1 then
+    return false
+  end
+  local lhs = vim.tbl_get(require("slop.config").get("complete"), "keymaps", fn)
+  if type(lhs) ~= "string" or lhs == "" then
+    return false
+  end
+  local key = vim.keycode(lhs)
+  for _, k in ipairs(MENU_KEYS) do
+    if vim.keycode(k) == key then
+      -- <C-y> confirms a selected menu item; with nothing selected it still accepts the ghost
+      return fn ~= "accept" or vim.fn.complete_info({ "selected" }).selected ~= -1
+    end
+  end
+  return false
+end
+
 local function fallthrough(fn)
   return function()
+    if menu_owns(fn) then
+      return false
+    end
     return engine()[fn]()
   end
 end
@@ -323,6 +350,11 @@ return {
   teardown = function()
     engine().teardown()
     pcall(vim.api.nvim_del_augroup_by_name, "slop.complete")
+    -- a disabled module must not keep answering nvim-cmp (it would still send buffer text to the provider)
+    local cmp = package.loaded["slop.modules.complete.cmp"]
+    if cmp then
+      cmp.unregister()
+    end
   end,
 
   highlights = {
@@ -352,6 +384,9 @@ return {
       fallthrough = true,
       desc = "accept n suggestion lines",
       rhs = function()
+        if menu_owns("accept_n_lines") then
+          return false
+        end
         return engine().accept_n_lines()
       end,
     },
@@ -439,14 +474,19 @@ return {
       h.error(("provider `%s` is not defined in ai.providers"):format(c.provider))
     else
       local source, var = ai.api_key_source(p)
-      local key = source == "env" and (
-          os.getenv(var --[[@as string]]) or ""
-        ) ~= ""
       local msg = ("provider `%s` (%s, %s, %s)"):format(c.provider, p.kind, p.service or "?", p.model)
-      if source == "env" and not key then
-        h.warn(msg .. (": $%s is NOT set"):format(var))
+      if source == "env" and not ai.valid_var(var) then
+        h.error(msg .. ": " .. ai.NOT_A_NAME) -- never echo the value: it is most likely the key itself
+      elseif source == "env" then
+        local shown = ai.var_label(var --[[@as string]])
+        local set = os.getenv(var --[[@as string]])
+        if not set or set == "" then
+          h.warn(msg .. (": %s is NOT set"):format(shown))
+        else
+          h.ok(msg .. (": key from %s (set)"):format(shown))
+        end
       else
-        h.ok(msg .. (source == "env" and (": key from $%s (set)"):format(var) or (": key " .. source)))
+        h.ok(msg .. ": key " .. source)
       end
       if p.kind == "chat" then
         h.info("chat provider: completions use chat-FIM prompting (slower than a FIM endpoint)")

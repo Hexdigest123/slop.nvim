@@ -33,6 +33,7 @@ local api = vim.api
 ---@field no_render? boolean
 ---@field manual boolean
 ---@field pending_next? boolean
+---@field t0? number                       hrtime of the request in flight (RequestFinished ms on cancel)
 
 M.auto = true -- global auto-trigger switch (toggle)
 M.cfg = nil ---@type table?
@@ -212,6 +213,19 @@ local function cancel_req(req)
   if not req then
     return
   end
+  if req.loading or req.fetching then
+    -- every RequestStarted gets its RequestFinished (statusline / progress counters), also when typing made it stale
+    events().emit("complete", "RequestFinished", {
+      buf = req.buf,
+      provider = cfg().provider,
+      id = req.id,
+      items = #req.items,
+      ok = false,
+      error = "cancelled",
+      ms = req.t0 and math.floor((vim.uv.hrtime() - req.t0) / 1e6) or 0,
+    })
+    req.loading, req.fetching = false, false
+  end
   for _, h in ipairs(req.handles) do
     pcall(h.cancel, h)
   end
@@ -339,6 +353,7 @@ function M.request(buf, req, first, on_more)
   local stream = first and c.stream and not req.no_render
   events().emit("complete", "RequestStarted", { buf = buf, provider = c.provider, id = req.id, n = #req.items + 1 })
   local t0 = vim.uv.hrtime()
+  req.t0 = t0
   local handle
   handle = ai.complete_fim({
     provider = c.provider,
@@ -376,6 +391,7 @@ function M.request(buf, req, first, on_more)
       local ms = (vim.uv.hrtime() - t0) / 1e6
       if first then
         req.loading = false
+        req.text = "" -- the processed candidates supersede the raw streamed preview (rejected ones must vanish)
       else
         req.fetching = false
       end
@@ -640,8 +656,8 @@ function M.render(buf)
       M.schedule(buf)
       return
     end
-  elseif typed ~= "" and req.loading then
-    -- typed away from the anchor before anything arrived: the request is stale
+  elseif typed ~= "" then
+    -- typed on while nothing is shown (still loading, or finished empty / failed): start over from here
     M.reset(buf)
     M.schedule(buf)
     return
@@ -724,7 +740,7 @@ local function read_count()
     return tonumber(ch) --[[@as integer]]
   end
   if ok and ch ~= "" and ch ~= "\27" then
-    api.nvim_feedkeys(ch, "m", false)
+    api.nvim_feedkeys(vim.keycode(vim.fn.keytrans(ch)), "mi", false) -- front of typeahead, keys re-escaped
   end
   return 1
 end

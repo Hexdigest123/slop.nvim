@@ -23,7 +23,9 @@ describe("complete module", function()
     srv = mock.start(function(req, res)
       local body = vim.json.decode(req.body)
       local r = table.remove(mine, 1) or { "" }
-      if body.stream then
+      if r.status then
+        res.json(r.status, { message = "boom" })
+      elseif body.stream then
         res.stream(200, sse_fim(r), { delay = r.delay or 2 })
       else
         res.json(200, { choices = { { message = { content = table.concat(r) } } } })
@@ -450,5 +452,216 @@ describe("complete module", function()
     local spec = require("slop.modules.complete")
     local ok = pcall(spec.health)
     assert.is_true(ok)
+  end)
+
+  local function wait_settled(n)
+    vim.wait(2000, function()
+      return #srv.requests == n and engine.status(buf).state ~= "loading"
+    end, 5)
+    vim.wait(20)
+  end
+
+  it("an empty response does not stop suggestions: typing on requests again", function()
+    responses = { { "" }, { "second()" } }
+    setup()
+    open({ "local x = " })
+    insert(function()
+      engine.sync(buf)
+      wait_settled(1)
+      type_text("f")
+      wait_ghost("second()")
+    end)
+    assert.equal(2, #srv.requests)
+  end)
+
+  it("a failed request (HTTP 500) does not stop suggestions either", function()
+    responses = { { status = 500 }, { "second()" } }
+    setup()
+    open({ "local x = " })
+    insert(function()
+      engine.sync(buf)
+      wait_settled(1)
+      type_text("f")
+      wait_ghost("second()")
+    end)
+    assert.equal(2, #srv.requests)
+  end)
+
+  it("a streamed candidate that post-processing rejects is not shown (duplicate of the next line)", function()
+    responses = { { "\nreturn x" } }
+    setup({ complete = { cache = false } })
+    open({ "local x = ", "return x" })
+    api.nvim_win_set_cursor(0, { 1, 9 })
+    insert(function()
+      engine.sync(buf)
+      wait_settled(1)
+      assert.is_nil(text())
+      assert.is_false(engine.accept())
+    end)
+    assert.are.same({ "local x = ", "return x" }, lines())
+  end)
+
+  it("every RequestStarted gets a RequestFinished, also when typing cancels the request", function()
+    responses = { { "aaa", "bbb", "ccc", "ddd", delay = 60 }, { "zzz" } }
+    setup()
+    local started, finished = {}, {}
+    require("slop.core.events").on("complete", "RequestStarted", function(d)
+      started[#started + 1] = d.id
+    end)
+    require("slop.core.events").on("complete", "RequestFinished", function(d)
+      finished[#finished + 1] = d
+    end)
+    open({ "q = " })
+    insert(function()
+      engine.sync(buf)
+      wait_ghost("aaa")
+      type_text("X") -- stale while streaming: cancelled
+      wait_ghost("zzz", true)
+    end)
+    assert.equal(2, #started)
+    assert.are.same(
+      started,
+      vim.tbl_map(function(d)
+        return d.id
+      end, finished)
+    )
+    assert.is_false(finished[1].ok)
+    assert.equal("cancelled", finished[1].error)
+    assert.is_true(finished[2].ok)
+  end)
+
+  it("<M-n> + a non-digit: the key goes back in front of pending typeahead, multibyte intact", function()
+    responses = { { "if a then\n  b()\nend" } }
+    setup({ complete = { cache = false } })
+    open({ "" })
+    insert(function()
+      engine.sync(buf)
+      wait_ghost("if a then\n  b()\nend")
+      -- typeahead as during a macro replay: <M-n> — z <Esc> ("—" is E2 80 94: contains K_SPECIAL)
+      api.nvim_feedkeys("—z", "mti", true)
+      api.nvim_feedkeys(vim.keycode("<M-n>"), "mti", false)
+    end, "i")
+    assert.are.same({ "if a then—z" }, lines())
+  end)
+
+  describe("native popup menu visible (0.12 'autocomplete', i_CTRL-N, omnifunc)", function()
+    local probes, calls
+    local function spy(name)
+      local orig = engine[name]
+      engine[name] = function(...)
+        calls[#calls + 1] = name
+        return orig(...)
+      end
+    end
+    local function prepare()
+      responses = { { "ghost_text()" } }
+      setup({ complete = { cache = false } })
+      open({ "x = " })
+      probes, calls = {}, {}
+      spy("next")
+      spy("dismiss")
+      spy("accept")
+      vim.keymap.set("i", "<F10>", function()
+        probes[#probes + 1] = { line = api.nvim_get_current_line(), pum = vim.fn.pumvisible() }
+      end)
+    end
+    after_each(function()
+      vim.o.completeopt = "menu,popup"
+    end)
+
+    it("<C-n>, <C-y> (item selected) and <C-e> go to the menu, not to the ghost", function()
+      prepare()
+      insert(function()
+        engine.sync(buf)
+        wait_ghost("ghost_text()")
+        vim.fn.complete(vim.fn.col("."), { "alpha", "beta" }) -- inserts and selects "alpha"
+        -- queued in reverse: "i" inserts at the front of the typeahead
+        api.nvim_feedkeys(vim.keycode("<F10><C-y><F10>"), "mti", false)
+        -- <C-n> through slop's map (Vim leaves it unmapped in complete() mode, 'autocomplete' maps it)
+        vim.fn.maparg("<C-n>", "i", false, true).callback()
+      end)
+      assert.are.same({ { line = "x = beta", pum = 1 }, { line = "x = beta", pum = 0 } }, probes)
+      assert.are.same({}, calls)
+
+      prepare()
+      insert(function()
+        engine.sync(buf)
+        wait_ghost("ghost_text()")
+        vim.fn.complete(vim.fn.col("."), { "alpha", "beta" })
+        api.nvim_feedkeys(vim.keycode("<C-e><F10>"), "mti", false)
+      end)
+      assert.are.same({ { line = "x = ", pum = 0 } }, probes) -- the menu closed and restored the typed text
+      assert.are.same({}, calls)
+    end)
+
+    it("<C-y> still accepts the ghost when no menu item is selected", function()
+      prepare()
+      vim.o.completeopt = "menu,noselect"
+      insert(function()
+        engine.sync(buf)
+        wait_ghost("ghost_text()")
+        vim.fn.complete(vim.fn.col("."), { "alpha", "beta" })
+        api.nvim_feedkeys(vim.keycode("<C-y><F10>"), "mti", false)
+      end)
+      assert.are.same({ { line = "x = ghost_text()", pum = 0 } }, probes)
+      assert.are.same({ "accept" }, calls)
+    end)
+  end)
+
+  it("disabling the module unregisters the nvim-cmp source", function()
+    local src, unregistered = nil, {}
+    package.loaded["cmp"] = {
+      register_source = function(_, s)
+        src = s
+        return 7
+      end,
+      unregister_source = function(id)
+        unregistered[#unregistered + 1] = id
+      end,
+    }
+    setup({ complete = { frontend = "cmp" } })
+    open({ "m = " })
+    assert.is_true(src:is_available())
+    require("slop.core.registry").disable("complete")
+    assert.are.same({ 7 }, unregistered)
+    assert.is_false(src:is_available())
+    -- a cmp that kept the source object anyway gets nothing, and nothing is sent
+    local got
+    insert(function()
+      src:complete({ context = { bufnr = buf, option = { reason = "manual" } } }, function(res)
+        got = res
+      end)
+      vim.wait(100)
+    end)
+    assert.are.same({}, got.items)
+    assert.equal(0, #srv.requests)
+  end)
+
+  it("health never prints an api_key value that is not an env var name", function()
+    local orig = vim.health
+    for _, pasted in ipairs({ "sk-live-PASTED0123456789abcdef", "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" }) do
+      require("slop").setup({
+        ai = {
+          providers = {
+            p = { kind = "fim", service = "mistral", url = "http://127.0.0.1:9", model = "m", api_key = pasted },
+          },
+        },
+        complete = { provider = "p" },
+      })
+      local out = {}
+      vim.health = setmetatable({}, {
+        __index = function(_, kind)
+          return function(msg, advice)
+            out[#out + 1] = kind .. ": " .. tostring(msg) .. " " .. vim.inspect(advice)
+          end
+        end,
+      })
+      local ok, err = pcall(require("slop.modules.complete").health)
+      vim.health = orig
+      assert(ok, err)
+      local all = table.concat(out, "\n")
+      assert.is_nil(all:find(pasted, 1, true), all)
+      assert.matches(pasted:find("-", 1, true) and "environment variable NAME" or "named by api_key", all)
+    end
   end)
 end)

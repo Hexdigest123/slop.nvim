@@ -65,8 +65,33 @@ the mapping it replaced (for example nvim-cmp's) or to the native key.
 Normal mode:
   <leader>at  toggle automatic suggestions           keymaps.toggle
 
-Each accept is one undo step. Set any key to `false` to disable it. If you
-already mapped a key yourself, slop leaves it alone.
+Each accept is one undo step. Accepted text is inserted directly, not typed,
+so |.| repeats only what you typed yourself, not the accepted suggestion. Set
+any key to `false` to disable it.
+
+The Insert-mode keys above wrap a mapping that already exists on the same
+key: slop acts while a suggestion is visible, otherwise your mapping (or the
+native key) runs. `trigger` and `toggle` are not mapped at all when the key is
+already taken.
+
+While the native popup menu is visible (|ins-completion-menu|: 0.12
+'autocomplete', |i_CTRL-N|, an omnifunc or LSP), the menu keeps its own keys:
+<C-n>, <C-p> and <C-e> go to the menu, and so does <C-y> when a menu item is
+selected (with nothing selected, <C-y> accepts the suggestion). This applies
+to the slop keys that are set to one of these four keys.
+
+Every action is also a `<Plug>` mapping for your own keys:
+`<Plug>(slop-complete-accept)`, `-accept-word`, `-accept-line`,
+`-accept-n-lines`, `-next`, `-prev`, `-dismiss`, `-trigger` and
+`-toggle` (Normal mode), e.g. >lua
+  vim.keymap.set("i", "<M-a>", "<Plug>(slop-complete-accept)",
+    { remap = true })
+<
+An Insert-mode `<Plug>` does nothing when no suggestion is visible (it has
+nothing to fall through to), so for a key that must keep its own meaning use
+the `keymaps` option instead: `keymaps = { accept = "<Tab>" }` falls through
+to a normal <Tab>. Set the matching `keymaps` entry to `false` when you map a
+`<Plug>` to that same key yourself.
 
 The ghost text also shows while the nvim-cmp menu is open
 (`show_with_cmp_menu`). nvim-cmp maps its keys per buffer, so those
@@ -129,7 +154,8 @@ Providers are shared by all slop AI features and live in `opts.ai.providers`.
 Each one has a `kind`: "fim" for native fill-in-the-middle endpoints, or
 "chat" for chat models. A chat provider can also serve completions: slop then
 prompts it to fill in the middle, and it may return several alternatives.
-This is slower than a FIM endpoint.
+This is slower than a FIM endpoint. A leading `<think>…</think>` block (local
+reasoning models that inline their thinking) is dropped, never suggested.
 
   field          meaning ~
   kind           "fim" | "chat"
@@ -139,12 +165,17 @@ This is slower than a FIM endpoint.
   model          model name
   api_key        env var NAME (string), function returning the key, or false
                  (no key, e.g. local servers). Default: <SERVICE>_API_KEY,
-                 e.g. MISTRAL_API_KEY. Literal keys are rejected.
+                 e.g. MISTRAL_API_KEY. Literal keys are rejected (and never
+                 printed by messages or |:checkhealth|). A function is called
+                 once and its key kept for 5 minutes, so a password-manager
+                 call does not run on every keystroke.
   format         dialect override: "mistral" | "openai" | "anthropic" |
                  "gemini" | "llamacpp" (default derived from `service`;
                  unknown services use "openai")
   params         table deep-merged into the request body (top_p, reasoning
-                 settings, ollama `options`, ...)
+                 settings, ollama `options`, ...). A `vim.NIL` value removes
+                 that field, also nested, e.g. `{ temperature = vim.NIL }`
+                 for a model that rejects it
   headers        extra request headers
   transform      fun(http_request, info) -> http_request (rewrite url/body,
                  or set `proxy` / `extra_args` for curl)
@@ -156,11 +187,15 @@ This is slower than a FIM endpoint.
                  {{prefix}} {{suffix}} and your own vars)
   stream         false disables streaming
   timeout        minimum request timeout (ms) for every module using this
-                 provider (default 30000; a module's own `timeout` can only
-                 raise it)
+                 provider: a module's own `timeout` (complete: 10000) can
+                 only raise it. Unset: no minimum, the module's timeout
+                 applies (30000 when neither sets one)
   max_tokens     minimum `max_tokens` for every chat request to this
                  provider. Reasoning models spend tokens thinking before
-                 they answer: set e.g. 8192 here instead of per module
+                 they answer: set e.g. 8192 here instead of per module.
+                 With `service = "openai"` it is sent as
+                 `max_completion_tokens` (OpenAI's reasoning models reject
+                 `max_tokens`)
 
 Recipes: >lua
   ai = { providers = {
@@ -294,6 +329,9 @@ User events (|slop-events|):
   SlopCompleteRequestStarted   { buf, provider, id, n }
   SlopCompleteRequestFinished  { buf, provider, id, items, ok, error?, ms }
   SlopCompleteAccepted         { buf, kind, chars, id }
+Every RequestStarted is followed by one RequestFinished with the same `id`,
+also when typing made the request stale (`ok = false`,
+`error = "cancelled"`).
 
 Highlights (default links):
   SlopCompleteGhost    -> SlopGhost -> Comment
@@ -341,6 +379,10 @@ services.ai.context ~                                    *slop-ai-context*
     meta }  (redacted)
   context.files(root?)  context.file(path, opts?)
   context.rules(root?, names, { from? })
+  `files()` never blocks for long: git runs in the background, the first
+  call for a root waits at most 500 ms (else it returns a time-boxed
+  directory walk), later calls return the cached list while git refreshes
+  it. `file()` reads a loaded buffer only when its name is exactly the path.
 
 ==============================================================================
 11. CREDITS                                            *slop-complete-credits*
