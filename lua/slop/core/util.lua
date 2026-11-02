@@ -297,6 +297,18 @@ function M.visual_range(buf)
     local last = api.nvim_buf_get_lines(buf, erow, erow + 1, false)[1] or ""
     return { srow, 0, erow, #last }
   end
+  -- Charwise (a block counts as its charwise span). getregionpos() applies 'selection' (exclusive leaves
+  -- out the character at the end) and reports the last byte of the last character (multibyte, composing).
+  local exclusive = vim.o.selection == "exclusive"
+  local ok, region = pcall(vim.fn.getregionpos, s, e, { type = "v", exclusive = exclusive })
+  if ok and type(region) == "table" and #region > 0 then
+    local first, last = region[1][1], region[#region][2]
+    if exclusive and last[2] < e[2] then
+      -- the end is the first column of its line: the selection stops after the previous line break
+      return { first[2] - 1, math.max(first[3] - 1, 0), erow, 0 }
+    end
+    return { first[2] - 1, math.max(first[3] - 1, 0), last[2] - 1, last[3] }
+  end
   local line = api.nvim_buf_get_lines(buf, erow, erow + 1, false)[1] or ""
   local ecol = math.min(e[3], #line)
   -- include the full last (multi-byte) character

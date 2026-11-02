@@ -101,7 +101,7 @@ end
 function M.names(opts)
   local seen, out = {}, {}
   local function add(n)
-    if not seen[n] then
+    if type(n) == "string" and not seen[n] then
       seen[n] = true
       if not (opts and opts.enabled) or M.is_enabled(n) then
         out[#out + 1] = n
@@ -465,16 +465,36 @@ function M.status(name)
   return "available"
 end
 
+--- Skip actions whose lhs plugin/slop.lua manages (manifest keys).
+---@param name string
+---@return table<string, boolean>
+local function manifest_keys(name)
+  local skip = {}
+  for action in pairs(M.entry(name).keys or {}) do
+    skip[action] = true
+  end
+  return skip
+end
+
 --- Load a module once: validate spec + config, set up services, apply keymaps/highlights, call setup(cfg).
 --- Returns its api table (spec.api or {}), or nil + error. Disabled modules return nil, "disabled".
 ---@param name string
----@param opts? {silent?: boolean}  don't notify when disabled
+---@param opts? {silent?: boolean, report?: boolean, trigger?: boolean}  silent: don't notify when disabled;
+---  report: say so again when it failed earlier (explicit user actions: :Slop, keys); trigger: loaded by a
+---  lazy-load autocmd (SlopModuleLoaded fires after it, see below)
 ---@return table? api, string? err
 function M.load(name, opts)
   opts = opts or {}
   local st = state[name]
   if st then
     if st.status == "failed" then
+      if opts.report then
+        -- the user asked for this module again: a silent no-op would look like a broken key
+        log().notify(
+          ("slop: module '%s' is unavailable (failed to load: %s)"):format(name, (st.error or "?"):match("^[^\n]*")),
+          vim.log.levels.ERROR
+        )
+      end
       return nil, st.error
     end
     return st.api
@@ -510,22 +530,42 @@ function M.load(name, opts)
     end
   end
   if spec.highlights then
-    require("slop.core.util").hl(spec.highlights)
+    -- unprotected, a bad group would leave the module "loading" forever (load() returning its api as if ready)
+    local ok, herr = pcall(require("slop.core.util").hl, spec.highlights)
+    if not ok then
+      return fail("highlights: " .. tostring(herr))
+    end
   end
-  local skip = {}
-  for action in pairs(M.entry(name).keys or {}) do
-    skip[action] = true
+  --- Undo what a failed setup may have left running (its autocmds, timers, providers). Keymaps stay: they
+  --- are guarded (keymaps.lua) and report the failure, or load the module once it can.
+  ---@param teardown boolean
+  local function cleanup(teardown)
+    if teardown and spec.teardown then
+      pcall(spec.teardown)
+    end
+    pcall(api.nvim_del_augroup_by_name, "slop." .. name)
   end
-  local ok, kerr = pcall(require("slop.core.keymaps").apply, name, spec, cfg, { skip_lhs = skip })
+  local ok, kerr = pcall(require("slop.core.keymaps").apply, name, spec, cfg, { skip_lhs = manifest_keys(name) })
   if not ok then
+    cleanup(false)
     return fail("keymaps: " .. tostring(kerr))
   end
   local sok, serr = xpcall(spec.setup, debug.traceback, cfg)
   if not sok then
+    cleanup(true)
     return fail(tostring(serr))
   end
   state[name] = { status = "loaded", api = spec.api or {} }
-  require("slop.core.events").emit(nil, "ModuleLoaded", { name = name })
+  local events = require("slop.core.events")
+  if opts.trigger then
+    -- An error in a user handler would become an exception of the triggering command: in BufReadPre an
+    -- `:edit` run from Lua (pickers, vim.cmd) then skips reading the file. Fire it after that event.
+    vim.schedule(function()
+      events.emit(nil, "ModuleLoaded", { name = name })
+    end)
+  else
+    events.emit(nil, "ModuleLoaded", { name = name })
+  end
   return state[name].api
 end
 
@@ -540,14 +580,56 @@ function M.load_capability(cap)
   end
 end
 
---- Handler behind `<Plug>(slop-<module>-<action>)` stubs created at startup.
+--- Keys that press `<Plug>(slop-<name>-<action>)` again with the count, register and pending operator of
+--- the current key press (consumed by the stub that ran first).
 ---@param name string
 ---@param action string
+---@return string
+local function press_again(name, action)
+  local keys = vim.keycode(require("slop.core.keymaps").plug(name, action))
+  local mode = vim.fn.mode(1)
+  if not mode:match("^[nvV\22]") then
+    return keys -- insert, cmdline, terminal, select: no count/register prefix
+  end
+  local prefix = ""
+  if vim.v.register ~= "" and vim.v.register ~= '"' then
+    prefix = '"' .. vim.v.register
+  end
+  if vim.v.count > 0 then
+    prefix = prefix .. vim.v.count
+  end
+  if mode:match("^no") then
+    prefix = prefix .. vim.v.operator
+  end
+  return prefix .. keys
+end
+
+--- Handler behind `<Plug>(slop-<module>-<action>)`: the stubs created at startup, and module keymaps whose
+--- module is not (or no longer) loaded and enabled. Loads the module on first use.
+---@param name string
+---@param action string
+---@param opts? {expr?: boolean}  called from an expr mapping (textlock: setup() cannot run now)
 ---@return any
-function M.run_keymap(name, action)
-  local mod_api = M.load(name)
-  if not mod_api then
-    return
+function M.run_keymap(name, action, opts)
+  local expr = opts and opts.expr
+  local nothing = expr and "" or nil
+  if M.kind(name) == "module" and not M.is_enabled(name) then
+    -- also covers a module disabled at runtime that is still loaded (no teardown)
+    log().notify(("slop: module '%s' is disabled"):format(name), vim.log.levels.WARN)
+    return nothing
+  end
+  if expr and not M.is_loaded(name) then
+    -- under textlock setup() could not open a window or edit a buffer: load outside of it, then press again
+    local keys = press_again(name, action)
+    vim.schedule(function()
+      if M.load(name, { report = true }) then
+        api.nvim_feedkeys(keys, "mi", false)
+      end
+    end)
+    return ""
+  end
+  if not M.load(name, { report = true }) then
+    return nothing
   end
   local spec = M.spec(name)
   local km = spec and spec.keymaps
@@ -557,16 +639,38 @@ function M.run_keymap(name, action)
   local k = km and km[action]
   if not k then
     log().notify(("slop: %s has no keymap '%s'"):format(name, action), vim.log.levels.ERROR)
-    return
+    return nothing
   end
-  if type(k.rhs) == "string" then
-    if k.expr then
-      return k.rhs
+  local rhs = k.rhs
+  if expr then
+    if type(rhs) == "string" then
+      return k.expr and api.nvim_eval(rhs) or rhs
     end
-    api.nvim_feedkeys(vim.keycode(k.rhs), "m", false)
+    return rhs()
+  end
+  if type(rhs) == "string" or k.expr then
+    -- loading defined the real <Plug>: press it again, so this first press works like the later ones
+    -- (before the keys typed after it, noremap, with count/register/operator)
+    api.nvim_feedkeys(press_again(name, action), "mi", false)
     return
   end
-  return k.rhs()
+  return rhs()
+end
+
+--- Was `ev` fired for its buffer, i.e. is its <amatch> derived from the buffer (file name, 'filetype',
+--- 'syntax')? LspProgress (pattern = kind), Progress (= source), OptionSet, ... are not.
+---@param ev {event: string, buf?: integer, match?: string}
+---@return boolean
+local function buffer_event(ev)
+  if ev.event == "User" or not (ev.buf and api.nvim_buf_is_valid(ev.buf)) then
+    return false
+  end
+  if ev.event == "FileType" then
+    return ev.match == vim.bo[ev.buf].filetype
+  elseif ev.event == "Syntax" then
+    return ev.match == vim.bo[ev.buf].syntax
+  end
+  return ev.match == nil or ev.match == api.nvim_buf_get_name(ev.buf)
 end
 
 --- After an event-triggered load, re-fire the event for the module's own augroup ("slop.<name>"),
@@ -580,12 +684,16 @@ function M.replay(name, ev)
     return
   end
   local o = { group = grp, modeline = false, data = ev.data }
-  if ev.event == "User" then
+  if buffer_event(ev) then
+    o.buf = ev.buf
+  else
+    -- with `buf` the match would become the buffer's file name and pattern handlers would miss the event
     o.pattern = ev.match
-  elseif ev.buf and api.nvim_buf_is_valid(ev.buf) then
-    o.buffer = ev.buf
   end
-  pcall(api.nvim_exec_autocmds, ev.event, o)
+  -- runs inside the triggering event: what the handlers report is shown after it (see log.deferred())
+  log().deferred(function()
+    pcall(api.nvim_exec_autocmds, ev.event, o)
+  end)
 end
 
 --- Enable at runtime (config override) and load.
@@ -599,7 +707,7 @@ function M.enable(name)
   if M.is_loaded(name) then
     local spec = M.spec(name)
     if spec then
-      require("slop.core.keymaps").apply(name, spec, config().get(name))
+      require("slop.core.keymaps").apply(name, spec, config().get(name), { skip_lhs = manifest_keys(name) })
     end
     return state[name].api
   end

@@ -1,5 +1,7 @@
 --- :checkhealth slop — core checks, then every module (spec.health()) and service.
 --- Health functions must not require the module to be set up (they run without setup()).
+--- Nothing here prints an option value or a logged message (people paste this report into issues; a value
+--- may be an API key put in the wrong option).
 ---@class slop.health
 local M = {}
 
@@ -9,7 +11,7 @@ local function check_config(ns)
   local config = require("slop.config")
   local ok, errs = pcall(config.errors, ns)
   if not ok then
-    h.error(("config `%s`: %s"):format(ns, errs))
+    h.error(("config `%s`: %s"):format(ns, config.hide_values(tostring(errs))))
     return
   end
   for _, e in ipairs(errs) do
@@ -73,7 +75,12 @@ local function core()
   local log = require("slop.core.log")
   local errors = log.entries({ level = vim.log.levels.ERROR })
   if #errors > 0 then
-    h.warn(("%d error(s) logged this session, see :Slop log"):format(#errors), { log.format_entry(errors[#errors]) })
+    -- when and where only: a message can quote anything (a response body, a value)
+    local last = errors[#errors]
+    h.warn(
+      ("%d error(s) logged this session, see :Slop log"):format(#errors),
+      { ("last at %s%s"):format(os.date("%H:%M:%S", last.time), last.scope and (" [" .. last.scope .. "]") or "") }
+    )
   end
 end
 
@@ -92,14 +99,17 @@ local function modules()
       h.ok(("%s: %s — %s"):format(name, status, spec.description))
     end
   end
+  local raw = require("slop.config").raw()
   for _, name in ipairs(names) do
     local spec = registry.spec(name)
-    if spec and registry.is_enabled(name) then
-      h.start("slop: " .. name)
+    local enabled = registry.is_enabled(name)
+    -- disabled modules too when configured: a mistake (`enabled = "yes"`) may be what disables them
+    if spec and (enabled or raw[name] ~= nil) then
+      h.start("slop: " .. name .. (enabled and "" or " (disabled)"))
       if check_config(name) ~= false then
         h.ok("configuration is valid")
       end
-      if spec.health then
+      if enabled and spec.health then
         run_health(name, spec.health)
       end
     end

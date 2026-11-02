@@ -1,5 +1,7 @@
 local h = require("helpers")
 
+local real_notify = vim.notify -- ERROR level echoes with err=true: that is what breaks a read
+
 local function fake(name, extra)
   return vim.tbl_extend("force", {
     name = name,
@@ -147,6 +149,16 @@ describe("registry", function()
     assert.matches("hello.greeting", err)
   end)
 
+  it("direct loads report problems synchronously (only lazy-load triggers defer them)", function()
+    local notes = {}
+    vim.notify = function(msg)
+      notes[#notes + 1] = msg
+    end
+    config.setup({ hello = { enabled = true, greeting = 42 } })
+    assert.is_nil(registry.load("hello"))
+    assert.matches("hello%.greeting", table.concat(notes, "\n"))
+  end)
+
   it("load_capability loads enabled providers only", function()
     config.setup({ modules = { prov = fake("prov", { manifest = { provides = { "thing" } } }) } })
     registry.load_capability("thing")
@@ -188,5 +200,331 @@ describe("registry", function()
     registry.load("ev")
     registry.replay("ev", { event = "User", match = "SlopTestX", data = { ok = 1 } })
     assert.are.same({ ok = 1 }, seen)
+  end)
+
+  it("a disabled module's <Plug> stops running its handler, also when the user mapped it", function()
+    local notes, ran = {}, { off = 0, kept = 0 }
+    vim.notify = function(msg)
+      notes[#notes + 1] = msg
+    end
+    local function km(name)
+      return {
+        go = {
+          mode = "n",
+          desc = "go",
+          rhs = function()
+            ran[name] = ran[name] + 1
+          end,
+        },
+      }
+    end
+    config.setup({
+      modules = {
+        off = fake("off", { teardown = function() end, keymaps = km("off") }),
+        kept = fake("kept", { keymaps = km("kept") }), -- no teardown: stays loaded when disabled
+      },
+    })
+    assert.truthy(registry.load("off") and registry.load("kept"))
+    vim.keymap.set("n", "<F5>", "<Plug>(slop-off-go)")
+    h.feed("<F5><Plug>(slop-kept-go)")
+    assert.are.same({ off = 1, kept = 1 }, ran)
+    registry.disable("off")
+    registry.disable("kept")
+    h.feed("<F5><Plug>(slop-kept-go)")
+    assert.are.same({ off = 1, kept = 1 }, ran)
+    assert.matches("module 'kept' is disabled", notes[#notes])
+    assert.truthy(registry.enable("off"))
+    h.feed("<F5>")
+    assert.equal(2, ran.off)
+  end)
+
+  it("a failed setup: its keys report it (also :Slop), partial setup is undone, keys work once fixed", function()
+    local notes, ran, broken, torn = {}, 0, true, false
+    vim.notify = function(msg)
+      notes[#notes + 1] = msg
+    end
+    local spec = fake("flaky", {
+      setup = function()
+        vim.api.nvim_create_autocmd("User", {
+          group = require("slop.core.util").augroup("flaky"),
+          pattern = "SlopFlakyProbe",
+          callback = function() end,
+        })
+        if broken then
+          error("boom")
+        end
+      end,
+      teardown = function()
+        torn = true
+      end,
+      commands = { run = { default = true, impl = function() end } },
+      keymaps = {
+        go = {
+          mode = "n",
+          desc = "go",
+          rhs = function()
+            ran = ran + 1
+          end,
+        },
+      },
+    })
+    config.setup({ modules = { flaky = spec } })
+    assert.is_nil(registry.load("flaky"))
+    assert.is_true(torn)
+    assert.equal(0, #vim.api.nvim_get_autocmds({ event = "User", pattern = "SlopFlakyProbe" }))
+    h.feed("<Plug>(slop-flaky-go)")
+    assert.equal(0, ran)
+    assert.matches("'flaky' is unavailable %(failed to load: .*boom", notes[#notes])
+    local n = #notes
+    require("slop.core.commands").run({ fargs = { "flaky" } })
+    assert.equal(n + 1, #notes, ":Slop reports the failure again")
+    assert.is_nil(registry.load("flaky", { silent = true }))
+    -- API access (e.g. from a statusline) does not notify each time, the error tells why
+    assert.has_error(function()
+      return require("slop").flaky.x
+    end, "unavailable")
+    assert.equal(n + 1, #notes)
+    broken = false
+    config.setup({ modules = { flaky = spec } }) -- the user fixed the cause
+    h.feed("<Plug>(slop-flaky-go)")
+    assert.equal(1, ran)
+    assert.is_true(registry.is_loaded("flaky"))
+  end)
+
+  it("a bad highlight group fails the load instead of leaving it 'loading'", function()
+    config.setup({ modules = { badhl = fake("badhl", { highlights = { SlopBadhlX = { fg = "notacolor" } } }) } })
+    local api, err = registry.load("badhl")
+    assert.is_nil(api)
+    assert.matches("highlights", err)
+    assert.equal("failed", registry.status("badhl"))
+    assert.is_nil(registry.load("badhl"))
+  end)
+end)
+
+describe("lazy triggers (plugin/slop.lua)", function()
+  local registry, config, notes
+  before_each(function()
+    h.reset()
+    notes = {}
+    vim.notify = function(msg)
+      notes[#notes + 1] = msg
+    end
+    vim.cmd("silent! %bwipe!")
+    registry = require("slop.core.registry")
+    config = require("slop.config")
+  end)
+
+  --- setup() with the built-in event-triggered modules off (isolates the module under test).
+  local function setup(opts)
+    config.setup(vim.tbl_extend("force", { cloak = false, todo = false, context = false, progress = false }, opts))
+  end
+
+  --- A user module loaded by `events`; its setup() records `handles` events of its own augroup.
+  local function module(name, events, handles, extra)
+    local calls = {}
+    local spec = vim.tbl_extend("force", fake(name), {
+      manifest = { cmd = true, events = events },
+      setup = function()
+        for _, ev in ipairs(handles) do
+          vim.api.nvim_create_autocmd(ev, {
+            group = require("slop.core.util").augroup(name),
+            callback = function(a)
+              calls[#calls + 1] = ev .. ":" .. vim.fs.basename(a.match)
+            end,
+          })
+        end
+      end,
+    }, extra or {})
+    return spec, calls
+  end
+
+  local function file(name, text)
+    local p = h.tmpdir("trig") .. "/" .. name
+    h.write(p, text or "x\n")
+    return p
+  end
+
+  it("replays the trigger once; a module loaded before its trigger does not see it twice", function()
+    local lazy, lazy_calls = module("lazym", { "BufReadPost" }, { "BufReadPost" })
+    local eager, eager_calls = module("eagerm", { "BufReadPost" }, { "BufReadPost" })
+    setup({ modules = { lazym = lazy, eagerm = eager } })
+    h.source_plugin()
+    assert.truthy(registry.load("eagerm"))
+    vim.cmd.edit(file("a.txt"))
+    assert.are.same({ "BufReadPost:a.txt" }, lazy_calls)
+    assert.are.same({ "BufReadPost:a.txt" }, eager_calls)
+  end)
+
+  it("re-arms the triggers after a failed load once setup() fixes the config", function()
+    local spec, calls = module("fixm", { "BufReadPost" }, { "BufReadPost" }, {
+      defaults = { enabled = true, n = 1 },
+      schema = function(cfg, check)
+        check("n", cfg.n, "number")
+      end,
+    })
+    setup({ modules = { fixm = spec }, fixm = { n = "x" } })
+    h.source_plugin()
+    vim.cmd.edit(file("a.txt"))
+    assert.equal("failed", registry.status("fixm"))
+    setup({ modules = { fixm = spec } })
+    -- the file that is already open gets the module too (scheduled), later reads trigger as usual
+    assert.truthy(vim.wait(1000, function()
+      return registry.is_loaded("fixm")
+    end))
+    assert.are.same({ "BufReadPost:a.txt" }, calls)
+    vim.cmd.edit(file("b.txt"))
+    assert.are.same({ "BufReadPost:a.txt", "BufReadPost:b.txt" }, calls)
+  end)
+
+  it("replays a non-buffer event with its pattern (LspProgress kind)", function()
+    local seen = {}
+    local spec = vim.tbl_extend("force", fake("lspm"), {
+      manifest = { cmd = true, events = { "LspProgress" } },
+      setup = function()
+        vim.api.nvim_create_autocmd("LspProgress", {
+          group = require("slop.core.util").augroup("lspm"),
+          pattern = "begin",
+          callback = function(a)
+            seen[#seen + 1] = vim.fs.basename(a.match)
+          end,
+        })
+      end,
+    })
+    setup({ modules = { lspm = spec } })
+    h.source_plugin()
+    vim.cmd.edit(file("b.txt"))
+    local data = { client_id = 1, params = { token = 1, value = { kind = "begin", title = "t" } } }
+    vim.api.nvim_exec_autocmds("LspProgress", { pattern = "begin", modeline = false, data = data })
+    assert.is_true(registry.is_loaded("lspm"))
+    assert.are.same({ "begin" }, seen)
+  end)
+
+  it("a throwing SlopModuleLoaded handler cannot abort the read that triggered the load", function()
+    vim.g.slop_test_allow_stderr = true -- Nvim prints the handler's error on stderr: expected here
+    local spec = module("prem", { "BufReadPre" }, {})
+    setup({ modules = { prem = spec } })
+    h.source_plugin()
+    local fired = false
+    vim.api.nvim_create_autocmd("User", {
+      group = vim.api.nvim_create_augroup("slop.spec.user", { clear = true }), -- (h.reset() removes it)
+      pattern = "SlopModuleLoaded",
+      callback = function(ev)
+        if ev.data.name == "prem" then
+          fired = true
+          error("user bug (expected in this spec)")
+        end
+      end,
+    })
+    local p = file("keep.txt", "precious\n")
+    assert.truthy(pcall(vim.cmd.edit, p))
+    assert.are.same({ "precious" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    assert.is_true(registry.is_loaded("prem"))
+    assert.truthy(
+      vim.wait(1000, function()
+        return fired
+      end),
+      "fired right after the read"
+    )
+  end)
+
+  it("an invalid config of a module loaded by a file read is reported after the read, never aborts it", function()
+    vim.notify = real_notify
+    config.setup({ cloak = { render = "bogus" }, todo = false, context = false, progress = false })
+    h.source_plugin()
+    local p = file("conf.yaml", "a: 1\nb: 2\n")
+    local ok, err = pcall(vim.cmd.edit, p)
+    assert.truthy(ok, err)
+    assert.are.same({ "a: 1", "b: 2" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    assert.equal("failed", registry.status("cloak"))
+    assert.truthy(
+      vim.wait(1000, function()
+        return vim.fn.execute("messages"):find("cloak.render: expected", 1, true) ~= nil
+      end),
+      "the notification is shown right after"
+    )
+  end)
+
+  it("sourced late (lazy.nvim VeryLazy): read-event modules load for the files already open", function()
+    vim.cmd.edit(file("late.txt"))
+    local spec, calls = module("latem", { "BufReadPre", "BufNewFile" }, { "BufReadPost" })
+    setup({ modules = { latem = spec } })
+    h.source_plugin()
+    assert.is_false(registry.is_loaded("latem"), "scheduled: the plugin manager's setup() comes first")
+    assert.truthy(vim.wait(1000, function()
+      return registry.is_loaded("latem")
+    end))
+    assert.are.same({ "BufReadPost:late.txt" }, calls)
+  end)
+
+  it("first press through a stub: string rhs keeps order and count; expr keys load outside textlock", function()
+    -- selene: allow(global_usage)
+    _G.slop_counts = {} -- read by the mapping's <Cmd>lua rhs below
+    setup({
+      modules = {
+        strm = vim.tbl_extend("force", fake("strm"), {
+          defaults = { enabled = true, keymaps = { go = "<F4>" } },
+          manifest = { cmd = true, keys = { go = { mode = "n", lhs = "<F4>", desc = "strm go" } } },
+          keymaps = {
+            go = { mode = "n", desc = "strm go", rhs = "<Cmd>lua table.insert(_G.slop_counts, vim.v.count)<CR>AX<Esc>" },
+          },
+        }),
+        exprm = vim.tbl_extend("force", fake("exprm"), {
+          defaults = { enabled = true, keymaps = { go = "<F3>" } },
+          manifest = { cmd = true, keys = { go = { mode = "n", lhs = "<F3>", desc = "exprm go", expr = true } } },
+          setup = function()
+            -- not allowed under textlock (E565)
+            vim.api.nvim_buf_set_lines(vim.api.nvim_create_buf(false, true), 0, -1, false, { "ready" })
+          end,
+          keymaps = {
+            go = {
+              mode = "n",
+              desc = "exprm go",
+              expr = true,
+              rhs = function()
+                return "AE<Esc>"
+              end,
+            },
+          },
+        }),
+      },
+    })
+    h.source_plugin()
+    local buf = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+    h.feed("3<F4>AY<Esc>")
+    assert.equal("XY", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+    -- selene: allow(global_usage)
+    assert.are.same({ 3 }, _G.slop_counts)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+    h.feed("<F3>")
+    assert.truthy(vim.wait(1000, function()
+      return registry.is_loaded("exprm")
+    end))
+    h.feed("", "tx") -- run the key pressed again
+    assert.equal("E", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+    -- selene: allow(global_usage)
+    _G.slop_counts = nil
+  end)
+
+  it("first press through a stub in operator-pending mode keeps the operator and register", function()
+    setup({
+      modules = {
+        opm = vim.tbl_extend("force", fake("opm"), {
+          defaults = { enabled = true, keymaps = { word = "<F2>" } },
+          manifest = { cmd = true, keys = { word = { mode = "o", lhs = "<F2>", desc = "opm word" } } },
+          keymaps = { word = { mode = "o", desc = "opm word", rhs = "iw" } },
+        }),
+      },
+    })
+    h.source_plugin()
+    local buf = vim.api.nvim_get_current_buf()
+    for _ = 1, 2 do -- the stub, then the real <Plug>
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "one two three" })
+      vim.api.nvim_win_set_cursor(0, { 1, 4 })
+      vim.fn.setreg("a", "")
+      h.feed('"ad<F2>')
+      assert.equal("one  three", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+      assert.equal("two", vim.fn.getreg("a"))
+    end
   end)
 end)

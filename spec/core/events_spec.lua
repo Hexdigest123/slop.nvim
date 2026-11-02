@@ -46,6 +46,19 @@ describe("events", function()
     assert.equal(200, seen)
   end)
 
+  it("a failing handler stops neither the emitter nor the other handlers", function()
+    vim.g.slop_test_allow_stderr = true -- Nvim prints the handler's error on stderr: expected here
+    local after = false
+    events.on("t", "Boom", function()
+      error("user bug (expected in this spec)")
+    end)
+    events.on("t", "Boom", function(d)
+      after = d.x == 1
+    end)
+    assert.truthy(pcall(events.emit, "t", "Boom", { x = 1 }))
+    assert.is_true(after)
+  end)
+
   it("emit is safe from fast contexts", function()
     local seen = false
     events.on("t", "Fast", function()

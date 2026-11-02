@@ -30,6 +30,7 @@ local M = {}
 ---@field block string[]           File globs whose content never reaches AI.
 ---@field placeholder string       Replacement text for redacted spans.
 ---@field agent_reads "deny"|"allow"  Whether ACP agents may read blocked files.
+---@field detectors boolean        Built-in token detectors (cloud/API keys, JWTs, URL passwords) for AI text.
 
 ---@class slop.Config.Core
 ---@field ui slop.Config.Ui
@@ -42,9 +43,32 @@ M.core_defaults = {
   log = { level = "warn", max_entries = 2000 },
   project = { root_markers = { ".git" }, dir = ".nvim" },
   secrets = {
-    block = { ".env*", "*.pem", "*.key", "*.p12", "*.pfx", "*secret*", "*credential*", "*private-key*" },
+    -- Globs without "/" match the file name, the others match below any directory.
+    block = {
+      ".env*",
+      "*.pem",
+      "*.key",
+      "*.p12",
+      "*.pfx",
+      "*secret*",
+      "*credential*",
+      "*private-key*",
+      ".netrc",
+      "_netrc",
+      ".npmrc",
+      ".pypirc",
+      ".git-credentials",
+      ".kube/config",
+      "*kubeconfig*",
+      "*service-account*.json",
+      "id_rsa",
+      "id_dsa",
+      "id_ecdsa",
+      "id_ed25519",
+    },
     placeholder = "<redacted>",
     agent_reads = "deny",
+    detectors = true,
   },
 }
 
@@ -67,17 +91,31 @@ local setup_opts = {} ---@type table
 local setup_modules = {} ---@type table<string, slop.ModuleSpec>
 local overrides = {} ---@type table<string, boolean>
 local raw_cache = nil ---@type table?
+local g_modules = nil ---@type table<string, slop.ModuleSpec>?
 local cache = {} ---@type table<string, table>
 local errors = {} ---@type table<string, string[]>
 local reported = {} ---@type table<string, boolean>
 
-local function from_vim_g()
+--- vim.g.slop: a table or a function returning one (not copied).
+---@return table?
+local function vim_g()
   local g = vim.g.slop
   if type(g) == "function" then
     local ok, res = pcall(g)
     g = ok and res or nil
   end
-  return type(g) == "table" and vim.deepcopy(g) or {}
+  return type(g) == "table" and g or nil
+end
+
+--- vim.g.slop without `modules`, copied (runtime overrides must not write into it).
+local function from_vim_g()
+  local out = {}
+  for k, v in pairs(vim_g() or {}) do
+    if k ~= "modules" then
+      out[k] = v
+    end
+  end
+  return vim.deepcopy(out)
 end
 
 local function report(key, msg, level)
@@ -88,9 +126,72 @@ local function report(key, msg, level)
   require("slop.core.log").notify(msg, level or vim.log.levels.ERROR)
 end
 
+local TYPES = {
+  ["nil"] = true,
+  boolean = true,
+  number = true,
+  string = true,
+  table = true,
+  ["function"] = true,
+  thread = true,
+  userdata = true,
+}
+
+--- Validation messages never echo option values ("<path>: expected <what>, got <value>" keeps only type
+--- names): the classic mistake `api_key = "sk-..."` would otherwise print the key in notifications,
+--- :messages, :Slop log and :checkhealth.
+---@param msg string
+---@return string
+function M.hide_values(msg)
+  return (
+    msg:gsub(", got ([^\n]*)", function(rest)
+      local t = rest:match("^(%l+)$") or rest:match("^(%l+)%. Info: ")
+      if t and TYPES[t] then
+        return nil -- a type name: keep
+      end
+      return ", got an invalid value"
+    end)
+  )
+end
+
+--- The name -> spec entries of a `modules` option. Anything else (e.g. a list of specs) is reported and
+--- dropped: an integer key would break every sorted module list (:Slop, completion, health).
+---@param mods any
+---@param origin string  where the option came from, for the message
+---@return table<string, slop.ModuleSpec>
+local function module_map(mods, origin)
+  local out = {}
+  if mods == nil then
+    return out
+  end
+  if type(mods) ~= "table" then
+    report(
+      origin .. ".modules",
+      ("slop: %s: `modules` must be a table of name = spec, got %s"):format(origin, type(mods))
+    )
+    return out
+  end
+  for k, v in pairs(mods) do
+    if type(k) == "string" and type(v) == "table" then
+      out[k] = v
+    else
+      report(
+        origin .. ".modules." .. tostring(k),
+        ("slop: %s: `modules` maps module names to specs (`modules = { name = spec }`); ignoring [%s] = %s"):format(
+          origin,
+          vim.inspect(k),
+          type(v)
+        )
+      )
+    end
+  end
+  return out
+end
+
 --- Drop every cached/merged value (next get() recomputes).
 function M.invalidate()
   raw_cache = nil
+  g_modules = nil
   cache = {}
   errors = {}
   reported = {}
@@ -98,6 +199,27 @@ end
 
 local function fire_changed()
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "SlopConfigChanged", modeline = false })
+end
+
+--- Cheap checks of module options that need no module spec. A module whose options are only validated
+--- on its first config.get() is never validated when a mistake leaves it disabled
+--- (`term = { enabled = "yes" }`, `hello = true`), so report those here.
+---@return table<string, string[]>
+local function module_errors()
+  local out = {}
+  local manifest = require("slop.manifest")
+  local user_mods = M.user_modules()
+  for k, v in pairs(M.raw()) do
+    if type(k) == "string" and not (M.core_namespaces[k] or M.reserved[k]) then
+      local is_module = manifest[k] or user_mods[k] or require("slop.core.registry").kind(k) == "module"
+      if is_module and type(v) ~= "table" and v ~= false then
+        out[k] = { ("%s: expected table|false, got %s"):format(k, type(v)) }
+      elseif is_module and type(v) == "table" and v.enabled ~= nil and type(v.enabled) ~= "boolean" then
+        out[k] = { ("%s.enabled: expected boolean, got %s"):format(k, type(v.enabled)) }
+      end
+    end
+  end
+  return out
 end
 
 --- Store user options. Does not load any module. Fires `User SlopConfigChanged`.
@@ -108,22 +230,28 @@ function M.setup(opts)
     report("setup", "slop: setup() expects a table, got " .. type(opts))
     opts = {}
   end
-  local o = vim.deepcopy(opts)
-  setup_modules = type(o.modules) == "table" and o.modules or {}
-  o.modules = nil
-  setup_opts = o
+  -- Options are copied, module specs are not: a spec's `api` table is what require("slop").<name> returns,
+  -- and specs may hold values that cannot be copied (timers, parsed queries).
+  local o = {}
+  for k, v in pairs(opts) do
+    if k ~= "modules" then
+      o[k] = v
+    end
+  end
+  setup_opts = vim.deepcopy(o)
   M.invalidate()
+  setup_modules = module_map(opts.modules, "setup()")
   local registry = package.loaded["slop.core.registry"]
   if registry then
     registry.on_config_changed()
   end
-  -- Cheap checks that need no module spec: core namespaces + top-level keys.
-  local errs = {}
+  -- Cheap checks that need no module spec: core namespaces (get() reports their errors, once) + top-level keys.
   for ns in pairs(M.core_namespaces) do
-    vim.list_extend(errs, M.errors(ns))
+    M.errors(ns)
   end
-  if #errs > 0 then
-    report("core", "slop: invalid config:\n  " .. table.concat(errs, "\n  "))
+  for ns, msgs in pairs(module_errors()) do
+    -- same key as config.get(ns) uses, so the error is not reported twice
+    report(ns, "slop: invalid config:\n  " .. table.concat(msgs, "\n  "))
   end
   local unknown = M.unknown_top()
   if #unknown > 0 then
@@ -139,28 +267,26 @@ function M.raw()
   if raw_cache then
     return raw_cache
   end
-  local g = from_vim_g()
-  g.modules = nil
-  local raw = vim.tbl_deep_extend("force", g, setup_opts)
+  local raw = vim.tbl_deep_extend("force", from_vim_g(), setup_opts)
   for name, enabled in pairs(overrides) do
-    if type(raw[name]) ~= "table" then
-      raw[name] = {}
-    end
-    raw[name].enabled = enabled
+    -- a copy: tbl_deep_extend() shares the sub-tables that only setup() has, and the override must not end
+    -- up in the stored setup() options (it would survive set_enabled(name, nil))
+    raw[name] = vim.tbl_extend("force", type(raw[name]) == "table" and raw[name] or {}, { enabled = enabled })
   end
   raw_cache = raw
   return raw
 end
 
---- User-registered module specs (`opts.modules`), name -> spec.
+--- User-registered module specs (`opts.modules` of vim.g.slop and setup()), name -> spec.
 ---@return table<string, slop.ModuleSpec>
 function M.user_modules()
-  local g = vim.g.slop
+  if not g_modules then
+    local g = vim_g()
+    g_modules = module_map(g and g.modules, "vim.g.slop")
+  end
   local out = {}
-  if type(g) == "table" and type(g.modules) == "table" then
-    for k, v in pairs(g.modules) do
-      out[k] = v
-    end
+  for k, v in pairs(g_modules) do
+    out[k] = v
   end
   for k, v in pairs(setup_modules) do
     out[k] = v
@@ -224,9 +350,28 @@ end
 ---@return fun(path: string, value: any, validator: any, optional?: boolean, message?: string)
 function M.checker(prefix, out)
   return function(path, value, validator, optional, message)
-    local ok, err = pcall(vim.validate, prefix .. path, value, validator, optional, message)
+    if type(optional) == "string" then
+      optional, message = nil, optional
+    end
+    local name = prefix .. path
+    if vim.is_callable(validator) then
+      -- Not through vim.validate(): for function validators it reports "got <tostring(value)>", which
+      -- prints whatever the user put there (an API key pasted into `api_key`). Report the type only.
+      if value == nil and optional == true then
+        return
+      end
+      local ok, valid, info = pcall(validator, value)
+      if not ok then
+        out[#out + 1] = ("%s: %s"):format(name, M.hide_values((tostring(valid):gsub("^[^\n]-:%d+: ", ""))))
+      elseif not valid then
+        out[#out + 1] = ("%s: expected %s, got %s"):format(name, message or "?", type(value))
+          .. (type(info) == "string" and (". Info: " .. info) or "")
+      end
+      return
+    end
+    local ok, err = pcall(vim.validate, name, value, validator, optional, message)
     if not ok then
-      out[#out + 1] = tostring(err):gsub("^[^\n]-:%d+: ", "")
+      out[#out + 1] = (tostring(err):gsub("^[^\n]-:%d+: ", ""))
     end
   end
 end
@@ -246,8 +391,8 @@ local core_schema = {
   log = function(c, check)
     check("level", c.level, is_level, false, "log level name or number")
     check("max_entries", c.max_entries, function(v)
-      return type(v) == "number" and v >= 1
-    end, false, "positive number")
+      return type(v) == "number" and v >= 1 and v == math.floor(v)
+    end, false, "integer >= 1")
   end,
   project = function(c, check)
     check("root_markers", c.root_markers, "table")
@@ -261,6 +406,7 @@ local core_schema = {
     check("agent_reads", c.agent_reads, function(v)
       return v == "deny" or v == "allow"
     end, false, "'deny'|'allow'")
+    check("detectors", c.detectors, "boolean")
   end,
 }
 
@@ -302,7 +448,7 @@ function M.validate(ns, cfg)
   if spec and spec.schema then
     local ok, err = pcall(spec.schema, cfg, check)
     if not ok then
-      err = tostring(err):gsub("^[^\n]-:%d+: ", "")
+      err = M.hide_values((tostring(err):gsub("^[^\n]-:%d+: ", "")))
       if not vim.startswith(err, ns .. ".") then
         err = ns .. "." .. err
       end
@@ -327,15 +473,20 @@ function M.get(ns)
   end
   local cfg = M.defaults(ns)
   local user = M.raw()[ns]
+  local type_err = nil
   if user == false then
     cfg.enabled = false
   elseif type(user) == "table" then
     cfg = vim.tbl_deep_extend("force", cfg, user)
   elseif user ~= nil then
-    report(ns .. ".type", ("slop: option '%s' must be a table or false, got %s"):format(ns, type(user)))
+    -- an error like any other (also listed by :checkhealth), not only a one-off notification
+    type_err = ("%s: expected table|false, got %s"):format(ns, type(user))
   end
   cache[ns] = cfg
   errors[ns] = M.validate(ns, cfg)
+  if type_err then
+    table.insert(errors[ns], 1, type_err)
+  end
   if #errors[ns] > 0 then
     report(ns, "slop: invalid config:\n  " .. table.concat(errors[ns], "\n  "))
   end

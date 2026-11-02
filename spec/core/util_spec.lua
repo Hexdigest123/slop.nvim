@@ -70,6 +70,42 @@ describe("util", function()
     assert.equal("FloatBorder", vim.api.nvim_get_hl(0, { name = "SlopBorder" }).link)
   end)
 
+  it("visual_range() follows 'selection' and covers whole multibyte characters", function()
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "abc héllo wörld", "xé̃y", "", "end" })
+    local got
+    vim.keymap.set("x", "<F9>", function()
+      got = util.range_text(buf, util.visual_range(buf))
+    end)
+    local function sel(pos, keys)
+      vim.api.nvim_win_set_cursor(0, pos)
+      h.feed(keys .. "<F9><Esc>")
+      return table.concat(got, "\n")
+    end
+    local saved = vim.o.selection
+    vim.o.selection = "inclusive"
+    assert.equal("abc", sel({ 1, 0 }, "ve"))
+    assert.equal("hé", sel({ 1, 0 }, "wvl"))
+    assert.equal("abc héllo wörld", sel({ 1, 0 }, "v$"))
+    assert.equal("xé̃", sel({ 2, 0 }, "vl"))
+    assert.equal("héllo wörld\nx", sel({ 1, 4 }, "vj0"))
+    assert.equal("y\n", sel({ 2, 5 }, "vj"))
+    assert.equal("abc héllo wörld\nxé̃y", sel({ 1, 0 }, "Vj"))
+    assert.equal("abc héllo wörld\nxé̃", sel({ 1, 0 }, "<C-v>jl"), "a block counts as its charwise span")
+    vim.o.selection = "exclusive"
+    assert.equal("abc", sel({ 1, 0 }, "ve"))
+    assert.equal("hél", sel({ 1, 0 }, "wvlll"))
+    assert.equal("abc héllo wörld", sel({ 1, 0 }, "v$"))
+    assert.equal("héllo wörld\n", sel({ 1, 4 }, "vj0"), "ends before the first column: keeps the line break")
+    assert.equal("a", sel({ 1, 0 }, "v"), "an empty exclusive selection is one character, like Visual mode")
+    -- from the '< '> marks after Visual mode ended
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("ve<Esc>")
+    assert.equal("abc", table.concat(util.range_text(buf, util.visual_range(buf)), "\n"))
+    vim.o.selection = saved
+  end)
+
   it("augroup() is named slop.<module> and not cleared by default", function()
     local g = util.augroup("x")
     vim.api.nvim_create_autocmd("User", { group = g, pattern = "Nope", callback = function() end })

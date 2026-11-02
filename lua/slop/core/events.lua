@@ -24,6 +24,8 @@ function M.pattern(module, event)
 end
 
 --- Fire `User Slop<Module><Event>`. Safe from fast contexts (scheduled there).
+--- A failing handler is reported by Neovim and does not stop the emitter; but inside a command (e.g. the
+--- BufReadPre of a `:edit`) it fails that command, so don't emit from there (see registry.load()).
 ---@param module string?
 ---@param event string
 ---@param data? any  passed as `ev.data` (must be serialisable: no functions/userdata)

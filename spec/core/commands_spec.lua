@@ -43,6 +43,12 @@ describe(":Slop", function()
     assert.is_false(require("slop.core.registry").is_loaded("hello"))
   end)
 
+  it("completes abbreviated command names (:Sl, :Slo) and after a count", function()
+    assert.truthy(vim.tbl_contains(complete("Sl term "), "toggle"))
+    assert.are.same({ "enable" }, complete("Slo modules en"))
+    assert.are.same({ "term" }, complete("5Sl te"))
+  end)
+
   it("completes :Slop modules enable|disable", function()
     assert.are.same({ "disable", "enable" }, complete("Slop modules "))
     assert.are.same({ "hello" }, complete("Slop modules enable h"))

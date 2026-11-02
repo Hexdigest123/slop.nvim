@@ -131,6 +131,146 @@ describe("keymaps", function()
     assert.equal(1, prev)
   end)
 
+  it("fallthrough() keeps an earlier buffer-local mapping in any buffer, and honours <Nop>", function()
+    local km = require("slop.core.keymaps")
+    vim.api.nvim_create_buf(true, false)
+    local buf = vim.api.nvim_create_buf(true, false)
+    assert.not_equal(1, buf)
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+    vim.keymap.set("i", "<C-y>", "PREV", { buf = buf }) -- e.g. an ftplugin's map, defined before slop's
+    km.fallthrough("i", "<C-y>", function()
+      return false
+    end, { desc = "test", buf = buf })
+    h.feed("i<C-y><Esc>", "tx")
+    assert.equal("PREV", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+    -- a key disabled with <Nop> stays disabled: not even the native i_CTRL-Y runs
+    local other = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(other)
+    vim.api.nvim_buf_set_lines(other, 0, -1, false, { "abc", "" })
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    vim.keymap.set("i", "<C-y>", "<Nop>")
+    km.fallthrough("i", "<C-y>", function()
+      return false
+    end, { desc = "test" })
+    h.feed("a<C-y><Esc>", "tx")
+    assert.equal("", vim.api.nvim_buf_get_lines(other, 1, 2, false)[1])
+  end)
+
+  it("a nowait fall-through `gr` behaves as if unmapped when other maps go on from it (grn, grx, gr<Esc>)", function()
+    local km = require("slop.core.keymaps")
+    for _, lhs in ipairs({ "grn", "grr", "gra", "gri", "grt", "grx" }) do
+      pcall(vim.keymap.del, "n", lhs) -- the 0.11+ LSP defaults: replaced by test maps below
+    end
+    local renamed = 0
+    vim.keymap.set("n", "grn", function()
+      renamed = renamed + 1
+    end)
+    vim.keymap.set("n", "grr", "<Nop>")
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "abc" })
+    vim.bo[buf].modified = false
+    -- like a diff review's reject key: nothing to reject here
+    km.fallthrough("n", "gr", function()
+      return false
+    end, { desc = "reject", buf = buf, nowait = true })
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("grn")
+    assert.equal(1, renamed)
+    assert.are.same({ "abc" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    assert.is_false(vim.bo[buf].modified)
+    h.feed("grx") -- no grx map: Vim's own gr{char}
+    assert.are.same({ "xbc" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "abc" })
+    h.feed("gr<Esc>")
+    assert.are.same({ "abc" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    -- the count is kept
+    h.feed("2grz")
+    assert.are.same({ "zzc" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    -- nothing follows within 'timeoutlen': handed to Vim's gr (which then waits for its char itself;
+    -- here the end of the fed keys aborts it, like :normal)
+    local saved = vim.o.timeoutlen
+    vim.o.timeoutlen = 20
+    local t0 = vim.uv.hrtime()
+    h.feed("gr")
+    vim.o.timeoutlen = saved
+    assert.truthy((vim.uv.hrtime() - t0) / 1e6 < 900, "does not wait for a key forever")
+    assert.are.same({ "zzc" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    assert.equal(1, renamed)
+  end)
+
+  it("every keymap kind gets a <Plug>; a fall-through one does nothing when there is nothing to do", function()
+    local km = require("slop.core.keymaps")
+    local hits = {}
+    local function rhs(name, ret)
+      return function()
+        hits[#hits + 1] = name
+        return ret
+      end
+    end
+    km.apply("kinds", {
+      keymaps = {
+        g = { mode = "n", desc = "global", rhs = rhs("g") },
+        f = { mode = "n", ft = { "slopkinds" }, desc = "ft", rhs = rhs("f") },
+        b = { mode = "n", buffer = true, desc = "buffer", rhs = rhs("b") },
+        t = { mode = "i", fallthrough = true, desc = "fallthrough", rhs = rhs("t", false) },
+      },
+    }, { keymaps = { g = "<F6>", f = "<F7>", b = "<F8>", t = "<C-t>" } })
+    for name, mode in pairs({ g = "n", f = "n", b = "n", t = "i" }) do
+      assert.truthy(vim.fn.maparg(km.plug("kinds", name), mode) ~= "", name)
+    end
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+    h.feed("<Plug>(slop-kinds-g)<Plug>(slop-kinds-f)<Plug>(slop-kinds-b)")
+    h.feed("i<Plug>(slop-kinds-t)<Esc>")
+    assert.are.same({ "g", "f", "b", "t" }, hits)
+    assert.equal("", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1], "no native key behind the <Plug>")
+  end)
+
+  it("set(), set_buf() and fallthrough() pass nowait through", function()
+    local km = require("slop.core.keymaps")
+    local buf = vim.api.nvim_get_current_buf()
+    km.set("n", "<F10>", function() end, { desc = "x", nowait = true })
+    km.set_buf(buf, "n", "<F11>", function() end, { desc = "x", nowait = true })
+    km.fallthrough("n", "<F12>", function()
+      return false
+    end, { desc = "x", buf = buf, nowait = true })
+    assert.equal(1, vim.fn.maparg("<F10>", "n", false, true).nowait)
+    assert.equal(1, vim.fn.maparg("<F11>", "n", false, true).nowait)
+    assert.equal(1, vim.fn.maparg("<F12>", "n", false, true).nowait)
+    km.set("n", "<S-F10>", function() end, { desc = "x" })
+    assert.equal(0, vim.fn.maparg("<S-F10>", "n", false, true).nowait)
+  end)
+
+  it("a mapleader change + setup() moves the default keys to the new leader", function()
+    h.source_plugin()
+    assert.equal("<Plug>(slop-term-toggle)", vim.fn.maparg(" \\", "n"))
+    vim.g.mapleader = ","
+    require("slop").setup({})
+    assert.equal("", vim.fn.maparg(" \\", "n"))
+    assert.equal("<Plug>(slop-term-toggle)", vim.fn.maparg(",\\", "n"))
+    assert.equal("<Plug>(slop-marks-add)", vim.fn.maparg(",h", "n"))
+  end)
+
+  it("remove() finds the lhs maps after a mapleader change; apply() again does not stack autocmds", function()
+    local km = require("slop.core.keymaps")
+    local spec = {
+      keymaps = {
+        go = { mode = "n", desc = "go", rhs = function() end },
+        f = { mode = "n", ft = { "slopx" }, desc = "ft", rhs = function() end },
+      },
+    }
+    km.apply("lead", spec, { keymaps = { go = "<leader>q", f = "<F7>" } })
+    km.apply("lead", spec, { keymaps = { go = "<leader>q", f = "<F7>" } })
+    assert.equal(1, #vim.api.nvim_get_autocmds({ group = "slop.lead", event = "FileType" }))
+    assert.equal("<Plug>(slop-lead-go)", vim.fn.maparg(" q", "n"))
+    vim.g.mapleader = ","
+    km.remove("lead")
+    assert.equal("", vim.fn.maparg(" q", "n"))
+  end)
+
   it("expr_fallthrough() returns the original key or ''", function()
     local km = require("slop.core.keymaps")
     local f = km.expr_fallthrough("<C-n>", function()

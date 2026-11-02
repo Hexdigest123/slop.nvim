@@ -19,6 +19,7 @@ local names = { [0] = "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "OFF" }
 local entries = {} ---@type slop.log.Entry[]
 local head = 0 -- index of newest entry
 local count = 0
+local cap = nil ---@type integer?  capacity the ring is laid out for
 
 local function threshold()
   local config = package.loaded["slop.config"] or require("slop.config")
@@ -26,11 +27,32 @@ local function threshold()
   return ok and lvl or levels.WARN
 end
 
+--- Ring capacity from log.max_entries. Clamped: the value is read while an invalid config is being
+--- reported (through this logger), and `head % 0` would make every later record() throw.
+---@return integer
 local function max_entries()
   local ok, n = pcall(function()
     return require("slop.config").get("log").max_entries
   end)
-  return ok and type(n) == "number" and n or 2000
+  n = ok and type(n) == "number" and math.floor(n) or 2000
+  return n >= 1 and n or 2000
+end
+
+--- Recorded entries, oldest first (for the current layout).
+---@return slop.log.Entry[]
+local function ordered()
+  local out = {}
+  if count == 0 or not cap then
+    return out
+  end
+  local start = count < cap and 1 or (head % cap + 1)
+  for i = 0, count - 1 do
+    local e = entries[(start - 1 + i) % cap + 1]
+    if e then
+      out[#out + 1] = e
+    end
+  end
+  return out
 end
 
 local function fmt(msg, ...)
@@ -51,23 +73,43 @@ end
 
 local function record(level, scope, msg)
   local max = max_entries()
-  head = head % max + 1
+  if max ~= cap then
+    -- log.max_entries changed (setup()): keep the newest entries, in order
+    local keep = ordered()
+    keep = vim.list_slice(keep, math.max(1, #keep - max + 1))
+    entries, cap, count, head = keep, max, #keep, #keep
+  end
+  head = head % cap + 1
   entries[head] = { time = os.time(), level = level, scope = scope, msg = msg }
-  count = math.min(count + 1, max)
+  count = math.min(count + 1, cap)
 end
 
 local function prefix(scope)
   return scope and ("slop: " .. scope .. ": ") or "slop: "
 end
 
+local deferring = 0 -- > 0 while M.deferred() runs
+
 local function show(text, level, opts)
-  if vim.in_fast_event() then
+  if vim.in_fast_event() or deferring > 0 then
     vim.schedule(function()
       vim.notify(text, level, opts)
     end)
   else
     vim.notify(text, level, opts)
   end
+end
+
+--- Run `fn` with notifications shown right after it instead of during it (they are recorded at once). For
+--- code that runs inside another command, e.g. a lazy load in BufReadPre: an error message there becomes an
+--- exception of that command, and an `:edit` run from Lua (pickers, vim.cmd) then skips reading the file.
+---@param fn fun()
+---@return boolean ok, string? err
+function M.deferred(fn)
+  deferring = deferring + 1
+  local ok, err = xpcall(fn, debug.traceback)
+  deferring = deferring - 1
+  return ok, err
 end
 
 ---@param level integer
@@ -159,11 +201,8 @@ end
 function M.entries(opts)
   opts = opts or {}
   local out = {}
-  local max = max_entries()
-  local start = count < max and 1 or (head % max + 1)
-  for i = 0, count - 1 do
-    local e = entries[(start - 1 + i) % max + 1]
-    if e and (not opts.level or e.level >= opts.level) and (not opts.scope or e.scope == opts.scope) then
+  for _, e in ipairs(ordered()) do
+    if (not opts.level or e.level >= opts.level) and (not opts.scope or e.scope == opts.scope) then
       out[#out + 1] = e
     end
   end
@@ -185,6 +224,23 @@ function M.format_entry(e)
   )
 end
 
+local LOG_NAME = "slop://log"
+
+--- The log buffer made by open(), if it is still that scratch buffer. ":bdelete" keeps a buffer valid but
+--- clears its options and mappings: reused, it would be a normal modified file buffer that blocks :qa.
+---@return integer?
+local function log_buf()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == LOG_NAME then
+      if vim.bo[b].buftype == "nofile" then
+        return b
+      end
+      pcall(vim.api.nvim_buf_delete, b, { force = true })
+      return nil
+    end
+  end
+end
+
 --- Open the log in a scratch split (buffer "slop://log", filetype "sloplog"; `q` closes).
 ---@param opts? {level?: integer}
 ---@return integer buf
@@ -196,10 +252,10 @@ function M.open(opts)
   if #lines == 0 then
     lines = { "(slop log is empty)" }
   end
-  local buf = vim.fn.bufnr("slop://log")
-  if buf == -1 or not vim.api.nvim_buf_is_valid(buf) then
+  local buf = log_buf()
+  if not buf then
     buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_name(buf, "slop://log")
+    vim.api.nvim_buf_set_name(buf, LOG_NAME)
     vim.bo[buf].bufhidden = "hide"
     vim.bo[buf].filetype = "sloplog"
     vim.keymap.set("n", "q", "<Cmd>close<CR>", { buf = buf, desc = "slop: close log", nowait = true })

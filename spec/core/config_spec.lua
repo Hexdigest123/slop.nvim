@@ -65,7 +65,7 @@ describe("config", function()
 
   it("reports validation errors with <ns>.<field> paths", function()
     config.setup({ ui = { picker = "nope" } })
-    assert.are.same({ "ui.picker: expected 'auto'|'fzf'|'builtin'|'select', got nope" }, config.errors("ui"))
+    assert.are.same({ "ui.picker: expected 'auto'|'fzf'|'builtin'|'select', got string" }, config.errors("ui"))
     assert.matches("invalid config", notes[1].msg)
     config.setup({ hello = { greeting = 1, keymaps = { greet = 2 } } })
     local errs = config.errors("hello")
@@ -143,5 +143,127 @@ describe("config", function()
     assert.is_true(config.enabled("hello"))
     config.set_enabled("hello", nil)
     assert.is_false(config.enabled("hello"))
+  end)
+
+  it("removing an override restores the setup() value (the override is not written into it)", function()
+    config.setup({ term = { layout = "float" } })
+    config.set_enabled("term", false)
+    assert.is_false(config.enabled("term"))
+    config.set_enabled("term", nil)
+    assert.is_true(config.enabled("term"))
+    assert.are.same({ layout = "float" }, config.raw().term)
+  end)
+
+  it("never echoes option values in validation errors, notifications or the log", function()
+    local key = "sk-FAKE0000-0000-NOTAREALKEY"
+    config.setup({ ai = { providers = { codestral = { api_key = key } } } })
+    local errs = config.errors("ai")
+    assert.are.same({ "ai.providers.codestral.api_key: expected env var name|function|false, got string" }, errs)
+    for _, n in ipairs(notes) do
+      assert.falsy(n.msg:find(key, 1, true), n.msg)
+    end
+    for _, e in ipairs(require("slop.core.log").entries()) do
+      assert.falsy(e.msg:find(key, 1, true), e.msg)
+    end
+    -- errors a schema throws itself (vim.validate with a function validator) are cleaned too
+    config.setup({
+      modules = {
+        thrower = {
+          name = "thrower",
+          description = "d",
+          defaults = { enabled = true, token = "" },
+          setup = function() end,
+          schema = function(cfg)
+            vim.validate("token", cfg.token, function(v)
+              return v == ""
+            end, "an empty string")
+          end,
+        },
+      },
+      thrower = { token = key },
+    })
+    assert.are.same({ "thrower.token: expected an empty string, got an invalid value" }, config.errors("thrower"))
+    assert.equal("x: expected y, got number", config.hide_values("x: expected y, got number"))
+  end)
+
+  it("log.max_entries must be an integer >= 1", function()
+    config.setup({ log = { max_entries = 2.5 } })
+    assert.are.same({ "log.max_entries: expected integer >= 1, got number" }, config.errors("log"))
+    config.setup({ log = { max_entries = 0 } })
+    assert.equal(1, #config.errors("log"))
+    local reported = vim.tbl_filter(function(n)
+      return n.msg:find("log.max_entries", 1, true) ~= nil
+    end, notes)
+    assert.equal(2, #reported, "once per setup() call")
+  end)
+
+  it("secrets: detectors on by default, a boolean; common credential files are blocked", function()
+    local c = config.get("secrets")
+    assert.is_true(c.detectors)
+    for _, g in ipairs({ ".netrc", "_netrc", ".npmrc", ".pypirc", ".git-credentials", ".kube/config" }) do
+      assert.truthy(vim.tbl_contains(c.block, g), g)
+    end
+    for _, g in ipairs({ "*kubeconfig*", "*service-account*.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519" }) do
+      assert.truthy(vim.tbl_contains(c.block, g), g)
+    end
+    local secrets = require("slop.core.secrets")
+    for _, p in ipairs({ "/h/.kube/config", "/h/.ssh/id_ed25519", "/p/gcp-service-account-1.json", "/h/.netrc" }) do
+      assert.is_true(secrets.is_blocked(p), p)
+    end
+    assert.is_false(secrets.is_blocked("/h/.ssh/id_ed25519.pub"))
+    config.setup({ secrets = { detectors = "yes" } })
+    assert.are.same({ "secrets.detectors: expected boolean, got string" }, config.errors("secrets"))
+    config.setup({ secrets = { detectors = false } })
+    assert.is_false(config.get("secrets").detectors)
+  end)
+
+  it("reports option mistakes that leave a module disabled", function()
+    config.setup({ term = { enabled = "yes" }, hello = true })
+    local text = table.concat(
+      vim.tbl_map(function(n)
+        return n.msg
+      end, notes),
+      "\n"
+    )
+    assert.matches("term%.enabled: expected boolean, got string", text)
+    assert.matches("hello: expected table|false, got boolean", text)
+    assert.is_false(config.enabled("term"))
+    assert.truthy(vim.tbl_contains(config.errors("hello"), "hello: expected table|false, got boolean"))
+  end)
+
+  it("opts.modules: only name = spec entries; specs are used as given", function()
+    local timer = assert(vim.uv.new_timer()) -- userdata in a module table must not break setup()
+    local api = { timer = timer }
+    local mine = {
+      name = "mine",
+      description = "d",
+      defaults = { enabled = true },
+      api = api,
+      setup = function()
+        api.ready = true
+      end,
+    }
+    config.setup({ modules = { mine = mine, { name = "listed" } } })
+    timer:close()
+    assert.equal(mine, config.user_modules().mine)
+    assert.is_nil(config.user_modules()[1])
+    assert.matches("ignoring %[1%] = table", notes[1].msg)
+    local registry = require("slop.core.registry")
+    assert.truthy(vim.tbl_contains(registry.names(), "mine"))
+    assert.equal(api, require("slop").mine)
+    assert.is_true(api.ready)
+  end)
+
+  it("vim.g.slop as a function also registers modules", function()
+    vim.g.slop = function()
+      return {
+        modules = {
+          gmod = { name = "gmod", description = "d", defaults = { enabled = true }, setup = function() end },
+        },
+      }
+    end
+    config.invalidate()
+    assert.truthy(config.user_modules().gmod)
+    assert.equal("module", require("slop.core.registry").kind("gmod"))
   end)
 end)

@@ -108,7 +108,7 @@ function M.run(cmd)
   if not reg.is_enabled(name) then
     return err(("slop: module '%s' is disabled (enable it with :Slop modules enable %s)"):format(name, name))
   end
-  if not reg.load(name) then
+  if not reg.load(name, { report = true }) then
     return
   end
   local spec = reg.spec(name)
@@ -139,14 +139,15 @@ function M.run(cmd)
   end
 end
 
---- Completion for :Slop. Handles a range prefix ("'<,'>Slop ...") and bang.
+--- Completion for :Slop. Handles a range prefix ("'<,'>Slop ..."), bang and abbreviations (":Sl ...").
 --- Level 1: core subcommands + enabled modules; level 2: the module's subcommands (spec loaded, no setup);
 --- level 3+: the subcommand's complete(arg_lead, args_after_sub, cmdline).
 ---@param arg_lead string
 ---@param cmdline string
 ---@return string[]
 function M.complete(arg_lead, cmdline, _)
-  local rest = cmdline:match("Slop!?%s+(.*)$") or ""
+  -- the command as typed: user commands may be abbreviated (":Sl", ":Slo")
+  local rest = cmdline:match("%f[%a]Sl%a*!?%s+(.*)$") or ""
   local words = vim.split(rest, "%s+", { trimempty = false })
   if #words <= 1 then
     local names = vim.list_extend(vim.tbl_keys(M.core), registry().names({ enabled = true }))
