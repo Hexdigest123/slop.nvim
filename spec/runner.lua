@@ -6,6 +6,9 @@
 -- Paths may be spec files, directories, or substrings of spec paths. Default: every spec/**/*_spec.lua.
 -- Each spec FILE runs in its own `nvim --headless --clean -u NONE` child process (isolation), with
 -- XDG_{DATA,STATE,CACHE,CONFIG}_HOME pointed at a fresh temp dir. Files run in parallel (SLOP_TEST_JOBS).
+-- A file whose stderr reports an unhandled error (scheduled callback, timer, autocmd: "vim.schedule callback:",
+-- "Lua callback:", "stack traceback:", "E5108:", "Error in ...", "Error executing ...") fails even when every test
+-- passed; set vim.g.slop_test_allow_stderr = true in a spec that provokes such output on purpose.
 --
 -- Globals inside specs (busted-compatible subset):
 --   describe(name, fn)  it(name, fn)  pending(name)  before_each(fn)  after_each(fn)
@@ -217,6 +220,9 @@ local function run_child(file)
     end
   end
   run_suite(root_suite, {})
+  if vim.g.slop_test_allow_stderr then
+    io.write("@@ALLOW_STDERR\n")
+  end
   io.write(("@@RESULT %d %d %d\n"):format(results.passed, results.failed, results.pending))
   return results.failed > 0 and 1 or 0
 end
@@ -245,6 +251,23 @@ local function discover(filters)
     end
   end
   return out
+end
+
+--- Errors raised in scheduled callbacks, timers and autocmds never reach a spec's pcall: Neovim prints them to
+--- stderr. A passing file whose stderr shows one of these still fails (opt out: vim.g.slop_test_allow_stderr).
+local STDERR_ERRORS =
+  { "vim.schedule callback:", "Lua callback:", "stack traceback:", "E5108:", "Error in ", "Error executing" }
+
+---@param stderr string?
+---@return string? line  the first line that reports an unhandled error
+local function stderr_error(stderr)
+  for line in (stderr or ""):gmatch("[^\n]+") do
+    for _, pat in ipairs(STDERR_ERRORS) do
+      if line:find(pat, 1, true) then
+        return line
+      end
+    end
+  end
 end
 
 local function run_parent(filters)
@@ -302,8 +325,10 @@ local function run_parent(filters)
     io.write(rel .. "\n")
     local out = (res and res.stdout or "") .. ""
     local p, f, pe = out:match("@@RESULT (%d+) (%d+) (%d+)")
-    io.write((out:gsub("@@RESULT[^\n]*\n?", "")))
-    if res and res.stderr and res.stderr ~= "" and (not p or res.code ~= 0) then
+    local allow = out:find("@@ALLOW_STDERR", 1, true) ~= nil
+    io.write((out:gsub("@@RESULT[^\n]*\n?", ""):gsub("@@ALLOW_STDERR\n?", "")))
+    local err_line = not allow and stderr_error(res and res.stderr) or nil
+    if res and res.stderr and res.stderr ~= "" and (not p or res.code ~= 0 or err_line) then
       io.write("  stderr: " .. res.stderr:gsub("\n", "\n  ") .. "\n")
     end
     if not p then
@@ -314,7 +339,11 @@ local function run_parent(filters)
       total.passed = total.passed + tonumber(p)
       total.failed = total.failed + tonumber(f)
       total.pending = total.pending + tonumber(pe)
-      if tonumber(f) > 0 or res.code ~= 0 then
+      if err_line then
+        total.failed = total.failed + 1
+        io.write(("  ✗ unhandled error on stderr: %s\n"):format(err_line))
+      end
+      if tonumber(f) > 0 or res.code ~= 0 or err_line then
         failed_files[#failed_files + 1] = rel
       end
     end
