@@ -70,13 +70,15 @@ end
 ---@return string
 function M.instruction(preset, extra)
   extra = extra and vim.trim(extra) or ""
-  if not preset then
+  -- a preset without a prompt (rejected by the schema, but setup() continues) acts like no preset
+  local base = preset and type(preset.prompt) == "string" and preset.prompt or ""
+  if base == "" then
     return extra
   end
   if extra == "" then
-    return preset.prompt
+    return base
   end
-  return preset.prompt .. "\n\nAdditional instructions from the user: " .. extra
+  return base .. "\n\nAdditional instructions from the user: " .. extra
 end
 
 --- Build the content blocks of the first prompt.

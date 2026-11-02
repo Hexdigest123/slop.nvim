@@ -26,6 +26,19 @@ describe("edit replacement protocol", function()
       assert.equal("unterminated", err)
       assert.is_nil(R.from_tag("no tags"))
     end)
+
+    it("takes the innermost opening tag when the answer mentions the tag in prose", function()
+      local msg =
+        "I put the new code in the <slop:replacement> block below.\n<slop:replacement>\nx = 2\n</slop:replacement>"
+      assert.equal("x = 2", R.from_tag(msg))
+      assert.same({ "x = 2", "tag" }, { R.extract(msg, { old_text = "x = 1" }) })
+    end)
+
+    it("keeps the fences of a region that is itself one fenced block", function()
+      local msg = "Done.\n<slop:replacement>\n```lua\nprint(2)\n```\n</slop:replacement>"
+      assert.same({ "```lua\nprint(2)\n```", "tag" }, { R.extract(msg, { old_text = "```lua\nprint(1)\n```" }) })
+      assert.same({ "print(2)", "tag" }, { R.extract(msg, { old_text = "print(1)" }) })
+    end)
   end)
 
   it("from_fence takes the last fenced block", function()
@@ -45,6 +58,19 @@ describe("edit replacement protocol", function()
     it("cuts a whole-file diff down to the region", function()
       local d = { { path = "/p/a.lua", oldText = "whatever", newText = "-- head\nNEW\n-- tail" } }
       assert.equal("NEW", R.from_diffs(d, ctx))
+      -- agents send file contents with the final newline; buffer text never ends in one
+      d = { { path = "/p/a.lua", oldText = "whatever", newText = "-- head\nNEW\n-- tail\n" } }
+      assert.equal("NEW", R.from_diffs(d, ctx))
+      -- a buffer whose last line is empty, with and without the file's final newline in the diff
+      local ectx = vim.tbl_extend("force", ctx, { file_after = "\n-- tail\n" })
+      d = { { path = "/p/a.lua", oldText = "whatever", newText = "-- head\nNEW\n-- tail\n\n" } }
+      assert.equal("NEW", R.from_diffs(d, ectx))
+      d = { { path = "/p/a.lua", oldText = "whatever", newText = "-- head\nNEW\n-- tail\n" } }
+      assert.equal("NEW", R.from_diffs(d, ectx))
+      -- a region at the end of the file gets no stray final newline
+      local tctx = vim.tbl_extend("force", ctx, { file_after = "" })
+      d = { { path = "/p/a.lua", oldText = "whatever", newText = "-- head\nNEW\n" } }
+      assert.equal("NEW", R.from_diffs(d, tctx))
     end)
 
     it("ignores other files and unmatched diffs", function()
@@ -161,6 +187,12 @@ describe("edit replacement protocol", function()
         "Explain it\n\nAdditional instructions from the user: briefly",
         P.instruction({ prompt = "Explain it" }, " briefly ")
       )
+    end)
+
+    it("a preset without a prompt falls back to the user's text", function()
+      local P = require("slop.modules.edit.prompt")
+      assert.equal("do it", P.instruction({ name = "mine" }, " do it "))
+      assert.equal("", P.instruction({ name = "mine" }, nil))
     end)
   end)
 end)

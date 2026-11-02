@@ -167,7 +167,6 @@ function Request:_progress_stop(status, msg)
   end
 end
 
----@param status string
 --- Current region (linewise regions are normalised to whole lines).
 ---@return slop.Range?
 function Request:region()
@@ -181,6 +180,7 @@ function Request:region()
   return r
 end
 
+---@param status string
 function Request:_set_status(status)
   if status == self.status then
     return
@@ -330,7 +330,11 @@ function Request:_send(blocks)
       self:_on_permission(req, respond)
     end,
     on_done = function(stop, err)
-      self:_on_done(stop, err)
+      -- an error while applying the answer must still finish the request (else it stays listed forever)
+      local ok, e = pcall(self._on_done, self, stop, err)
+      if not ok then
+        self:_fail("applying the answer failed: " .. tostring(e), true)
+      end
     end,
   })
 end
@@ -349,12 +353,7 @@ function Request:_on_update(u)
     self:_set_status("thinking")
   elseif kind == "tool_call" or kind == "tool_call_update" then
     local id = u.toolCallId or "?"
-    local tc = self.tools[id] or {}
-    for k, v in pairs(u) do
-      if not (k == "content" and type(v) == "table" and #v == 0) then
-        tc[k] = v
-      end
-    end
+    local tc = acp.merge_tool_call(self.tools[id], u)
     self.tools[id] = tc
     local title = tc.title or tc.kind or "tool"
     local st = tc.status
@@ -388,16 +387,13 @@ end
 function Request:_on_permission(req, respond)
   local acp = require("slop.services.ai.acp")
   local policy = self.cfg.permissions or acp.default_policy
-  local id, verdict, reason = acp.decide(req, policy)
+  -- req.toolCall only carries changed fields: decide on everything announced for the call (the client merges its
+  -- own view already; merging ours too is harmless)
   local tc = type(req.toolCall) == "table" and req.toolCall or {}
+  tc = acp.merge_tool_call(tc.toolCallId ~= nil and self.tools[tc.toolCallId] or nil, tc)
+  local id, verdict, reason = acp.decide(vim.tbl_extend("force", {}, req, { toolCall = tc }), policy)
   if verdict == "reject" then
     for _, c in ipairs(type(tc.content) == "table" and tc.content or {}) do
-      if type(c) == "table" and c.type == "diff" then
-        self.diffs[#self.diffs + 1] = c
-      end
-    end
-    local known = tc.toolCallId and self.tools[tc.toolCallId]
-    for _, c in ipairs(known and type(known.content) == "table" and known.content or {}) do
       if type(c) == "table" and c.type == "diff" then
         self.diffs[#self.diffs + 1] = c
       end
@@ -472,7 +468,8 @@ function Request:_complete()
     ui.show_scratch(
       ("edit/%s-%d"):format(self.preset and self.preset.name or "result", self.id),
       lines,
-      vim.bo[self.buf].filetype
+      -- the source buffer may have been wiped while the agent worked: the result is still worth showing
+      util.buf_valid(self.buf) and vim.bo[self.buf].filetype or nil
     )
     self.state = "done"
     self:_finish("scratch")
@@ -491,6 +488,10 @@ function Request:_complete()
   local r = util.buf_valid(buf) and self:region() or nil
   if not r then
     self:_fail("the region was deleted while the request was running; the answer is in a scratch buffer", true)
+    return
+  end
+  if not vim.bo[buf].modifiable then
+    self:_fail("the buffer is not modifiable anymore; the answer is in a scratch buffer", true)
     return
   end
   local conflict = not vim.deep_equal(util.range_text(buf, r), self.old_lines)

@@ -28,8 +28,9 @@ end
 
 --- Content of the last complete replacement block.
 ---@param text string
+---@param keep_fence? boolean              keep a code fence that wraps the whole block (the region is one)
 ---@return string? content, string? err  err = "unterminated" when an opening tag has no closing tag
-function M.from_tag(text)
+function M.from_tag(text, keep_fence)
   local last
   local pos = 1
   while true do
@@ -38,6 +39,12 @@ function M.from_tag(text)
       break
     end
     local cs, ce = text:find(M.CLOSE, e + 1, true)
+    -- the tag mentioned in prose before the real block: use the innermost open tag
+    local s2, e2 = text:find(M.OPEN, e + 1, true)
+    while cs and s2 and s2 < cs do
+      e = e2
+      s2, e2 = text:find(M.OPEN, e + 1, true)
+    end
     if not cs then
       if not last then
         return nil, "unterminated"
@@ -50,7 +57,8 @@ function M.from_tag(text)
   if not last then
     return nil
   end
-  return M.unfence(strip_edges(last))
+  last = strip_edges(last)
+  return keep_fence and last or M.unfence(last)
 end
 
 --- Content of the last fenced code block.
@@ -69,6 +77,17 @@ end
 ---@field old_text string                  original region text
 ---@field file_before? string              file text before the region
 ---@field file_after? string               file text after the region
+
+--- The region's part of a whole-file text, when the text keeps everything before and after the region.
+---@param text string
+---@param before string
+---@param after string
+---@return string?
+local function cut_file(text, before, after)
+  if #text >= #before + #after and text:sub(1, #before) == before and (after == "" or text:sub(-#after) == after) then
+    return text:sub(#before + 1, #text - #after)
+  end
+end
 
 --- Apply ACP diffs ({path, oldText, newText}) of rejected edits for our file to the region.
 ---@param diffs table[]
@@ -89,15 +108,14 @@ function M.from_diffs(diffs, ctx)
         local s, e = region:find(old, 1, true)
         region = region:sub(1, s - 1) .. d.newText .. region:sub(e + 1)
         applied = true
-      elseif
-        before
-        and after
-        and #d.newText >= #before + #after
-        and d.newText:sub(1, #before) == before
-        and (after == "" or d.newText:sub(-#after) == after)
-      then
-        region = d.newText:sub(#before + 1, #d.newText - #after)
-        applied = true
+      elseif before and after then
+        -- whole-file contents usually end with the file's final newline, which buffer text never has
+        local cut = d.newText:sub(-1) == "\n" and cut_file(d.newText:sub(1, -2), before, after)
+          or cut_file(d.newText, before, after)
+        if cut then
+          region = cut
+          applied = true
+        end
       end
     end
   end
@@ -110,7 +128,8 @@ end
 ---@param diffs? table[]                   diffs of rejected edit permissions / tool calls
 ---@return string? text, string source_or_err  source = "tag"|"diff"|"fence"
 function M.extract(message, ctx, diffs)
-  local tag, terr = M.from_tag(message or "")
+  -- a region that is itself one fenced block (Markdown) keeps its fences
+  local tag, terr = M.from_tag(message or "", (ctx and ctx.old_text or ""):match("^%s*```") ~= nil)
   if tag then
     return tag, "tag"
   end

@@ -48,7 +48,7 @@ local function region_from_mode(buf)
   local mode = vim.fn.mode()
   if mode:match("^[vV\22]") then
     local r = util.visual_range(buf)
-    api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+    vim.cmd("normal! \27") -- :normal saves/restores pending typeahead (feedkeys "x" would run it in Visual mode)
     if mode ~= "v" then
       return { r[1], 0, r[3], #get_line(buf, r[3]) }, true
     end
@@ -78,6 +78,43 @@ local function region_from_mode(buf)
     end
   end
   return { srow, 0, erow, #get_line(buf, erow) }, true
+end
+
+--- Track `range` while a prompt or picker is open: another request's preview, an LSP edit or a reload may move
+--- it before the request starts. Returns a function that drops the mark and yields the current range (nil when the
+--- region was deleted).
+---@param buf integer
+---@param range slop.Range
+---@param linewise boolean
+---@return fun(): slop.Range?
+local function track(buf, range, linewise)
+  local util = require("slop.core.util")
+  local ns = util.ns("edit.pending")
+  local ok, id = pcall(util.region_mark, buf, ns, range, { invalidate = true })
+  local taken, r = false, nil
+  return function()
+    if taken then
+      return r
+    end
+    taken = true
+    if not ok then
+      r = range
+      return r
+    end
+    r = util.mark_range(buf, ns, id)
+    pcall(api.nvim_buf_del_extmark, buf, ns, id)
+    if r and linewise then
+      if r[4] == 0 and r[3] > r[1] then
+        r[3] = r[3] - 1
+      end
+      r[2], r[4] = 0, #get_line(buf, r[3])
+    end
+    return r
+  end
+end
+
+local function region_gone()
+  log().notify("edit: the region was deleted while the prompt was open", vim.log.levels.WARN)
 end
 
 ---@class slop.edit.StartOpts
@@ -126,6 +163,10 @@ function api_tbl.start(opts)
     if not preset and rest == "" then
       return nil
     end
+    if preset and rest == "" and (type(preset.prompt) ~= "string" or preset.prompt == "") then
+      log().notify(("preset '%s' has no prompt (set edit.presets.%s.prompt)"):format(pname, pname), vim.log.levels.WARN)
+      return nil
+    end
     local req = require("slop.modules.edit.request").new({
       buf = buf,
       range = range,
@@ -153,6 +194,7 @@ function api_tbl.start(opts)
   end
   local context = require("slop.modules.edit.context")
   local root = context.root(buf)
+  local take = track(buf, range, linewise)
   require("slop.core.ui.input").open({
     title = ("slop edit · %s"):format(agent),
     default = opts.preset and ("#" .. opts.preset .. " ") or nil,
@@ -162,7 +204,17 @@ function api_tbl.start(opts)
     complete = function(lead)
       return context.complete(lead, all, root)
     end,
-    on_submit = go,
+    on_submit = function(text)
+      local r = take()
+      if not r then
+        return region_gone()
+      end
+      range = r
+      return go(text)
+    end,
+    on_cancel = function()
+      take()
+    end,
   })
 end
 
@@ -182,9 +234,22 @@ function api_tbl.preset(name, opts)
   local all = presets()
   local names = vim.tbl_keys(all)
   table.sort(names)
+  if opts.lines then
+    local s, e = opts.lines[1], opts.lines[2]
+    opts.range, opts.linewise, opts.lines = { s, 0, e, #get_line(buf, e) }, true, nil
+  end
+  local linewise = opts.linewise
+  if linewise == nil then
+    linewise = opts.range[2] == 0 and opts.range[4] >= #get_line(buf, opts.range[3])
+  end
+  local take = track(buf, opts.range, linewise)
   local function chosen(item)
+    local r = take()
     if item then
-      opts.preset = item
+      if not r then
+        return region_gone()
+      end
+      opts.preset, opts.range, opts.linewise = item, r, linewise
       api_tbl.start(opts)
     end
   end
@@ -365,10 +430,13 @@ return {
     check("permissions.allow", type(c.permissions) == "table" and c.permissions.allow or nil, function(v)
       return vim.islist(v)
     end, false, "list of tool kinds")
+    local builtin = require("slop.modules.edit.presets").builtin
     for name, p in pairs(type(c.presets) == "table" and c.presets or {}) do
+      -- only overrides of a built-in preset may leave `prompt` out (they keep the built-in prompt)
       check("presets." .. name, p, function(v)
-        return v == false or (type(v) == "table" and (v.prompt == nil or type(v.prompt) == "string"))
-      end, false, "false|{prompt, desc?, sink?, diagnostics?, input?, agent?}")
+        return v == false
+          or (type(v) == "table" and (type(v.prompt) == "string" or (v.prompt == nil and builtin[name] ~= nil)))
+      end, false, "false|{prompt, desc?, sink?, diagnostics?, input?, agent?} (prompt required for new presets)")
       if type(p) == "table" and p.sink ~= nil then
         check("presets." .. name .. ".sink", p.sink, function(v)
           return v == "diff" or v == "float" or v == "scratch"

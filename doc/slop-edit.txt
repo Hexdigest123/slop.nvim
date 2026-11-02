@@ -31,7 +31,8 @@ answer as an inline diff you accept or reject hunk by hunk.
 - Requests run concurrently; each one shows its progress in the buffer and
   can be cancelled on its own.
 - Everything sent to the agent passes through |slop-secrets|: blocked files
-  are never sent and secret values are replaced by `<redacted>`.
+  are never sent (unless you let agents read them, `secrets.agent_reads`,
+  |slop-edit-agents|) and secret values are replaced by `<redacted>`.
 
 ==============================================================================
 2. WORKFLOW                                                *slop-edit-workflow*
@@ -41,7 +42,11 @@ answer as an inline diff you accept or reject hunk by hunk.
      `<C-s>` (insert/normal) or `<CR>` (normal) submits,
      `<Esc>` / `q` (normal) or `<C-c>` cancels, `<Up>`/`<Down>` (normal) walk
      the prompt history. `#preset` and `@file` complete as you type
-     (also `<C-x><C-u>`).
+     (also `<C-x><C-u>`). The region is tracked while the prompt (or the
+     preset picker) is open: changes elsewhere in the buffer, such as another
+     request's preview, move it along; if the region is deleted nothing is
+     sent. Keys queued behind the edit key (a macro, a mapping such as
+     `<leader>aa#fix<C-s>`) go to the prompt.
 3. While the agent works the region is dimmed and a status line above it
    shows a spinner, the agent's latest activity ("Read foo.lua", "thinking",
    "writing") and the elapsed time. The statusline shows the native progress
@@ -54,15 +59,24 @@ answer as an inline diff you accept or reject hunk by hunk.
      `]h` / `[h` next / previous hunk          `<C-r>` refine
    The whole review is one undo step: `u` after accepting restores the
    original text. Rejecting everything right away leaves the buffer exactly
-   as it was (not even 'modified'). The diff keys only exist while a diff is
-   shown and fall through to their normal meaning outside a hunk.
+   as it was (not even 'modified').
+   The diff keys are buffer-local, exist only while a review is shown and
+   are mapped with |:map-nowait|, so they act at once. `ga`, `gr`, `gA`,
+   `gR` and `<C-r>` act only when the cursor is inside a hunk or the review
+   region, `]h` / `[h` move between the pending hunks; anywhere else the
+   keys keep their normal meaning (`<C-r>` redoes, `gR` starts Virtual
+   Replace mode, ...). While a review is shown, `gr` shadows the default LSP
+   maps `grn`, `grr`, `gra`, `gri`, `grt` and `grx` (Nvim 0.11+) in that
+   buffer; set another `reject` key under `edit.keymaps.diff` if you use them
+   during reviews.
 5. `<C-r>` (refine) asks for changes in the same agent session: the shown
    diff is withdrawn and the agent's new answer is shown instead.
 
 Conflict guard: if you change the region while the request is running, the
 answer is diffed against the current text, a warning line is shown and the
 diff is never applied automatically (even with `apply = "auto"`). If the
-region was deleted the answer goes to a scratch buffer instead.
+region was deleted, or the buffer is no longer 'modifiable', the request
+fails and the answer goes to a scratch buffer instead.
 
 ==============================================================================
 3. KEYMAPS                                                  *slop-edit-keymaps*
@@ -77,8 +91,9 @@ Defaults (set any of them to `false` under `edit.keymaps` to disable):
                                  only running one, or pick one)
 
 Diff review keys live under `edit.keymaps.diff` (buffer-local while a diff is
-shown): `accept = "ga"`, `reject = "gr"`, `accept_all = "gA"`,
-`reject_all = "gR"`, `next = "]h"`, `prev = "[h"`, `refine = "<C-r>"`.
+shown, see |slop-edit-workflow| step 4): `accept = "ga"`, `reject = "gr"`,
+`accept_all = "gA"`, `reject_all = "gR"`, `next = "]h"`, `prev = "[h"`,
+`refine = "<C-r>"`.
 
 <Plug> mappings: `<Plug>(slop-edit-edit)`, `<Plug>(slop-edit-preset)`,
 `<Plug>(slop-edit-agent)`, `<Plug>(slop-edit-cancel)`.
@@ -130,7 +145,8 @@ override them in `edit.presets` (`false` removes one): >lua
       },
     }
 <
-Fields: `desc`, `prompt` (the instruction), `sink` (`"diff"` default,
+Fields: `desc`, `prompt` (the instruction; required for a new preset, an
+override of a built-in keeps the built-in prompt), `sink` (`"diff"` default,
 `"float"`, `"scratch"`), `diagnostics` (send the region's diagnostics),
 `input` (open the prompt prefilled with `#name` for extra text), `agent`.
 
@@ -177,20 +193,33 @@ Neovim exits.
 Replacement-text protocol:
 - slop advertises only the `fs.readTextFile` client capability. Reads are
   served from loaded buffers (unsaved text) or disk, redacted, and refused for
-  blocked files and for paths outside the project root (symlinks resolved).
+  blocked files (also through a symlink with another name) and for paths
+  outside the project root (symlinks resolved).
   Set `read_outside_root = true` on an agent in `ai.agents` to lift the root
   limit for that agent.
+- `secrets.agent_reads` (|slop-config|) decides whether agents may read
+  blocked files. `"deny"` (default) refuses them as described here.
+  `"allow"` serves them and accepts `read` / `search` permission requests
+  that touch them, but their secret values are still redacted (cloak rules,
+  private keys, token detectors). Edits, moves and deletes of blocked files
+  are always rejected.
 - The prompt asks for exactly one `<slop:replacement>...</slop:replacement>`
-  block containing the new region text.
+  block containing the new region text. When the answer mentions the tag in
+  its prose, the block that is actually closed is used.
 - Permission requests: `read`, `search`, `fetch`, `think` tools are allowed;
   `edit`, `delete`, `move`, `execute` and anything else are rejected, always
   with the agent's own option id. Configure with `edit.permissions.allow`.
+  The decision uses everything the agent announced about the tool call (the
+  kind and paths of its earlier `tool_call` updates, not just the permission
+  request); a blocked path anywhere rejects it (reads: unless
+  `secrets.agent_reads = "allow"`).
 - Fallbacks when the agent ignores the protocol: the diff of a rejected edit
-  of this file, then the last fenced code block, else an error and the raw
-  answer in a scratch buffer.
-- The replacement is validated: CRLF removed, a trailing newline of whole-line
-  regions dropped, the base indentation restored if the agent dropped it,
-  answers containing `<redacted>` (or nested tags) refused.
+  of this file (a fragment of the region, or the whole file), then the last
+  fenced code block, else an error and the raw answer in a scratch buffer.
+- The replacement is validated: CRLF removed, a code fence around the whole
+  block removed (unless the region itself is one fenced block), a trailing
+  newline of whole-line regions dropped, the base indentation restored if the
+  agent dropped it, answers containing `<redacted>` (or nested tags) refused.
 
                                                              *slop-edit-modes*
 Permission modes: some agents start sessions in a mode that approves actions
@@ -290,6 +319,12 @@ These are shared with other modules (rest uses the diff for AI gen/fix).
       `:reject_all()`, `:next()`, `:prev()`, `:close()` (rejects pending),
       `:is_active()`, `:range()`, `:hunk_at(row)`.
   compute({old}, {new}) -> hunks (pure)   list({buf})   close_all({buf}?)
+  Review keys (buffer-local while a review is shown) are mapped with
+  |:map-nowait|; while a review is shown `gr` shadows the 0.11+ default LSP
+  maps `grn`, `grr`, `gra`, `gri`, `grt` and `grx`. `ga`, `gr`, `gA`, `gR`
+  and `<C-r>` act only inside a hunk or the review region and fall through
+  to their previous or native meaning elsewhere; `]h` / `[h` move between
+  the pending hunks.
 
                                                              *slop-edit-input*
 `require("slop.core.ui.input")`
@@ -309,6 +344,10 @@ These are shared with other modules (rest uses the diff for AI gen/fix).
   progress({ title?, message?, source? ("slop"), on_cancel? }) ->
       `:update(msg, percent?) :finish(status?, msg?)` (native progress
       messages; a UI "cancel" request calls on_cancel).
+      `:update()` keeps the last percent when it is omitted and rounds it
+      down and clamps it to 0-100. `:finish()` writes the final state to the
+      message history (updates do not). Both are safe to call from fast
+      events (luv callbacks): they are re-run on the main loop.
 
 ==============================================================================
 12. ACP CLIENT                                                  *slop-edit-acp*
@@ -328,8 +367,11 @@ over stdio) usable by any module:
 Also: `acp.get(name)`, `acp.clients()`, `acp.stop_all()`,
 `acp.decide(req, policy?)`, `acp.read_text_file(params)`, `acp.text()`,
 `acp.resource()`, `acp.resource_link()`, `acp.block_text(block)`,
-`acp.tool_paths(tool_call)`. Unknown agent requests are answered with
--32601, every request has a timeout (except prompts, which are cancellable),
-and a crashing agent fails everything that was pending with its stderr tail.
+`acp.tool_paths(tool_call)`, `acp.merge_tool_call(known, update)`. The
+`toolCall` an `on_permission` handler receives already merges the session's
+earlier `tool_call` / `tool_call_update` notifications for that call.
+Unknown agent requests are answered with -32601, every request has a timeout
+(except prompts, which are cancellable), and a crashing agent fails
+everything that was pending with its stderr tail.
 
  vim:tw=78:ts=8:ft=help:norl:

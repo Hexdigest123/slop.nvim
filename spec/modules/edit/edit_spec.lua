@@ -329,6 +329,136 @@ describe("edit module (mock ACP agent)", function()
     assert.same({}, log.entries())
   end)
 
+  it("decides permissions on the whole tool call the agent announced", function()
+    local opts = { { optionId = "yes", kind = "allow_once" }, { optionId = "no", kind = "reject_once" } }
+    setup({
+      turns = {
+        {
+          { tool = { toolCallId = "a", title = "Read", kind = "read", locations = { { path = dir .. "/.env" } } } },
+          { permission = { toolCall = { toolCallId = "a", kind = "read" }, options = opts } },
+          { tool = { toolCallId = "b", title = "Read", kind = "read", locations = { { path = dir .. "/r.lua" } } } },
+          { permission = { toolCall = { toolCallId = "b" }, options = opts } },
+          { replace_region = "upper" },
+        },
+      },
+    })
+    local buf = open("r.lua", "x = 1\n")
+    edit.start({ lines = { 0, 0 }, instruction = "x" })
+    assert.truthy(wait_review(buf))
+    local outcomes = vim.tbl_map(function(e)
+      return e.result.outcome.optionId
+    end, log.responses("session/request_permission"))
+    assert.same({ "no", "yes" }, outcomes)
+    diff.list(buf)[1]:reject_all()
+  end)
+
+  it("tracks the region while the prompt is open (another request's preview moves it)", function()
+    setup({
+      by_prompt = {},
+      turns = {
+        { { sleep = 100 }, { chunk = "<slop:replacement>\nA1\nA2\nA3\n</slop:replacement>" } },
+        { { replace_region = "upper" } },
+      },
+    })
+    local buf = open("s.lua", "a1\nb1\nb2\n")
+    edit.start({ lines = { 0, 0 }, instruction = "first" })
+    edit.start({ lines = { 1, 2 } }) -- the prompt float opens for b1..b2
+    local pwin = api.nvim_get_current_win()
+    assert.not_equal("", api.nvim_win_get_config(pwin).relative)
+    assert.truthy(mock.wait(function()
+      return #diff.list(buf) > 0
+    end))
+    assert.same({ "A1", "A2", "A3", "b1", "b2" }, lines(buf))
+    api.nvim_buf_set_lines(api.nvim_win_get_buf(pwin), 0, -1, false, { "second" })
+    h.feed("<C-s>")
+    assert.truthy(mock.wait(function()
+      return #prompts() == 2
+    end))
+    assert.truthy(prompt_text(2):find("<region>\nb1\nb2\n</region>", 1, true), prompt_text(2))
+    assert.truthy(prompt_text(2):find("Region: lines 4-5", 1, true))
+    assert.same({}, api.nvim_buf_get_extmarks(buf, require("slop.core.util").ns("edit.pending"), 0, -1, {}))
+  end)
+
+  it("a request whose buffer is wiped, locked or breaks while applying still finishes", function()
+    setup({ default_turn = { { sleep = 100 }, { replace_region = "upper" } } })
+    -- scratch sink: the source buffer is wiped while the agent works, the result still opens
+    local buf = open("t.lua", "x = 1\n")
+    local id = edit.start({ lines = { 0, 0 }, preset = "tests" })
+    mock.wait(function()
+      return reqmod.active[id] and reqmod.active[id].state == "running"
+    end)
+    vim.cmd("enew")
+    vim.cmd("bwipeout! " .. buf)
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("scratch", done[1].result)
+    assert.same({ "X = 1" }, lines(api.nvim_get_current_buf()))
+    -- diff sink: the buffer became 'nomodifiable' meanwhile
+    local buf2 = open("u.lua", "y = 2\n")
+    edit.start({ lines = { 0, 0 }, instruction = "x" })
+    vim.bo[buf2].modifiable = false
+    assert.truthy(mock.wait(function()
+      return #done > 1
+    end))
+    assert.equal("failed", done[2].result)
+    assert.same({ "y = 2" }, lines(buf2))
+    -- any error while applying the answer fails the request instead of leaving it listed forever
+    local buf3 = open("v.lua", "z = 3\n")
+    local show = diff.show
+    diff.show = function()
+      error("boom")
+    end
+    edit.start({ lines = { 0, 0 }, instruction = "x" })
+    local ok = mock.wait(function()
+      return #done > 2
+    end)
+    diff.show = show
+    assert.truthy(ok)
+    assert.equal("failed", done[3].result)
+    assert.same({ "z = 3" }, lines(buf3))
+    assert.same({}, edit.requests())
+  end)
+
+  it("presets need a prompt unless they override a built-in one", function()
+    setup({})
+    local config = require("slop.config")
+    local base = config.get("edit")
+    local function errs(presets)
+      return table.concat(config.validate("edit", vim.tbl_extend("force", base, { presets = presets })), "\n")
+    end
+    assert.matches("edit%.presets%.mine", errs({ mine = { desc = "no prompt" } }))
+    assert.equal("", errs({ mine = { prompt = "Do it." } }))
+    assert.equal("", errs({ fix = { agent = "mock" } }))
+    assert.equal("", errs({ explain = false }))
+    -- one that slipped through (setup() keeps going) is refused before the agent starts...
+    setup({ default_turn = { { chunk = "ok" } } }, { edit = { presets = { mine = { desc = "x", sink = "float" } } } })
+    open("w.lua", "x\n")
+    assert.is_nil(edit.start({ lines = { 0, 0 }, preset = "mine", instruction = "" }))
+    assert.same({}, log.entries())
+    -- ...and with extra text it runs as a plain instruction
+    assert.truthy(edit.start({ lines = { 0, 0 }, preset = "mine", instruction = "explain it" }))
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("explained", done[1].result)
+    assert.truthy(prompt_text():find("Instruction: explain it", 1, true))
+  end)
+
+  it("leaves Visual mode without running keys still queued behind the edit key", function()
+    setup({ default_turn = { { replace_region = "upper" } } })
+    h.source_plugin()
+    local buf = open("x.lua", "a\nb\nc\n")
+    -- a chained user mapping (a macro replay queues keys the same way): the rest is the prompt text
+    vim.keymap.set("x", "<F3>", "<leader>aaloud<C-s>", { remap = true })
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("V<F3>")
+    assert.truthy(wait_review(buf))
+    assert.same({ "A", "b", "c" }, lines(buf))
+    assert.truthy(prompt_text():find("Instruction: loud", 1, true))
+    diff.list(buf)[1]:accept_all()
+  end)
+
   it("opens the prompt float from the keymap and the command with a range", function()
     setup({ default_turn = { { replace_region = "upper" } } })
     h.source_plugin()
