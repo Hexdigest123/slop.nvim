@@ -2,7 +2,9 @@
 ---
 --- Every command runs through `git.run()`: `git -c core.quotepath=off --no-pager <args>` with the editor's
 --- environment inherited (so a `GIT_INDEX_FILE` that `git commit -a` / `git commit <paths>` exported to
---- `$EDITOR` is honoured) plus `GIT_OPTIONAL_LOCKS=0` (never fight the index lock held by `git commit`).
+--- `$EDITOR` is honoured, and the `GIT_DIR` / `GIT_WORK_TREE` of `git --git-dir=… --work-tree=… commit`) plus
+--- `GIT_OPTIONAL_LOCKS=0` (never fight the index lock held by `git commit`). An editor that did not inherit
+--- GIT_INDEX_FILE (remote / already running) gets the commit's index lock file instead (commit_index()).
 --- Callbacks always run on the main loop.
 ---
 --- Pure helpers (no process spawned): `root`, `git_dir`, `parse_commit_buffer`, `split_diff`.
@@ -11,7 +13,8 @@ local M = {}
 
 local uv = vim.uv
 
---- `git hash-object -t tree /dev/null`: diff base for root commits.
+--- `git hash-object -t tree /dev/null` in a SHA-1 repository: diff base for root commits (staged_diff asks git for
+--- the empty tree of the repository's own object format, so SHA-256 repositories work too).
 M.EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 ---@class slop.git.Result
@@ -50,7 +53,11 @@ local function abs(p, base)
     return nil
   end
   if not vim.startswith(p, "/") and not p:match("^%a:[/\\]") then
-    p = vim.fs.joinpath(base or uv.cwd(), p)
+    base = base or uv.cwd()
+    if not base then
+      return nil -- relative path and the cwd was deleted
+    end
+    p = vim.fs.joinpath(base, p)
   end
   return vim.fs.normalize(vim.fs.abspath(p))
 end
@@ -160,6 +167,9 @@ function M.git_dir(src)
     end
   end
   path = abs(path) or uv.cwd()
+  if not path then
+    return nil -- no path and the cwd was deleted
+  end
   -- inside a git dir?
   local dir = is_dir(path) and path or vim.fs.dirname(path)
   for d in vim.fs.parents(dir .. "/x") do
@@ -189,8 +199,9 @@ end
 ---@return string?
 function M.root(src)
   local path, hint = source(src)
-  if hint then
-    local wt = worktree_of(abs(hint) --[[@as string]])
+  local ahint = abs(hint)
+  if ahint then
+    local wt = worktree_of(ahint)
     if wt then
       return wt
     end
@@ -201,14 +212,26 @@ function M.root(src)
     if wt then
       return wt
     end
+    -- `git --git-dir=X --work-tree=Y commit` (bare "dotfiles" repos, yadm, vcsh) exports GIT_DIR and a
+    -- GIT_WORK_TREE that is relative to the cwd git started the editor in
+    local env_gd = vim.env.GIT_DIR
+    if env_gd and env_gd ~= "" and abs(env_gd) == vim.fs.normalize(gd) then
+      local ewt = vim.env.GIT_WORK_TREE
+      local r = (ewt and ewt ~= "") and abs(ewt) or uv.cwd()
+      if r then
+        return r
+      end
+    end
   end
-  if path and not path:match("^%a[%w+.-]*://") then
-    local r = vim.fs.root(abs(path) --[[@as string]], ".git")
+  local apath = path and not path:match("^%a[%w+.-]*://") and abs(path)
+  if apath then
+    local r = vim.fs.root(apath, ".git")
     if r then
       return vim.fs.normalize(r)
     end
   end
-  local r = vim.fs.root(uv.cwd(), ".git")
+  local cwd = uv.cwd() -- nil when the cwd was deleted
+  local r = cwd and vim.fs.root(cwd, ".git")
   return r and vim.fs.normalize(r) or nil
 end
 
@@ -224,13 +247,55 @@ local DIFF_ARGS = { "--no-color", "--no-ext-diff", "--no-textconv", "-M", "--src
 ---@field context? integer         -U lines (default 3)
 ---@field paths? string[]
 
---- Staged diff (`git diff --cached`, honouring GIT_INDEX_FILE / --amend). Output is NOT redacted:
---- pass it through core.secrets.redact_diff() before sending it anywhere.
+-- git writes the commit's index lock just before COMMIT_EDITMSG (hooks may run in between): a lock older than the
+-- message by more than this (s) is stale
+local LOCK_SLACK = 300
+
+--- Index file of a `git commit` in progress that this Neovim did not inherit, else nil (use the default index).
+--- While the editor is open, `git commit <paths>` keeps the index to commit in `<gitdir>/next-index-<pid>.lock` and
+--- `git commit -a` in `<gitdir>/index.lock`. git exports it to `$EDITOR` as GIT_INDEX_FILE, but an editor started
+--- earlier (nvr, flatten.nvim, `nvim --remote-wait`, fugitive's `:Git commit -a`) does not have it.
+---@param cwd? string  work tree (default: git.root(0))
+---@return string?
+function M.commit_index(cwd)
+  local inherited = vim.env.GIT_INDEX_FILE
+  if inherited and inherited ~= "" then
+    return nil
+  end
+  local gd = M.git_dir(cwd or 0)
+  local msg = gd and uv.fs_stat(gd .. "/COMMIT_EDITMSG")
+  if not msg then
+    return nil
+  end
+  local best, best_t
+  local function consider(p)
+    local st = uv.fs_stat(p)
+    if st and st.type == "file" and st.size > 0 and st.mtime.sec >= msg.mtime.sec - LOCK_SLACK then
+      if not best_t or st.mtime.sec > best_t then
+        best, best_t = p, st.mtime.sec
+      end
+    end
+  end
+  for name, kind in vim.fs.dir(gd) do
+    if kind == "file" and name:match("^next%-index%-%d+%.lock$") then
+      consider(gd .. "/" .. name)
+    end
+  end
+  if not best then
+    consider(gd .. "/index.lock")
+  end
+  return best
+end
+
+--- Staged diff (`git diff --cached`, honouring GIT_INDEX_FILE / --amend, and the index lock of a commit in progress
+--- when GIT_INDEX_FILE was not inherited, see commit_index()). Output is NOT redacted: pass it through
+--- core.secrets.redact_diff() before sending it anywhere.
 ---@param opts? slop.git.DiffOpts
 ---@param cb fun(diff: string?, err: string?)
 function M.staged_diff(opts, cb)
   opts = opts or {}
   local ro = { cwd = opts.cwd, env = opts.env }
+  local index = not opts.worktree and not (opts.env and opts.env.GIT_INDEX_FILE) and M.commit_index(opts.cwd)
   local function go(base)
     local args = { "diff" }
     if not opts.worktree then
@@ -245,19 +310,31 @@ function M.staged_diff(opts, cb)
       args[#args + 1] = "--"
       vim.list_extend(args, opts.paths)
     end
-    M.run(args, ro, function(res)
-      if res.code ~= 0 then
-        cb(nil, err_of(res, "diff"))
-      else
-        cb(res.stdout)
-      end
-    end)
+    local function diff(env)
+      M.run(args, { cwd = opts.cwd, env = env }, function(res)
+        if res.code ~= 0 and env ~= opts.env then
+          return diff(opts.env) -- the lock went away (the commit ended): the default index
+        elseif res.code ~= 0 then
+          cb(nil, err_of(res, "diff"))
+        else
+          cb(res.stdout)
+        end
+      end)
+    end
+    diff(index and vim.tbl_extend("force", opts.env or {}, { GIT_INDEX_FILE = index }) or opts.env)
   end
   if opts.amend or opts.worktree then
     local rev = opts.amend and "HEAD~1^{commit}" or "HEAD^{commit}"
     M.run({ "rev-parse", "-q", "--verify", rev }, ro, function(res)
       local sha = res.code == 0 and vim.trim(res.stdout) or ""
-      go(sha ~= "" and sha or M.EMPTY_TREE)
+      if sha ~= "" then
+        return go(sha)
+      end
+      -- root commit / unborn branch: the empty tree of this repository's object format (SHA-1 or SHA-256)
+      M.run({ "hash-object", "-t", "tree", "--stdin" }, { cwd = opts.cwd, env = opts.env, stdin = "" }, function(r)
+        local tree = r.code == 0 and vim.trim(r.stdout) or ""
+        go(tree ~= "" and tree or M.EMPTY_TREE)
+      end)
     end)
   else
     go(nil)
@@ -291,7 +368,8 @@ function M.log(opts, cb)
     cb({})
     return
   end
-  local args = { "log", "-n", tostring(n), "--no-merges", "--format=" .. (opts.format or "%s") }
+  -- --no-show-signature: `log.showSignature = true` would print signature lines into the output
+  local args = { "log", "-n", tostring(n), "--no-merges", "--no-show-signature", "--format=" .. (opts.format or "%s") }
   if opts.author then
     vim.list_extend(args, { "--fixed-strings", "--author=" .. opts.author })
   end
@@ -364,7 +442,7 @@ end
 ---@param cb fun(msg: string?)
 function M.head_message(opts, cb)
   opts = opts or {}
-  M.run({ "log", "-1", "--format=%B", "HEAD" }, { cwd = opts.cwd }, function(res)
+  M.run({ "log", "-1", "--no-show-signature", "--format=%B", "HEAD" }, { cwd = opts.cwd }, function(res)
     cb(res.code == 0 and res.stdout or nil)
   end)
 end

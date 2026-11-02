@@ -98,6 +98,53 @@ describe("core.git", function()
       vim.cmd.cd(other)
       assert.is_nil(git.root(other .. "/x.txt"))
     end)
+
+    it(
+      "uses GIT_DIR / GIT_WORK_TREE exported by `git --git-dir=… --work-tree=… commit` (bare dotfiles repos)",
+      function()
+        local base = h.tmpdir("dotfiles")
+        local gd, home = base .. "/dot.git", base .. "/home"
+        vim.fn.mkdir(home, "p")
+        sh(base, { "init", "-q", "--bare", gd })
+        h.write(home .. "/.vimrc", "set nu\n")
+        local env = { GIT_DIR = gd, GIT_WORK_TREE = home }
+        sh(home, { "add", ".vimrc" }, env)
+        h.write(gd .. "/COMMIT_EDITMSG", "\n# comment\n")
+        local cwd = vim.fn.getcwd()
+        vim.cmd.cd(home)
+        -- git starts the editor in the work tree with a RELATIVE GIT_WORK_TREE
+        vim.env.GIT_DIR, vim.env.GIT_WORK_TREE = gd, "."
+        local ok, err = pcall(function()
+          assert.equal(gd, git.git_dir(gd .. "/COMMIT_EDITMSG"))
+          assert.equal(home, git.root(gd .. "/COMMIT_EDITMSG"))
+          local diff = await(git.staged_diff, { cwd = git.root(gd .. "/COMMIT_EDITMSG") })
+          assert.matches("b/%.vimrc", diff)
+        end)
+        vim.env.GIT_DIR, vim.env.GIT_WORK_TREE = nil, nil
+        vim.cmd.cd(cwd)
+        assert(ok, err)
+        -- without the environment a bare repository still has no work tree
+        assert.is_nil(git.root(gd .. "/COMMIT_EDITMSG"))
+      end
+    )
+
+    it("does not throw when the cwd was deleted", function()
+      local cwd = vim.fn.getcwd()
+      local gone = h.tmpdir("gone")
+      vim.uv.chdir(gone)
+      vim.uv.fs_rmdir(gone)
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_set_current_buf(buf)
+      local ok, err = pcall(function()
+        assert.is_nil(git.root(0))
+        assert.is_nil(git.git_dir(0))
+        assert.is_nil(git.root("relative/file.txt"))
+        local res = await(git.run, { "--version" }, {})
+        assert.not_nil(res.code)
+      end)
+      vim.uv.chdir(cwd)
+      assert(ok, err)
+    end)
   end)
 
   describe("staged_diff", function()
@@ -172,6 +219,63 @@ describe("core.git", function()
       assert.is_nil(diff)
       assert.matches("git diff failed", err)
     end)
+
+    it("uses the index lock of a commit in progress when GIT_INDEX_FILE was not inherited (remote editors)", function()
+      h.write(dir .. "/b.txt", "staged\n")
+      sh(dir, { "add", "b.txt" })
+      -- `git commit -a` in progress: the index to commit is .git/index.lock (written before COMMIT_EDITMSG)
+      local lock = dir .. "/.git/index.lock"
+      vim.uv.fs_copyfile(dir .. "/.git/index", lock)
+      h.write(dir .. "/a.txt", "one\ncommitted by -a\n")
+      sh(dir, { "add", "a.txt" }, { GIT_INDEX_FILE = lock })
+      h.write(dir .. "/.git/COMMIT_EDITMSG", "\n# Please enter the commit message\n")
+      assert.equal(lock, git.commit_index(dir))
+      local diff = await(git.staged_diff, { cwd = dir })
+      assert.matches("b/a%.txt", diff)
+      assert.matches("b/b%.txt", diff)
+      -- an inherited GIT_INDEX_FILE wins (the local-editor case)
+      vim.env.GIT_INDEX_FILE = dir .. "/.git/index"
+      assert.is_nil(git.commit_index(dir))
+      diff = await(git.staged_diff, { cwd = dir })
+      vim.env.GIT_INDEX_FILE = nil
+      assert.falsy(diff:find("a.txt", 1, true))
+      -- `git commit <paths>`: next-index-<pid>.lock is preferred over index.lock
+      local next_index = dir .. "/.git/next-index-4242.lock"
+      vim.uv.fs_copyfile(lock, next_index)
+      assert.equal(next_index, git.commit_index(dir))
+      os.remove(next_index)
+      -- a stale lock (much older than COMMIT_EDITMSG) is ignored
+      local old = os.time() - 3600
+      vim.uv.fs_utime(lock, old, old)
+      assert.is_nil(git.commit_index(dir))
+      -- an unreadable lock (e.g. the commit just ended) falls back to the default index
+      h.write(lock, "not an index")
+      diff = await(git.staged_diff, { cwd = dir })
+      assert.matches("b/b%.txt", diff)
+      assert.falsy(diff:find("a.txt", 1, true))
+      os.remove(lock)
+    end)
+
+    it("amend of a root commit in a SHA-256 repository uses that format's empty tree", function()
+      local d = h.tmpdir("sha256")
+      local init = vim.system({ "git", "init", "-q", "-b", "main", "--object-format=sha256", d }):wait()
+      if init.code ~= 0 then
+        return -- git without SHA-256 support
+      end
+      sh(d, { "config", "user.email", "me@example.com" })
+      sh(d, { "config", "user.name", "Me" })
+      sh(d, { "config", "commit.gpgsign", "false" })
+      commit(d, "a.txt", "one\n", "root")
+      h.write(d .. "/a.txt", "one\ntwo\n")
+      sh(d, { "add", "a.txt" })
+      local diff, err = await(git.staged_diff, { cwd = d, amend = true })
+      assert.is_nil(err)
+      assert.matches("new file mode", diff)
+      assert.matches("%+two", diff)
+      local wdiff, werr = await(git.staged_diff, { cwd = d, worktree = true })
+      assert.is_nil(werr)
+      assert.matches("%+two", wdiff)
+    end)
   end)
 
   describe("branch / log / config", function()
@@ -213,6 +317,29 @@ describe("core.git", function()
       local v, err = await(git.config_get, "slop.nothing", { cwd = dir })
       assert.is_nil(v)
       assert.is_nil(err)
+    end)
+
+    it("log / head_message ignore log.showSignature (signed commits)", function()
+      if vim.fn.executable("ssh-keygen") == 0 then
+        return
+      end
+      local dir = repo()
+      local key = h.tmpdir("sshkey") .. "/key"
+      assert(
+        vim.system({ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key, "-C", "me@example.com" }):wait().code
+          == 0
+      )
+      h.write(key .. ".allowed", "me@example.com " .. vim.fn.readfile(key .. ".pub")[1] .. "\n")
+      sh(dir, { "config", "gpg.format", "ssh" })
+      sh(dir, { "config", "user.signingkey", key })
+      sh(dir, { "config", "gpg.ssh.allowedSignersFile", key .. ".allowed" })
+      sh(dir, { "config", "commit.gpgsign", "true" })
+      commit(dir, "a.txt", "1\n", "feat: one")
+      commit(dir, "a.txt", "2\n", "fix: two\n\nbody")
+      sh(dir, { "config", "log.showSignature", "true" })
+      assert.matches("[Ss]ignature", sh(dir, { "log", "-1", "--format=%s" }), "precondition: git prints signatures")
+      assert.same({ "fix: two", "feat: one" }, (await(git.log, { cwd = dir })))
+      assert.equal("fix: two\n\nbody", vim.trim(await(git.head_message, { cwd = dir })))
     end)
 
     it("head_message returns HEAD's full message", function()
