@@ -4,10 +4,12 @@
 --- * One long-lived client per agent name, spawned lazily on the first start()/new_session() and respawned on
 ---   demand after it exits (acp/client.lua, transport in acp/rpc.lua).
 --- * Client capabilities advertised: fs.readTextFile ONLY. The default handler (`acp.read_text_file`) serves live
----   buffers first, redacts with core.secrets and refuses blocked paths. No write/terminal capabilities
----   (agent requests for them get -32601).
+---   buffers first, redacts with core.secrets and refuses blocked paths (symlinks resolved; config
+---   `secrets.agent_reads = "allow"` serves them with their secret values redacted). No write/terminal
+---   capabilities (agent requests for them get -32601).
 --- * Permission requests without a turn handler go through `acp.decide()`: read/search/fetch/think allowed,
----   everything else rejected, always answering with the agent's own optionId.
+---   everything else rejected, always answering with the agent's own optionId. Decisions see the whole tool call:
+---   the client merges every tool_call / tool_call_update of the session into the request's `toolCall`.
 ---@class slop.acp
 local M = {}
 
@@ -17,6 +19,7 @@ local api = vim.api
 ---@field agent string                    name in config ai.agents
 ---@field cwd? string                     default core.project.root()
 ---@field read_text_file? fun(params: {path: string, line?: integer, limit?: integer}): string?, (table|string)?
+---@field read_outside_root? boolean      lift the project-root limit of reads (also ai.agents.<name>.read_outside_root)
 ---@field on_exit? fun(code: integer, stderr_tail: string)
 
 local clients = {} ---@type table<string, slop.acp.Client>
@@ -128,8 +131,58 @@ local function inside(path, root)
   return real == base or real:sub(1, #base + 1) == base .. "/"
 end
 
+--- May ACP agents read blocked files? Config `secrets.agent_reads` ("deny" default | "allow").
+---@return boolean
+local function blocked_reads_allowed()
+  local ok, c = pcall(function()
+    return require("slop.config").get("secrets")
+  end)
+  return ok and type(c) == "table" and c.agent_reads == "allow"
+end
+
+--- Is `path`, or the file it resolves to through symlinks, blocked by the secrets policy?
+---@param secrets slop.secrets
+---@param path string
+---@param real? string  resolved path, when already known
+---@return boolean
+local function is_blocked(secrets, path, real)
+  real = real or vim.uv.fs_realpath(path)
+  return secrets.is_blocked(path) or (real ~= nil and secrets.is_blocked(real))
+end
+
+--- Redact the secret spans of a blocked file's lines. redact_lines() would replace every line of a blocked file;
+--- with agent_reads = "allow" its secret values (cloak rules, private keys, token detectors) still go.
+---@param secrets slop.secrets
+---@param src string
+---@param lines string[]
+---@return string[]
+local function redact_spans(secrets, src, lines)
+  local ph = secrets.placeholder()
+  local by_row = {}
+  for _, s in ipairs(secrets.spans(src, lines, 0)) do
+    by_row[s.row + 1] = by_row[s.row + 1] or {}
+    table.insert(by_row[s.row + 1], s)
+  end
+  local out = {}
+  for i, l in ipairs(lines) do
+    local parts, pos = {}, 0
+    for _, s in ipairs(by_row[i] or {}) do -- merged and sorted per row by spans()
+      local a, b = math.max(s.col, pos), math.min(s.end_col, #l)
+      if b > a then
+        parts[#parts + 1] = l:sub(pos + 1, a)
+        parts[#parts + 1] = ph
+        pos = b
+      end
+    end
+    parts[#parts + 1] = l:sub(pos + 1)
+    out[i] = table.concat(parts)
+  end
+  return out
+end
+
 --- Default `fs/read_text_file` handler: live buffer first (unsaved state), else disk; `line` is 1-based,
---- `limit` a line count. Redacted with core.secrets; blocked paths and paths outside `opts.root`
+--- `limit` a line count. Redacted with core.secrets. Blocked paths are refused unless config
+--- `secrets.agent_reads = "allow"` (their secret values are still redacted); paths outside `opts.root`
 --- (default core.project.root()) are refused unless `opts.read_outside_root` is set.
 ---@param params {path: string, line?: integer, limit?: integer}
 ---@param opts? {root?: string, read_outside_root?: boolean}
@@ -151,11 +204,14 @@ function M.read_text_file(params, opts)
     end
   end
   local secrets = require("slop.core.secrets")
-  if secrets.is_blocked(path) then
+  -- a symlink with an innocent name must not expose a blocked file (globs and cloak rules match on names)
+  local real = vim.uv.fs_realpath(path)
+  local blocked = is_blocked(secrets, path, real)
+  if blocked and not blocked_reads_allowed() then
     return nil, { code = -32603, message = "slop: reading this file is refused by the secrets policy: " .. path }
   end
   local lines
-  local buf = buffer_for(path)
+  local buf = buffer_for(path) or (real and buffer_for(real))
   if buf then
     lines = api.nvim_buf_get_lines(buf, 0, -1, false)
   else
@@ -178,7 +234,12 @@ function M.read_text_file(params, opts)
       lines[#lines] = nil
     end
   end
-  lines = secrets.redact_lines(path, lines, 0)
+  if blocked then
+    -- only with secrets.agent_reads = "allow": redact_lines() would replace every line of a blocked file
+    lines = redact_spans(secrets, real or path, lines)
+  else
+    lines = secrets.redact_lines(real or path, lines, 0)
+  end
   local first = math.max(1, tonumber(params.line) or 1)
   local last = #lines
   if tonumber(params.limit) then
@@ -238,6 +299,32 @@ function M.tool_paths(tc)
   return out
 end
 
+--- Merge a tool call update into what is known about the call (ACP updates only carry the fields that changed).
+--- An empty table in the update keeps the known one, and `locations` accumulate: every path the agent announced
+--- for the call counts for the permission decision.
+---@param known? table
+---@param update? table
+---@return table
+function M.merge_tool_call(known, update)
+  local out = vim.tbl_extend("force", {}, type(known) == "table" and known or {})
+  for k, v in pairs(type(update) == "table" and update or {}) do
+    if k == "locations" and type(v) == "table" and type(out.locations) == "table" then
+      local seen, list = {}, {}
+      for _, l in ipairs(vim.list_extend(vim.list_slice(out.locations), v)) do
+        local key = type(l) == "table" and (tostring(l.path) .. ":" .. tostring(l.line)) or tostring(l)
+        if not seen[key] then
+          seen[key] = true
+          list[#list + 1] = l
+        end
+      end
+      out.locations = list
+    elseif not (type(v) == "table" and next(v) == nil and type(out[k]) == "table") then
+      out[k] = v
+    end
+  end
+  return out
+end
+
 local function pick(options, verdict)
   local prefer = verdict == "allow" and { "allow_once", "allow_always" } or { "reject_once", "reject_always" }
   for _, kind in ipairs(prefer) do
@@ -249,8 +336,12 @@ local function pick(options, verdict)
   end
 end
 
+-- Tool kinds that only read files: with secrets.agent_reads = "allow" they may touch blocked files.
+local READ_KINDS = { read = true, search = true }
+
 --- Decide a `session/request_permission` request. Returns the agent's own optionId (nil = answer "cancelled"),
---- the verdict and a human-readable reason.
+--- the verdict and a human-readable reason. A tool call touching a blocked file (symlinks resolved) is rejected,
+--- except reads when config `secrets.agent_reads = "allow"`; writes, moves and deletes of blocked files never pass.
 ---@param req {toolCall?: table, options?: table[]}
 ---@param policy? {allow?: string[]}
 ---@return string? option_id, "allow"|"reject" verdict, string reason
@@ -265,11 +356,13 @@ function M.decide(req, policy)
   local verdict, reason = "reject", ("tool kind '%s' is not allowed"):format(kind)
   if allowed[kind] then
     verdict, reason = "allow", ("tool kind '%s' is allowed"):format(kind)
-    local secrets = require("slop.core.secrets")
-    for _, p in ipairs(M.tool_paths(tc)) do
-      if secrets.is_blocked(p) then
-        verdict, reason = "reject", "blocked file: " .. p
-        break
+    if not (READ_KINDS[kind] and blocked_reads_allowed()) then
+      local secrets = require("slop.core.secrets")
+      for _, p in ipairs(M.tool_paths(tc)) do
+        if is_blocked(secrets, p) then
+          verdict, reason = "reject", "blocked file: " .. p
+          break
+        end
       end
     end
   end

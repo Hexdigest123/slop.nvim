@@ -101,6 +101,7 @@ end
 ---@field mode? string                       current permission mode id, when the agent reports one
 ---@field private _turn slop.acp.Turn?
 ---@field private _perms table<any, fun(option_id: string|nil)>
+---@field private _tools table<any, table>      toolCallId -> everything the agent announced about the call
 ---@field private _closed boolean
 local Session = {}
 Session.__index = Session
@@ -263,6 +264,12 @@ function Client:_methods()
   return {
     ["session/request_permission"] = function(params, respond)
       local session = self.sessions[params.sessionId]
+      -- the request's toolCall is a ToolCallUpdate (every field but the id is optional): decide on everything the
+      -- agent announced for that call (kind and paths often only came with the earlier tool_call notification)
+      local merged = session and type(params.toolCall) == "table" and self:_track_tool(session, params.toolCall)
+      if merged then
+        params = vim.tbl_extend("force", {}, params, { toolCall = merged })
+      end
       local function answer(option_id)
         if option_id then
           respond({ outcome = { outcome = "selected", optionId = option_id } })
@@ -327,6 +334,10 @@ function Client:_on_notification(method, params)
     local session = self.sessions[params.sessionId]
     if session and type(params.update) == "table" then
       self:_track_mode(session, params.update)
+      local kind = params.update.sessionUpdate
+      if kind == "tool_call" or kind == "tool_call_update" then
+        self:_track_tool(session, params.update)
+      end
     end
     local turn = session and session._turn
     if turn and turn.handlers.on_update and type(params.update) == "table" then
@@ -389,7 +400,17 @@ function Client:start(cb)
   end
   self.state = "starting"
   self._stopping = false
-  local rpc, err = rpc_mod.spawn({
+  if self._rpc then
+    -- the previous process is still shutting down (killed after a failed start, or stop()): its sessions die with
+    -- it; its pending turns fail when it exits
+    local old = self.sessions
+    self.sessions = {}
+    for _, s in pairs(old) do
+      s._closed = true
+    end
+  end
+  local rpc, err
+  rpc, err = rpc_mod.spawn({
     cmd = self.config.cmd,
     env = self.config.env,
     cwd = self._opts.cwd,
@@ -397,9 +418,15 @@ function Client:start(cb)
     timeout = self.config.timeout,
     methods = self:_methods(),
     on_notification = function(method, params)
-      self:_on_notification(method, params)
+      if self._rpc == rpc then
+        self:_on_notification(method, params)
+      end
     end,
     on_exit = function(code, sig, tail)
+      -- the exit of a process that was already replaced must not tear down the new one
+      if self._rpc ~= nil and self._rpc ~= rpc then
+        return
+      end
       self:_on_exit(code, sig, tail)
     end,
   })
@@ -494,6 +521,7 @@ function Client:new_session(opts, cb)
         cwd = cwd,
         read_text_file = opts.read_text_file,
         _perms = {},
+        _tools = {},
         _closed = false,
       }, Session)
       self.sessions[session.id] = session
@@ -562,6 +590,20 @@ function Client:_apply_mode(session, result, done)
     end
     done()
   end)
+end
+
+--- Merge a tool call (update) into what the session knows about it; returns a copy of the merged call.
+---@param session slop.acp.Session
+---@param u table ToolCall / ToolCallUpdate
+---@return table?
+function Client:_track_tool(session, u)
+  if u.toolCallId == nil then
+    return nil
+  end
+  local merged = require("slop.services.ai.acp").merge_tool_call(session._tools[u.toolCallId], u)
+  merged.sessionUpdate = nil
+  session._tools[u.toolCallId] = merged
+  return vim.tbl_extend("force", {}, merged)
 end
 
 --- Follow mode changes the agent reports during a session; warn when it switches to an auto mode.

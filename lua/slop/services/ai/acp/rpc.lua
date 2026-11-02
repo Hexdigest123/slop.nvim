@@ -278,12 +278,13 @@ local function signal(pid, sig)
   if not pid then
     return false
   end
-  -- negative pid = the whole process group (detach = true made the child a group leader)
-  local ok = pcall(uv.kill, -pid, sig)
-  if not ok then
-    ok = pcall(uv.kill, pid, sig)
+  -- negative pid = the whole process group (detach = true made the child a group leader). uv.kill reports failure
+  -- (ESRCH, EPERM) by returning nil instead of throwing, so check its result before falling back to the pid alone.
+  local ok, ret = pcall(uv.kill, -pid, sig)
+  if not (ok and ret == 0) then
+    ok, ret = pcall(uv.kill, pid, sig)
   end
-  return ok
+  return ok and ret == 0
 end
 
 --- Terminate the process group: SIGTERM now, SIGKILL after a grace period.

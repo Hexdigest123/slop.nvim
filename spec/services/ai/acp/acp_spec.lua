@@ -115,6 +115,27 @@ describe("services.ai.acp", function()
       assert.is_nil(r)
       assert.matches("not found", err)
     end)
+
+    it("signals the pid itself when its process group can't be signalled", function()
+      local r = assert(require("slop.services.ai.acp.rpc").spawn({ cmd = { "sleep", "30" } }))
+      local real_kill, pids = vim.uv.kill, {}
+      -- uv.kill reports failure by returning nil (it does not throw)
+      vim.uv.kill = function(pid, sig)
+        pids[#pids + 1] = pid
+        if pid < 0 then
+          return nil, "ESRCH: no such process", "ESRCH"
+        end
+        return real_kill(pid, sig)
+      end
+      local ok, err = pcall(r.kill_now, r)
+      vim.uv.kill = real_kill
+      assert(ok, err)
+      assert.same({ -r.pid, r.pid, -r.pid, r.pid }, pids)
+      mock.wait(function()
+        return not r:is_running()
+      end)
+      assert.is_false(r:is_running())
+    end)
   end)
 
   describe("client", function()
@@ -208,6 +229,112 @@ describe("services.ai.acp", function()
       assert.matches("outside the project root", r[7].error.message)
     end)
 
+    it("refuses reads through a symlink to a blocked file and serves a linked file's live buffer", function()
+      local dir = h.tmpdir("acplink")
+      h.write(dir .. "/.env", "API_KEY=sk-live-1234567890abcdef\n")
+      h.write(dir .. "/real.lua", "on disk\n")
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/settings.txt"))
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/link.env"))
+      assert(vim.uv.fs_symlink(dir .. "/real.lua", dir .. "/alias.lua"))
+      vim.cmd.cd(dir)
+      vim.cmd.edit(dir .. "/real.lua")
+      api.nvim_buf_set_lines(0, 0, -1, false, { "unsaved" })
+      local log = mock.setup({
+        turns = {
+          {
+            { read = { path = dir .. "/settings.txt" } },
+            { read = { path = dir .. "/link.env" } },
+            { read = { path = dir .. "/alias.lua" } },
+          },
+        },
+      })
+      local res = run_turn(acp.client("mock"))
+      mock.wait(function()
+        return res.done
+      end)
+      local r = log.responses("fs/read_text_file")
+      assert.equal(3, #r)
+      assert.is_nil(r[1].result)
+      assert.matches("secrets policy", r[1].error.message)
+      assert.matches("secrets policy", r[2].error.message)
+      assert.equal("unsaved", r[3].result.content)
+    end)
+
+    it("secrets.agent_reads: deny refuses blocked files, allow serves them redacted; writes stay refused", function()
+      local dir = h.tmpdir("acpreads")
+      h.write(dir .. "/.env", "API_KEY=sk-live-1234567890abcdef\n# local settings\n")
+      h.write(dir .. "/id.pem", "-----BEGIN RSA PRIVATE KEY-----\nSECRETBODY\n-----END RSA PRIVATE KEY-----\n")
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/settings.txt"))
+      vim.cmd.cd(dir)
+      local function read_perm(id, path)
+        return {
+          permission = {
+            toolCall = { toolCallId = id, kind = "read", locations = { { path = path } } },
+            options = ALLOW_REJECT,
+          },
+        }
+      end
+      local plan = {
+        turns = {
+          {
+            { read = { path = dir .. "/.env" } },
+            { read = { path = dir .. "/id.pem" } },
+            { read = { path = dir .. "/settings.txt" } },
+            read_perm("r1", dir .. "/.env"),
+            read_perm("r2", dir .. "/settings.txt"),
+          },
+        },
+      }
+      local function run(opts)
+        local log = mock.setup(plan, opts)
+        local res = run_turn(acp.client("mock"))
+        mock.wait(function()
+          return res.done
+        end)
+        local outcomes = vim.tbl_map(function(e)
+          return e.result.outcome.optionId
+        end, log.responses("session/request_permission"))
+        return log.responses("fs/read_text_file"), outcomes
+      end
+      local edit_env =
+        { toolCall = { kind = "edit", locations = { { path = dir .. "/.env" } } }, options = ALLOW_REJECT }
+      local policy = { allow = { "read", "edit", "move", "delete" } }
+
+      -- deny (default): unchanged
+      assert.equal("deny", require("slop.config").get("secrets").agent_reads)
+      local reads, outcomes = run()
+      assert.equal(3, #reads)
+      for _, r in ipairs(reads) do
+        assert.is_nil(r.result)
+        assert.matches("secrets policy", r.error.message)
+      end
+      assert.same({ "reject", "reject" }, outcomes)
+      assert.equal("reject", (acp.decide(edit_env, policy)))
+
+      -- allow: served, with every secret value still redacted
+      acp.stop_all()
+      reads, outcomes = run({ secrets = { agent_reads = "allow" } })
+      assert.equal(3, #reads)
+      local env = reads[1].result.content
+      assert.matches("^API_KEY=", env)
+      assert.is_nil(env:find("sk-live-1234567890abcdef", 1, true))
+      assert.matches("<redacted>", env)
+      assert.matches("# local settings", env)
+      local pem = reads[2].result.content
+      assert.matches("BEGIN RSA PRIVATE KEY", pem)
+      assert.is_nil(pem:find("SECRETBODY", 1, true))
+      assert.equal(env, reads[3].result.content) -- through the symlink: the target's rules apply
+      assert.same({ "allow-once", "allow-once" }, outcomes)
+      -- writes, moves and deletes of blocked files stay refused
+      assert.equal("reject", (acp.decide(edit_env, policy)))
+      for _, kind in ipairs({ "move", "delete" }) do
+        local req = { toolCall = { kind = kind, locations = { { path = dir .. "/id.pem" } } }, options = ALLOW_REJECT }
+        assert.equal("reject", (acp.decide(req, policy)))
+      end
+      -- other kinds keep their policy
+      assert.equal("reject", (acp.decide({ toolCall = { kind = "execute" }, options = ALLOW_REJECT })))
+    end)
+
     it("applies the default permission policy with the agent's own optionIds", function()
       local dir = h.tmpdir("acpperm")
       local log = mock.setup({
@@ -240,6 +367,53 @@ describe("services.ai.acp", function()
         return e.result.outcome.optionId or e.result.outcome.outcome
       end, log.responses("session/request_permission"))
       assert.same({ "allow-once", "reject", "reject", "reject", "cancelled", "reject" }, outcomes)
+    end)
+
+    it("decides permissions on everything the agent announced for the tool call", function()
+      local dir = h.tmpdir("acpmerge")
+      local function tool(id, kind, path)
+        return {
+          tool = { toolCallId = id, title = "Read", kind = kind, status = "pending", locations = { { path = path } } },
+        }
+      end
+      local function perm(tc)
+        return { permission = { toolCall = tc, options = ALLOW_REJECT } }
+      end
+      local turn = {
+        -- a: the path came with the tool_call notification, the request repeats only the kind
+        tool("a", "read", dir .. "/.env"),
+        perm({ toolCallId = "a", kind = "read" }),
+        -- b: the request carries only the id (the kind came with the notification)
+        tool("b", "read", dir .. "/a.lua"),
+        perm({ toolCallId = "b" }),
+        -- c: a later update adds a blocked path
+        tool("c", "read", dir .. "/a.lua"),
+        { tool_update = { toolCallId = "c", locations = { { path = dir .. "/x.pem" } } } },
+        perm({ toolCallId = "c" }),
+      }
+      local log = mock.setup({ turns = { turn, turn } })
+      local client = acp.client("mock")
+      local res = run_turn(client) -- no turn handler: acp.decide() on the merged call
+      mock.wait(function()
+        return res.done
+      end)
+      local seen = {}
+      local res2 = run_turn(client, "x", {
+        on_permission = function(req, respond)
+          seen[#seen + 1] = req.toolCall
+          respond((acp.decide(req)))
+        end,
+      })
+      mock.wait(function()
+        return res2.done
+      end)
+      local outcomes = vim.tbl_map(function(e)
+        return e.result.outcome.optionId
+      end, log.responses("session/request_permission"))
+      assert.same({ "reject", "allow-once", "reject", "reject", "allow-once", "reject" }, outcomes)
+      assert.equal("read", seen[2].kind)
+      assert.equal(dir .. "/.env", seen[1].locations[1].path)
+      assert.equal(2, #seen[3].locations)
     end)
 
     it("passes permission requests to the turn handler and returns its choice", function()
@@ -354,6 +528,42 @@ describe("services.ai.acp", function()
         uerr = e
       end)
       assert.matches("unknown ACP agent 'nope'", uerr)
+    end)
+
+    it("a restart while the previous process is still being killed keeps the new process", function()
+      local log = mock.setup({ init = { protocolVersion = 2, agentCapabilities = {} } })
+      local plan = (log.path:gsub("log%.ndjson$", "plan.json"))
+      local client = acp.client("mock")
+      local first, second, old
+      client:start(function(e)
+        first, old = e, client._rpc
+        -- retry at once (the rejected process is being killed); the new process is healthy
+        h.write(plan, vim.json.encode(vim.empty_dict()))
+        client:start(function(e2)
+          second = e2 or false
+        end)
+      end)
+      mock.wait(function()
+        return second ~= nil and old ~= nil and old._exited
+      end)
+      assert.matches("protocol version 2", first)
+      assert.is_false(second)
+      assert.is_true(old._exited)
+      assert.equal("ready", client.state)
+      assert.is_true(client:is_running())
+      assert.not_equal(old, client._rpc)
+      local res = run_turn(client)
+      mock.wait(function()
+        return res.done
+      end)
+      assert.equal("end_turn", res.stop)
+      -- the client still owns the new process: stop() ends it
+      local rpc = client._rpc
+      client:stop()
+      mock.wait(function()
+        return not rpc:is_running()
+      end)
+      assert.is_false(rpc:is_running())
     end)
 
     it("authenticates when auth_method is configured", function()
