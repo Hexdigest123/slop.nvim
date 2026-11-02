@@ -44,7 +44,7 @@ function api.send_selection()
   return actions().send_selection()
 end
 
---- Run a command line (expandcmd) in the terminal.
+--- Run a command line in the terminal (`%`, `#`, `<cword>`... expanded like |:!|).
 ---@param cmd string
 ---@return boolean
 function api.exec(cmd)
@@ -67,6 +67,16 @@ local function complete_layout(lead, args)
     return {}
   end
   return require("slop.core.util").complete_prefix(LAYOUTS, lead)
+end
+
+--- The text after `:Slop term <sub>` exactly as typed: re-joined fargs would collapse runs of blanks (even inside
+--- quotes) and eat backslashes, which shell command lines need.
+---@param args string[]
+---@param cmd? vim.api.keyset.create_user_command.command_args
+---@return string
+local function typed(args, cmd)
+  local raw = cmd and type(cmd.args) == "string" and cmd.args:match("^%s*%S+%s+%S+%s+(.*)$")
+  return raw or table.concat(args, " ")
 end
 
 ---@type slop.ModuleSpec
@@ -153,7 +163,7 @@ return {
         if cmd and cmd.range and cmd.range > 0 then
           actions().send_lines(cmd.line1, cmd.line2)
         elseif #args > 0 then
-          api.send(table.concat(args, " "))
+          api.send(typed(args, cmd))
         else
           local row = vim.api.nvim_win_get_cursor(0)[1]
           actions().send_lines(row, row)
@@ -162,8 +172,8 @@ return {
     },
     exec = {
       desc = "exec {cmd...}: run a command line in the terminal",
-      impl = function(args)
-        api.exec(table.concat(args, " "))
+      impl = function(args, cmd)
+        api.exec(typed(args, cmd))
       end,
       complete = function(lead)
         return vim.fn.getcompletion(lead, "shellcmd")

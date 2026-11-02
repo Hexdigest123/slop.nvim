@@ -42,7 +42,8 @@ Defaults (set any of them to `false` under `term.keymaps` to disable):
   t     `<esc><esc>`    normal_mode   leave Terminal mode (buffer-local)
 
 `<Plug>` mappings: `<Plug>(slop-term-toggle)`, `<Plug>(slop-term-send)`,
-`<Plug>(slop-term-split)`, `<Plug>(slop-term-vsplit)`.
+`<Plug>(slop-term-split)`, `<Plug>(slop-term-vsplit)`,
+`<Plug>(slop-term-normal-mode)`.
 
 Toggle rules:
 - Plain toggle: hide when visible (in any layout), else show in `layout`.
@@ -54,15 +55,19 @@ Toggle rules:
 ==============================================================================
 3. COMMANDS                                                *slop-term-commands*
 
-:Slop term [toggle] [float|split|vsplit]                     *:Slop-term-toggle*
-        Toggle the terminal (default subcommand, so `:Slop term split` works).
+:Slop term [toggle] [{layout}]                               *:Slop-term-toggle*
+        Toggle the terminal; {layout} is `float`, `split` or `vsplit` (default
+        subcommand, so `:Slop term split` works).
 
 :[range]Slop term send [text]                                  *:Slop-term-send*
-        Send the lines of [range], or [text], or the current line.
+        Send the lines of [range], or [text] exactly as typed, or the current
+        line.
 
 :Slop term exec {cmd}                                          *:Slop-term-exec*
-        Run {cmd} in the terminal (|expandcmd()| is applied, so `%` works) and
-        show it.
+        Run {cmd} in the terminal and show it. Like |:!|, `%`, `#` and
+        `<cword>`-style items (with modifiers such as `:p`, `:t` or `:S`) are
+        expanded, and `\%` / `\#` give the character itself; everything else
+        (blanks, quotes, backslashes, `$VAR`) is sent as typed.
 
 :Slop term kill                                                *:Slop-term-kill*
         Stop the shell and wipe its buffer. The next toggle starts a new one.
@@ -104,6 +109,16 @@ in (0, 1] is a fraction of the editor, a number > 1 is cells, a function
 `fun(columns, lines): integer` is computed (and re-evaluated on |VimResized|).
 Float sizes are the content size; the border is drawn around it.
 
+`shell`: a string is a program, or a program and its arguments, like the
+default 'shell' (e.g. `set shell=zsh\ -l`); a program path may contain spaces
+(quote it when arguments follow: `'"/opt/my tools/zsh" -l'`).
+
+`close_on_exit`: `false` keeps the terminal even when the shell exits with 0
+(Neovim's default |TermClose| auto-close of 'shell' terminals does not apply
+to it). A terminal that is kept after its shell exited stays readable while
+it is shown. Hiding it and toggling again, or sending text to it, starts a
+new shell in its place.
+
 ==============================================================================
 5. LUA API                                                      *slop-term-api*
 
@@ -114,13 +129,20 @@ term.toggle({layout})                                        *slop-term.toggle()
 term.show({layout}) / term.hide()                              *slop-term.show()*
 term.send({data}, {opts})                                      *slop-term.send()*
         {data}: string or lines. {opts}: `submit` (default true, appends
-        <CR>), `paste` (`"auto"` default: bracketed paste for multi-line text,
-        `true`, `false`), `dedent` (default true: strip common indent).
+        <CR>), `paste` (`"auto"` default: paste multi-line text, `true`:
+        always paste, `false`: type the lines), `dedent` (default true: strip
+        common indent). A paste goes through Neovim's terminal paste, so the
+        program gets bracketed-paste markers only when it enabled bracketed
+        paste (shells do; `cat` or a plain REPL get just the text).
 term.send_selection()                                *slop-term.send_selection()*
+        Send the visual selection (charwise, linewise or blockwise; a block
+        made with `$` sends every line to its end, like |y|).
 term.exec({cmd})                                               *slop-term.exec()*
+        Like |:Slop-term-exec|.
 term.kill()                                                    *slop-term.kill()*
 term.term()                                                    *slop-term.term()*
-        The live terminal object, or nil.
+        The terminal object (its shell may have exited, see `close_on_exit`),
+        or nil.
 
 ==============================================================================
 6. HIGHLIGHTS AND EVENTS                                 *slop-term-highlights*
@@ -144,12 +166,13 @@ Terminal buffers have 'filetype' `slopterm` and `b:slop_term` = id.
   local t = core.spawn({ cmd = { "lazygit" }, hidden = true, layout = "float",
                          close_on_exit = true, hide_on_leave = true })
   t:toggle()                 -- show / hide; the job keeps running
-  t:send({ "make test" })    -- bracketed paste for multi-line text
+  t:send({ "make test" })    -- multi-line text is pasted (|slop-term.send()|)
   t:show({ layout = "split", enter = false })
   t:kill()
 <
 spawn(spec) starts the job in a hidden buffer (`jobstart(cmd, {term = true})`)
-and returns the object (or nil, err). There is one window "slot" per layout
+and returns the object (or nil, err). Without `cmd` it runs 'shell' with its
+arguments (e.g. `set shell=zsh\ -l`). There is one window "slot" per layout
 per tabpage. Other functions: `show`, `hide`, `toggle`, `focus`, `send`,
 `kill`, `get(id|name)`, `list({hidden?, owner?})`, `last()`, `from_buf(buf)`,
 `encode(data, opts)`.

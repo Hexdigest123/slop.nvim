@@ -57,7 +57,7 @@ describe("term module", function()
     assert.equal("Normal", api.nvim_get_hl(0, { name = "SlopTermNormal" }).link)
     -- <esc><esc> buffer-local terminal-mode map
     local m = vim.fn.maparg("<Esc><Esc>", "t", false, true)
-    assert.equal(1, m.buffer)
+    assert.equal(1, m.buf or m.buffer)
     assert.equal(vim.keycode("<C-\\><C-n>"), vim.keycode(m.rhs))
   end)
 
@@ -166,6 +166,108 @@ describe("term module", function()
     assert.truthy(wait(function()
       return buf_text(t.buf):find("cw%-14") ~= nil
     end))
+  end)
+
+  it(":Slop term send/exec keep the text as typed; exec expands only :!-style items", function()
+    local actions = require("slop.modules.term.actions")
+    local sent = {}
+    local orig = actions.send
+    actions.send = function(data)
+      sent[#sent + 1] = data
+      return true
+    end
+    vim.cmd.edit(vim.fn.fnameescape(root .. "/sub/my file.txt"))
+    vim.cmd([[Slop term send grep  -E 'a\.b|c   d' x]])
+    vim.cmd([[Slop term exec printf '\%s\n' "a    b" 'c\\d' '\<w\>' %:t:S]])
+    vim.cmd.enew()
+    vim.cmd([[Slop term exec echo %  \%]]) -- nothing to expand `%` to: sent unexpanded
+    actions.send = orig
+    assert.equal([[grep  -E 'a\.b|c   d' x]], sent[1])
+    assert.equal([[printf '%s\n' "a    b" 'c\\d' '\<w\>' 'my file.txt']], sent[2])
+    assert.equal([[echo %  \%]], sent[3])
+  end)
+
+  it("a blockwise `$` selection sends every line to its end, like `y`", function()
+    vim.cmd.stopinsert() -- a startinsert left pending by an earlier test's terminal would eat the keys below
+    local actions = require("slop.modules.term.actions")
+    api.nvim_buf_set_lines(
+      0,
+      0,
+      -1,
+      false,
+      { "short", "a much longer line", "", "mid line", "\tx tab", "日本語テキスト" }
+    )
+    local in_visual
+    vim.keymap.set("x", "<F3>", function()
+      in_visual = actions.selection()
+    end, { buf = 0 })
+    -- what `y` yanks for each block: a line ending left of the block is blanks, a tab or wide char cut by the left
+    -- edge becomes spaces (yanking here instead trips a headless redraw assertion of Nvim after the split tests)
+    local from3 = { "ort", "much longer line", (" "):rep(17), "d line", "      x tab", "本語テキスト" }
+    local cases = {
+      { { 1, 2 }, "<C-v>5j$", from3 },
+      { { 6, 3 }, "<C-v>5k$", from3 }, -- from inside a wide char
+      { { 1, 0 }, "<C-v>5j$", { "short", "a much longer line", "", "mid line", "\tx tab", "日本語テキスト" } },
+      { { 2, 4 }, "<C-v>2j$", { "ch longer line", (" "):rep(15), "line" } },
+      { { 4, 1 }, "<C-v>2j$", { "id line", "       x tab", " 本語テキスト" } },
+    }
+    for _, c in ipairs(cases) do
+      api.nvim_win_set_cursor(0, c[1])
+      h.feed(c[2] .. "<F3><Esc>")
+      assert.are.same(c[3], in_visual, c[2])
+      assert.are.same(c[3], actions.selection(), "after Visual mode: " .. c[2])
+      assert.equal("n", api.nvim_get_mode().mode)
+    end
+    -- without `$` the block keeps its right edge
+    api.nvim_win_set_cursor(0, { 1, 1 })
+    h.feed("<C-v>jl<F3><Esc>")
+    assert.are.same({ "ho", " m" }, in_visual)
+    assert.are.same({ "ho", " m" }, actions.selection())
+  end)
+
+  it("a kept terminal whose shell exited is replaced by toggle (once hidden) and by send", function()
+    slop.setup({ term = { shell = "sh", close_on_exit = "success" } })
+    local t = assert(slop.term.toggle())
+    local buf = t.buf
+    t:send("false; exit") -- like <C-d> after a failing command: status 1, the buffer is kept
+    assert.truthy(wait(function()
+      return t.exit_code ~= nil
+    end))
+    assert.equal(1, t.exit_code)
+    assert.is_true(t:is_visible())
+    slop.term.toggle() -- still shown (readable): toggle hides it
+    assert.is_false(t:is_visible())
+    assert.is_true(api.nvim_buf_is_valid(buf))
+    local t2 = assert(slop.term.toggle()) -- hidden and exited: a new shell
+    assert.not_equal(t, t2)
+    assert.is_true(t2:is_running())
+    assert.is_false(api.nvim_buf_is_valid(buf))
+    t2:send("exit 3")
+    assert.truthy(wait(function()
+      return t2.exit_code ~= nil
+    end))
+    assert.is_true(slop.term.send("echo again-$((2+3))"))
+    local t3 = assert(slop.term.term())
+    assert.not_equal(t2, t3)
+    assert.truthy(wait(function()
+      return buf_text(t3.buf):find("again%-5") ~= nil
+    end))
+  end)
+
+  it("shell strings are parsed like 'shell': arguments, program paths with spaces", function()
+    local actions = require("slop.modules.term.actions")
+    assert.are.same({ "sh", "-l" }, actions.shell_cmd("  sh  -l "))
+    assert.are.same({ "a", "b" }, actions.shell_cmd({ "a", "b" }))
+    local exe = root .. "/my tools/my sh"
+    h.write(exe, '#!/bin/sh\nexec sh "$@"\n')
+    vim.uv.fs_chmod(exe, 493) -- 0755
+    assert.are.same({ exe }, actions.shell_cmd(exe))
+    assert.are.same({ exe, "-l" }, actions.shell_cmd('"' .. exe .. '" -l'))
+    local shell = vim.o.shell
+    vim.o.shell = "sh -l"
+    local default = actions.shell_cmd("")
+    vim.o.shell = shell
+    assert.are.same({ "sh", "-l" }, default)
   end)
 
   it("exit cleanup: shell exit closes the float and wipes; next toggle respawns", function()
