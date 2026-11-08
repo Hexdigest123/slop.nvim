@@ -310,7 +310,9 @@ describe("doc target (other)", function()
   it("typescript: decorators of a class member are its siblings, a decorated export starts at its decorator", function()
     -- Nvim bundles no typescript parser: use an installed one, else skip
     vim.opt.rtp:append(vim.fn.expand("~/.local/share/nvim/site"))
-    if not pcall(vim.treesitter.language.add, "typescript") then
+    -- language.add throws on Nvim 0.10 but returns nil, err since 0.11
+    local ok, added = pcall(vim.treesitter.language.add, "typescript")
+    if not (ok and added) then
       return pending("no typescript parser installed")
     end
     local buf = scratch({
