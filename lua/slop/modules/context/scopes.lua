@@ -301,6 +301,11 @@ local BODY_TYPES = {
   suite = true,
 }
 
+-- A header is a handful of children (keyword, name, parameters, ...) before the body. A node without a body (a
+-- literal, a list) can have 100k children (a big JSON array, a data table): walking them all on every cursor move
+-- took ~150 ms, so the search for the body stops after this many.
+local MAX_HEADER_CHILDREN = 64
+
 --- Last header row of `node`: the end row of the last child before its body (comments ignored); the start row when
 --- the node has no body (literals, case labels, sections).
 ---@param node TSNode
@@ -308,10 +313,15 @@ local BODY_TYPES = {
 function M.header_last(node)
   local srow = node:start()
   local last = srow
+  local n = 0
   for child, field in node:iter_children() do
     local t = child:type()
     if (field and BODY_FIELDS[field]) or BODY_TYPES[t] or t:match("_body$") then
       return last
+    end
+    n = n + 1
+    if n > MAX_HEADER_CHILDREN then
+      break -- no body among the first children: a literal / list
     end
     if t ~= "comment" then
       local sr, _, er, ec = child:range()
@@ -480,25 +490,25 @@ function M.compute(win, cfg, limit)
   local crow, ccol = cursor[1] - 1, cursor[2]
   -- the float covers screen rows, not buffer rows: a closed fold is one row, a wrapped line several, and with
   -- 'smoothscroll' the topline may be partly scrolled off (skipcol)
-  local skip = api.nvim_win_call(win, function()
-    return vim.fn.winsaveview().skipcol
-  end)
+  local view = api.nvim_win_call(win, vim.fn.winsaveview)
+  local skip, fill = view.skipcol, view.topfill
   local function height(opts)
     opts.start_row = top
-    opts.start_vcol = skip > 0 and skip or nil
+    -- start_vcol leaves out the virtual / diff filler lines above the topline: only `topfill` of them are shown
+    opts.start_vcol = skip
     return api.nvim_win_text_height(win, opts)
   end
   ---@param row integer
-  ---@return integer  screen rows from the topline to `row`, negative above the window
+  ---@return integer  screen row of `row`'s text (below its own filler lines), negative above the window
   local function pos(row)
-    if row <= top then
+    if row < top then
       return row - top
     end
-    return height({ end_row = row - 1 }).all
+    return fill + (row == top and 0 or height({ end_row = row, end_vcol = 0 }).all)
   end
-  -- never cover the cursor line
+  -- never cover the cursor line, neither with context rows nor with the separator line drawn below them
   if crow >= top then
-    limit = math.min(limit, pos(crow))
+    limit = math.min(limit, pos(crow) - (cfg.separator and 1 or 0))
   end
   if limit <= 0 then
     return require("slop.core.ts").has_parser(buf) and {} or nil, 0
@@ -519,7 +529,8 @@ function M.compute(win, cfg, limit)
   -- topline: the context of the first row below the float; re-evaluated until the height is stable
   local h, groups = 0, {}
   for _ = 1, 4 do
-    local row = height({ max_height = h + 1 }).end_row -- the buffer row on screen row h
+    -- the buffer row on screen row h (the filler lines above the topline belong to it)
+    local row = h < fill and top or height({ max_height = h - fill + 1 }).end_row
     local cands = M.candidates(buf, row, indent_col(buf, row), cfg.node_types)
     if not cands then
       return nil, 0

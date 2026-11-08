@@ -99,6 +99,33 @@ describe("context scopes", function()
     assert.are.same({ { 0, 0 }, { 3, 3 } }, rows(cands))
   end)
 
+  it("a huge literal costs a few children per lookup, not one per element (100k-field table)", function()
+    local lines = { "return {" }
+    for i = 1, 100000 do
+      lines[#lines + 1] = ("  k%d = %d,"):format(i, i)
+    end
+    lines[#lines + 1] = "}"
+    local b = buf_with(lines, "lua")
+    local parser = vim.treesitter.get_parser(b)
+    parser:parse(true)
+    -- every TSNode shares one metatable: count the children header_last() walks
+    local mt = getmetatable(parser:trees()[1]:root())
+    local orig, visited = mt.iter_children, 0
+    mt.iter_children = function(node)
+      local next_child = orig(node)
+      return function()
+        local child, field = next_child()
+        visited = visited + (child and 1 or 0)
+        return child, field
+      end
+    end
+    local ok, cands = pcall(S.candidates, b, 50000, 4)
+    mt.iter_children = orig
+    assert.is_true(ok, cands)
+    assert.are.same({ { 0, 0 } }, rows(cands))
+    assert.truthy(visited < 1000, "children visited per lookup: " .. visited)
+  end)
+
   it("returns nil without a parser", function()
     local b = buf_with({ "x", "y" }, "")
     assert.is_nil(S.candidates(b, 0, 0))

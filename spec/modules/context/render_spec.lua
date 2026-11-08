@@ -181,6 +181,10 @@ describe("context render", function()
       assert.not_equal("SlopContextBottom", m[4].hl_group)
     end
     assert.equal("──────", screen_row(4):sub(1, #"──────"))
+    -- the separator line takes a row too: it never lands on the cursor line (4th screen row here)
+    view(15, 18, 4)
+    assert.are.same({ "  if a then" }, float_lines())
+    assert.equal(" 18     print(13)", screen_row(4))
   end)
 
   it("gutter: relativenumber, signcolumn width, statuscolumn, line_numbers = false", function()
@@ -346,6 +350,37 @@ describe("context render", function()
     view(6, 29, 4) -- screen rows: 6, the fold, 29 (cursor)
     assert.are.same({ "  if a then" }, float_lines(), "two rows above the cursor: the outer scope is trimmed")
     assert.equal(" 29     print(24)", screen_row(3))
+  end)
+
+  it("virtual / diff filler lines above the topline: only those on screen (topfill) count as rows", function()
+    local buf = open(LUA, "lua")
+    local vns = api.nvim_create_namespace("context-spec-virt")
+    local function virt_above(row)
+      api.nvim_buf_clear_namespace(buf, vns, 0, -1)
+      api.nvim_buf_set_extmark(buf, vns, row, 0, {
+        virt_lines = { { { "v1" } }, { { "v2" } }, { { "v3" } } },
+        virt_lines_above = true,
+      })
+    end
+    local function show(view_)
+      vim.fn.winrestview(view_)
+      ctx.refresh()
+      redraw()
+      local v = vim.fn.winsaveview()
+      return { v.topline, v.topfill }
+    end
+    -- scrolled past them (topfill 0): the cursor line 22 is the third screen row, so two rows may be covered
+    virt_above(19)
+    assert.are.same({ 20, 0 }, show({ topline = 20, topfill = 0, lnum = 22, col = 4 }))
+    assert.are.same({ "  if a then" }, float_lines(), "the cursor line stays visible")
+    -- all three shown above the topline: the 3-row context covers them, not the text
+    assert.are.same({ 20, 3 }, show({ topline = 20, topfill = 3, lnum = 22, col = 4 }))
+    assert.are.same({ "function M.outer(a,", "  b)", "  if a then" }, float_lines())
+    -- a scope starting on the topline is not hidden while filler lines push it down below the float
+    require("slop").setup({ context = { max_lines = 0 } })
+    virt_above(4)
+    assert.are.same({ 5, 3 }, show({ topline = 5, topfill = 3, lnum = 12, col = 4 }))
+    assert.are.same({ { row = 2, col = 0, rows = 2 } }, ctx.contexts(), "`if` (line 5) is visible below the float")
   end)
 
   it("'smoothscroll': only the visible rows of a partly scrolled-off topline count", function()

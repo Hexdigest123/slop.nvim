@@ -106,7 +106,8 @@ line, or hidden under the context rows shown above it. In "cursor" mode
 these are the scopes around the cursor. In "topline" mode they are the
 scopes around the first line below the context. The context never covers
 the cursor line, and at least one line of the window stays visible. Rows
-are screen rows: a closed fold counts as one, a wrapped line as several.
+are screen rows: a closed fold counts as one, a wrapped line as several,
+and virtual lines or diff filler lines count where they are on screen.
 
 Trimming. With more than `max_lines` rows, whole scopes are dropped:
 outermost first with `trim_scope = "outer"`, innermost first with "inner".
