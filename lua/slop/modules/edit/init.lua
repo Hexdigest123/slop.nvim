@@ -89,7 +89,9 @@ end
 ---@return fun(): slop.Range?
 local function track(buf, range, linewise)
   local util = require("slop.core.util")
+  local ui = require("slop.modules.edit.ui")
   local ns = util.ns("edit.pending")
+  local empty_last = linewise and get_line(buf, range[3]) == ""
   local ok, id = pcall(util.region_mark, buf, ns, range, { invalidate = true })
   local taken, r = false, nil
   return function()
@@ -104,10 +106,7 @@ local function track(buf, range, linewise)
     r = util.mark_range(buf, ns, id)
     pcall(api.nvim_buf_del_extmark, buf, ns, id)
     if r and linewise then
-      if r[4] == 0 and r[3] > r[1] then
-        r[3] = r[3] - 1
-      end
-      r[2], r[4] = 0, #get_line(buf, r[3])
+      r = ui.whole_lines(buf, r, empty_last, range[3] - range[1] + 1)
     end
     return r
   end
@@ -149,6 +148,10 @@ function api_tbl.start(opts)
   end
   local all = presets()
   local agent = opts.agent or current_agent()
+  if opts.preset and not all[opts.preset] then
+    log().notify(("unknown preset '%s'"):format(opts.preset), vim.log.levels.WARN)
+    return nil
+  end
 
   local function go(text)
     local P = require("slop.modules.edit.presets")
@@ -424,7 +427,9 @@ return {
     end, false, "number >= 0")
     check("presets", c.presets, "table")
     check("rules_files", c.rules_files, function(v)
-      return vim.islist(v)
+      return vim.islist(v) and #vim.tbl_filter(function(name)
+        return type(name) ~= "string"
+      end, v) == 0
     end, false, "list of file names")
     check("permissions", c.permissions, "table")
     check("permissions.allow", type(c.permissions) == "table" and c.permissions.allow or nil, function(v)
@@ -441,6 +446,11 @@ return {
         check("presets." .. name .. ".sink", p.sink, function(v)
           return v == "diff" or v == "float" or v == "scratch"
         end, false, "'diff'|'float'|'scratch'")
+      end
+      if type(p) == "table" then
+        for field, t in pairs({ desc = "string", agent = "string", diagnostics = "boolean", input = "boolean" }) do
+          check("presets." .. name .. "." .. field, p[field], t, true)
+        end
       end
     end
     for k, v in pairs(type(c.keymaps) == "table" and type(c.keymaps.diff) == "table" and c.keymaps.diff or {}) do

@@ -25,6 +25,22 @@ function M.region_mark(buf, range)
   })
 end
 
+--- Normalise the tracked range of a whole-line region to whole lines. An end at column 0 is the start of the next
+--- line (a line break typed at the end of the region, its last line deleted), unless the region's last line is an
+--- empty line (then only when the region grew past its `rows` lines).
+---@param buf integer
+---@param r slop.Range
+---@param empty_last? boolean  the region's last line was empty
+---@param rows? integer        the region's line count
+---@return slop.Range
+function M.whole_lines(buf, r, empty_last, rows)
+  if r[4] == 0 and r[3] > r[1] and (not empty_last or r[3] - r[1] + 1 > (rows or math.huge)) then
+    r[3] = r[3] - 1
+  end
+  r[2], r[4] = 0, #(api.nvim_buf_get_lines(buf, r[3], r[3] + 1, false)[1] or "")
+  return r
+end
+
 ---@param buf integer
 ---@param id integer?
 ---@return slop.Range?

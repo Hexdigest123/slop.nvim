@@ -31,8 +31,9 @@ answer as an inline diff you accept or reject hunk by hunk.
 - Requests run concurrently; each one shows its progress in the buffer and
   can be cancelled on its own.
 - Everything sent to the agent passes through |slop-secrets|: blocked files
-  are never sent (unless you let agents read them, `secrets.agent_reads`,
-  |slop-edit-agents|) and secret values are replaced by `<redacted>`.
+  are never sent (unless you let slop serve them redacted,
+  `secrets.agent_reads`, |slop-edit-agents|) and secret values are replaced
+  by `<redacted>`.
 
 ==============================================================================
 2. WORKFLOW                                                *slop-edit-workflow*
@@ -59,7 +60,10 @@ answer as an inline diff you accept or reject hunk by hunk.
      `]h` / `[h` next / previous hunk          `<C-r>` refine
    The whole review is one undo step: `u` after accepting restores the
    original text. Rejecting everything right away leaves the buffer exactly
-   as it was (not even 'modified').
+   as it was (not even 'modified'). Undoing a reject brings its hunk back for
+   review (redo rejects it again). A new review over rows another review
+   still has pending takes those hunks over: their text stays, and the new
+   review starts from it.
    The diff keys are buffer-local, exist only while a review is shown and
    are mapped with |:map-nowait|, so they act at once. `ga`, `gr`, `gA`,
    `gR` and `<C-r>` act only when the cursor is inside a hunk or the review
@@ -145,10 +149,11 @@ override them in `edit.presets` (`false` removes one): >lua
       },
     }
 <
-Fields: `desc`, `prompt` (the instruction; required for a new preset, an
-override of a built-in keeps the built-in prompt), `sink` (`"diff"` default,
-`"float"`, `"scratch"`), `diagnostics` (send the region's diagnostics),
-`input` (open the prompt prefilled with `#name` for extra text), `agent`.
+Fields: `desc` (string), `prompt` (the instruction; required for a new
+preset, an override of a built-in keeps the built-in prompt), `sink`
+(`"diff"` default, `"float"`, `"scratch"`), `diagnostics` (boolean: send the
+region's diagnostics), `input` (boolean: open the prompt prefilled with
+`#name` for extra text), `agent` (a key of `ai.agents`).
 
 ==============================================================================
 6. CONTEXT: RULES AND @FILE                                 *slop-edit-context*
@@ -163,8 +168,9 @@ Rules files: every existing file of `edit.rules_files` under the project root
 @file: `@path/to/file` in the instruction attaches that file (relative to the
 project root, or absolute). The live buffer content is used when the file is
 loaded; files over 100 KiB are truncated; blocked files (|slop-secrets|) are
-skipped with a warning. Agents that support embedded context receive the
-files as `resource` blocks, others inline.
+skipped with a warning, also through a symlink with another name (rules
+files too). Agents that support embedded context receive the files as
+`resource` blocks, others inline.
 
 The region itself is refused when it contains secrets (the replacement would
 overwrite the real values with placeholders), and blocked buffers are never
@@ -193,15 +199,16 @@ Neovim exits.
 Replacement-text protocol:
 - slop advertises only the `fs.readTextFile` client capability. Reads are
   served from loaded buffers (unsaved text) or disk, redacted, and refused for
-  blocked files (also through a symlink with another name) and for paths
-  outside the project root (symlinks resolved).
+  blocked files (also through a symlink with another name), for binary files
+  and for paths outside the project root (symlinks resolved).
   Set `read_outside_root = true` on an agent in `ai.agents` to lift the root
   limit for that agent.
-- `secrets.agent_reads` (|slop-config|) decides whether agents may read
-  blocked files. `"deny"` (default) refuses them as described here.
-  `"allow"` serves them and accepts `read` / `search` permission requests
-  that touch them, but their secret values are still redacted (cloak rules,
-  private keys, token detectors). Edits, moves and deletes of blocked files
+- `secrets.agent_reads` (|slop-config|) decides whether slop's own file reads
+  serve blocked files. `"deny"` (default) refuses them as described here.
+  `"allow"` serves them with their secret values redacted (cloak rules,
+  private keys, token detectors). It never grants a permission request that
+  touches a blocked file: with that permission the agent would read the file
+  with its own tools, unredacted. Edits, moves and deletes of blocked files
   are always rejected.
 - The prompt asks for exactly one `<slop:replacement>...</slop:replacement>`
   block containing the new region text. When the answer mentions the tag in
@@ -211,15 +218,15 @@ Replacement-text protocol:
   with the agent's own option id. Configure with `edit.permissions.allow`.
   The decision uses everything the agent announced about the tool call (the
   kind and paths of its earlier `tool_call` updates, not just the permission
-  request); a blocked path anywhere rejects it (reads: unless
-  `secrets.agent_reads = "allow"`).
+  request); a blocked path anywhere rejects it, whatever the tool kind.
 - Fallbacks when the agent ignores the protocol: the diff of a rejected edit
   of this file (a fragment of the region, or the whole file), then the last
   fenced code block, else an error and the raw answer in a scratch buffer.
 - The replacement is validated: CRLF removed, a code fence around the whole
   block removed (unless the region itself is one fenced block), a trailing
-  newline of whole-line regions dropped, the base indentation restored if the
-  agent dropped it, answers containing `<redacted>` (or nested tags) refused.
+  newline of whole-line regions dropped (kept when the region's own last line
+  is empty), the base indentation restored if the agent dropped it, answers
+  containing `<redacted>` (or nested tags) refused.
 
                                                              *slop-edit-modes*
 Permission modes: some agents start sessions in a mode that approves actions

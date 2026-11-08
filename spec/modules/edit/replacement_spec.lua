@@ -96,6 +96,8 @@ describe("edit replacement protocol", function()
       assert.same({ "a", "b" }, R.validate("a\r\nb\n", { old_text = "x", linewise = true }))
       assert.same({ "a", "" }, R.validate("a\n", { old_text = "x", linewise = false }))
       assert.same({}, R.validate("", { old_text = "x", linewise = true }))
+      -- a region ending with an empty line: the final newline is that line
+      assert.same({ "B", "" }, R.validate("B\n", { old_text = "b\n", linewise = true }))
     end)
 
     it("rejects nested tags and secret placeholders the original did not contain", function()

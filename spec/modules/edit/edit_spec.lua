@@ -260,6 +260,117 @@ describe("edit module (mock ACP agent)", function()
     assert.equal("accepted", done[1].result)
   end)
 
+  it("refines the same region after the agent deleted the last lines of the buffer", function()
+    setup({
+      turns = { { { chunk = "<slop:replacement>\n</slop:replacement>" } }, { { replace_region = "upper" } } },
+    })
+    local buf = open("ra.lua", "a\nb\nc\n")
+    local id = edit.start({ lines = { 1, 2 }, instruction = "drop them" })
+    assert.truthy(wait_review(buf))
+    assert.same({ "a" }, lines(buf))
+    assert.is_true(reqmod.active[id]:refine("keep them, upper case"))
+    assert.same({ "a", "b", "c" }, lines(buf))
+    assert.truthy(mock.wait(function()
+      return #diff.list(buf) > 0
+    end))
+    assert.same({ "a", "B", "C" }, lines(buf))
+    diff.list(buf)[1]:accept_all()
+    assert.same({ "a", "B", "C" }, lines(buf))
+  end)
+
+  it("refines a charwise region that moved while the agent worked", function()
+    setup({
+      turns = { { { sleep = 200 }, { replace_region = "upper" } }, { { replace_region = "same" } } },
+    })
+    local buf = open("rb.lua", "print(foo, bar)\n")
+    local id = edit.start({ range = { 0, 6, 0, 9 }, linewise = false, instruction = "up" })
+    vim.wait(50)
+    api.nvim_buf_set_text(buf, 0, 0, 0, 0, { "x = " })
+    assert.truthy(wait_review(buf))
+    assert.same({ "x = print(FOO, bar)" }, lines(buf))
+    assert.is_true(reqmod.active[id]:refine("keep it"))
+    assert.truthy(mock.wait(function()
+      return #prompts() == 2
+    end))
+    -- the refined answer replaces `foo` again (unchanged), not the bytes at the region's old columns
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("unchanged", done[1].result)
+    assert.same({ "x = print(foo, bar)" }, lines(buf))
+  end)
+
+  it("a linewise region ending with an empty line keeps it (no false conflict)", function()
+    setup({
+      turns = { { { chunk = "<slop:replacement>\nB\n\n</slop:replacement>" } } },
+    }, { edit = { apply = "auto" } })
+    local buf = open("rd.lua", "a\nb\n\nc\n")
+    edit.start({ lines = { 1, 2 }, instruction = "x" })
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("accepted", done[1].result)
+    assert.same({ "a", "B", "", "c" }, lines(buf))
+    -- a line break typed at its end while the agent works stays out of it
+    done = {}
+    setup({
+      turns = { { { sleep = 200 }, { chunk = "<slop:replacement>\nX\n\n</slop:replacement>" } } },
+    }, { edit = { apply = "auto" } })
+    buf = open("rd2.lua", "a\nb\n\nc\n")
+    edit.start({ lines = { 1, 2 }, instruction = "x" })
+    vim.wait(50)
+    api.nvim_buf_set_text(buf, 2, 0, 2, 0, { "", "" })
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("accepted", done[1].result)
+    assert.same({ "a", "X", "", "", "c" }, lines(buf))
+  end)
+
+  it("an agent that dies mid-request fails it, keeps the partial answer and leaves the buffer alone", function()
+    setup({ turns = { { { chunk = "half an answer" }, { sleep = 50 }, { exit = 3 } } } })
+    local buf = open("rf.lua", "keep\n")
+    local id = edit.start({ lines = { 0, 0 }, instruction = "x" })
+    assert.truthy(mock.wait(function()
+      return #done > 0
+    end))
+    assert.equal("failed", done[1].result)
+    assert.is_nil(reqmod.active[id])
+    assert.same({ "keep" }, lines(buf))
+    assert.same({}, api.nvim_buf_get_extmarks(buf, require("slop.core.util").ns("edit.region"), 0, -1, {}))
+    local raw
+    for _, b in ipairs(api.nvim_list_bufs()) do
+      if api.nvim_buf_get_name(b):match("slop://edit/output") then
+        raw = b
+      end
+    end
+    assert.same({ "half an answer" }, lines(raw))
+  end)
+
+  it("an empty explain answer fails the request (and its progress message)", function()
+    setup({ turns = { { { thought = "hmm" } } } })
+    local spinner = require("slop.core.ui.spinner")
+    local progress, finished = spinner.progress, {}
+    spinner.progress = function(o)
+      local p = progress(o)
+      local finish = p.finish
+      p.finish = function(self, status, msg)
+        finished[#finished + 1] = status
+        return finish(self, status, msg)
+      end
+      return p
+    end
+    open("re.lua", "return 1\n")
+    edit.start({ lines = { 0, 0 }, preset = "explain" })
+    local ok = mock.wait(function()
+      return #done > 0
+    end)
+    spinner.progress = progress
+    assert.truthy(ok)
+    assert.equal("failed", done[1].result)
+    assert.same({ "failed" }, finished)
+  end)
+
   it("explain shows a float, tests opens a scratch buffer", function()
     setup({
       turns = {
@@ -296,6 +407,8 @@ describe("edit module (mock ACP agent)", function()
     h.write(dir .. "/AGENTS.md", "Always use tabs.")
     h.write(dir .. "/util.lua", "return { helper = true }")
     h.write(dir .. "/.env", "TOKEN=secret")
+    -- a symlink with an innocent name must not expose the blocked file (secret globs match names)
+    assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/notes.txt"))
     local buf, file = open("k.lua", "local x = 1\n")
     local plan_path = log.path:gsub("log%.ndjson$", "plan.json")
     local plan = vim.json.decode(h.read(plan_path))
@@ -307,7 +420,7 @@ describe("edit module (mock ACP agent)", function()
       buf,
       { { lnum = 0, col = 0, message = "unused x", severity = 1 } }
     )
-    edit.start({ lines = { 0, 0 }, preset = "fix", instruction = "see @util.lua and @.env" })
+    edit.start({ lines = { 0, 0 }, preset = "fix", instruction = "see @util.lua and @.env and @notes.txt" })
     mock.wait(function()
       return #done > 0 or #diff.list(buf) > 0
     end)
@@ -431,11 +544,24 @@ describe("edit module (mock ACP agent)", function()
     assert.equal("", errs({ mine = { prompt = "Do it." } }))
     assert.equal("", errs({ fix = { agent = "mock" } }))
     assert.equal("", errs({ explain = false }))
+    -- mistyped fields are reported instead of breaking the request later
+    assert.matches("edit%.presets%.mine%.agent", errs({ mine = { prompt = "x", agent = { "claude" } } }))
+    assert.matches("edit%.presets%.fix%.input", errs({ fix = { input = "yes" } }))
+    assert.matches("edit%.presets%.mine%.desc", errs({ mine = { prompt = "x", desc = { "d" } } }))
+    assert.matches("edit%.presets%.mine%.diagnostics", errs({ mine = { prompt = "x", diagnostics = 1 } }))
+    assert.matches(
+      "edit%.rules_files",
+      table.concat(config.validate("edit", vim.tbl_extend("force", base, { rules_files = { "AGENTS.md", 1 } })), "\n")
+    )
     -- one that slipped through (setup() keeps going) is refused before the agent starts...
     setup({ default_turn = { { chunk = "ok" } } }, { edit = { presets = { mine = { desc = "x", sink = "float" } } } })
     open("w.lua", "x\n")
     assert.is_nil(edit.start({ lines = { 0, 0 }, preset = "mine", instruction = "" }))
     assert.same({}, log.entries())
+    -- an unknown preset is reported, no prompt float opens for it
+    local win = api.nvim_get_current_win()
+    assert.is_nil(edit.start({ lines = { 0, 0 }, preset = "nosuch" }))
+    assert.equal(win, api.nvim_get_current_win())
     -- ...and with extra text it runs as a plain instruction
     assert.truthy(edit.start({ lines = { 0, 0 }, preset = "mine", instruction = "explain it" }))
     assert.truthy(mock.wait(function()
@@ -485,5 +611,16 @@ describe("edit module (mock ACP agent)", function()
     assert.same({ "A", "B", "C" }, lines(buf))
     vim.cmd("Slop edit agent mock")
     assert.equal("mock", edit.agent())
+  end)
+end)
+
+describe("edit request label", function()
+  it("is cut by characters: a long instruction never ends in half a multibyte character", function()
+    h.reset()
+    local req = require("slop.modules.edit.request").new({ instruction = ("ä"):rep(80), cfg = {} })
+    local label = req:label()
+    assert.equal(("ä"):rep(59) .. "…", label)
+    assert.truthy(vim.str_utf_end(label, #label) == 0 and vim.fn.strchars(label) == 60)
+    assert.equal("short", require("slop.modules.edit.request").new({ instruction = "short", cfg = {} }):label())
   end)
 end)

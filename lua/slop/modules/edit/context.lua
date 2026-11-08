@@ -23,25 +23,38 @@ end
 ---@field text string
 ---@field filetype? string
 
+--- The file a path resolves to through symlinks, when that is another name: secret globs and cloak rules match names,
+--- so a link with an innocent name must be judged (and redacted) by its target too.
+---@param abs string
+---@return string?
+local function link_target(abs)
+  local real = vim.uv.fs_realpath(abs)
+  return real and real ~= abs and real or nil
+end
+
 --- Content of a file for the prompt (live buffer first), redacted. nil + reason when blocked/missing.
 ---@param path string                      absolute or relative to root
 ---@param root string
 ---@return slop.edit.FileText?, string?
 function M.file(path, root)
+  local secrets = require("slop.core.secrets")
+  local abs = vim.fs.normalize(path)
+  if abs:sub(1, 1) ~= "/" and not abs:match("^%a:[/\\]") then
+    abs = vim.fs.normalize(vim.fs.joinpath(root, abs))
+  end
+  local real = link_target(abs)
+  if secrets.is_blocked(abs) or (real and secrets.is_blocked(real)) then
+    return nil, "blocked by secrets rules: " .. path
+  end
   local ctx = ai_context()
   if type(ctx.file) == "function" then
     local ok, fc, err = pcall(ctx.file, path, { root = root, max_bytes = MAX_BYTES })
     if ok then
+      if fc and real then
+        fc.text = (secrets.redact_text(fc.text, real))
+      end
       return fc, err
     end
-  end
-  local secrets = require("slop.core.secrets")
-  local abs = vim.fs.normalize(path)
-  if abs:sub(1, 1) ~= "/" then
-    abs = vim.fs.normalize(vim.fs.joinpath(root, abs))
-  end
-  if secrets.is_blocked(abs) then
-    return nil, "blocked by secrets rules: " .. path
   end
   local text
   for _, b in ipairs(api.nvim_list_bufs()) do
@@ -65,10 +78,14 @@ function M.file(path, root)
   if vim.startswith(abs, root .. "/") then
     rel = abs:sub(#root + 2)
   end
+  text = secrets.redact_text(text, abs)
+  if real then
+    text = secrets.redact_text(text, real)
+  end
   return {
     path = abs,
     rel = rel,
-    text = (secrets.redact_text(text, abs)),
+    text = text,
     filetype = vim.filetype.match({ filename = abs }),
   }
 end
@@ -82,7 +99,18 @@ function M.rules(root, names)
   if type(ctx.rules) == "function" then
     local ok, list = pcall(ctx.rules, root, names)
     if ok and type(list) == "table" then
-      return list
+      local secrets = require("slop.core.secrets")
+      local out = {}
+      for _, fc in ipairs(list) do
+        local real = type(fc.path) == "string" and link_target(fc.path) or nil
+        if not (real and secrets.is_blocked(real)) then
+          if real then
+            fc.text = (secrets.redact_text(fc.text, real))
+          end
+          out[#out + 1] = fc
+        end
+      end
+      return out
     end
   end
   local out = {}

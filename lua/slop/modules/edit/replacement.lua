@@ -197,7 +197,8 @@ function M.validate(text, ctx)
   if text:find(ph, 1, true) and not ctx.old_text:find(ph, 1, true) then
     return nil, ("the replacement contains the secret placeholder %s"):format(ph)
   end
-  if ctx.linewise and text:sub(-1) == "\n" then
+  -- a region whose last line is empty ends with "\n" itself: its replacement's final newline is that line
+  if ctx.linewise and text:sub(-1) == "\n" and ctx.old_text:sub(-1) ~= "\n" then
     text = text:sub(1, -2)
   end
   local lines = vim.split(text, "\n", { plain = true })

@@ -52,7 +52,8 @@ local next_id = 0
 ---@field private _busy boolean
 ---@field private _warned_write boolean
 ---@field private _ctx slop.edit.ReplaceCtx
----@field private _full_rows integer
+---@field private _empty_last boolean      linewise region whose last line is empty
+---@field private _preview_eof boolean     the review previews deleting the region at the end of the buffer
 local Request = {}
 Request.__index = Request
 
@@ -62,8 +63,9 @@ end
 
 local function short(s, n)
   s = (s or ""):gsub("%s+", " ")
-  if #s > n then
-    return s:sub(1, n - 1) .. "…"
+  -- by characters: a byte cut could end in half a multibyte character
+  if vim.fn.strchars(s) > n then
+    return vim.fn.strcharpart(s, 0, n - 1) .. "…"
   end
   return s
 end
@@ -172,12 +174,26 @@ end
 function Request:region()
   local r = ui.region(self.buf, self.mark)
   if r and self.linewise then
-    if r[4] == 0 and r[3] > r[1] then
-      r[3] = r[3] - 1
-    end
-    r[2], r[4] = 0, #get_line(self.buf, r[3])
+    r = ui.whole_lines(self.buf, r, self._empty_last, #self.old_lines)
   end
   return r
+end
+
+--- Remember the region and its text (and the file around it, for whole-file diffs of rejected edits), then mark it.
+---@param r slop.Range
+function Request:_snapshot(r)
+  local buf = self.buf
+  self.range = r
+  self.old_lines = util.range_text(buf, r)
+  self._empty_last = self.linewise and self.old_lines[#self.old_lines] == ""
+  local lc = api.nvim_buf_line_count(buf)
+  self._ctx = {
+    path = vim.fs.normalize(api.nvim_buf_get_name(buf)),
+    old_text = table.concat(self.old_lines, "\n"),
+    file_before = table.concat(api.nvim_buf_get_text(buf, 0, 0, r[1], r[2], {}), "\n"),
+    file_after = table.concat(api.nvim_buf_get_text(buf, r[3], r[4], lc - 1, #get_line(buf, lc - 1), {}), "\n"),
+  }
+  self.mark = ui.region_mark(buf, r)
 end
 
 ---@param status string
@@ -272,18 +288,7 @@ function Request:start()
   if self.sink == "diff" and not vim.bo[buf].modifiable then
     return false, "buffer is not modifiable"
   end
-  self.old_lines = util.range_text(buf, r)
-  local full_before = api.nvim_buf_get_text(buf, 0, 0, r[1], r[2], {})
-  local lc = api.nvim_buf_line_count(buf)
-  local last = get_line(buf, lc - 1)
-  local full_after = api.nvim_buf_get_text(buf, r[3], r[4], lc - 1, #last, {})
-  self._ctx = {
-    path = vim.fs.normalize(api.nvim_buf_get_name(buf)),
-    old_text = table.concat(self.old_lines, "\n"),
-    file_before = table.concat(full_before, "\n"),
-    file_after = table.concat(full_after, "\n"),
-  }
-  self.mark = ui.region_mark(buf, r)
+  self:_snapshot(r)
   self.state = "starting"
   M.active[self.id] = self
   self:_progress_start()
@@ -438,12 +443,12 @@ function Request:_complete()
   local secrets = require("slop.core.secrets")
   local title = ("slop %s: %s"):format(self.agent, self:label())
   if self.sink == "float" then
-    self:_progress_stop("success", "done")
-    ui.clear(self)
     if vim.trim(self.message) == "" then
       self:_fail("the agent returned no answer")
       return
     end
+    self:_progress_stop("success", "done")
+    ui.clear(self)
     ui.show_float(title, self.message)
     self.state = "done"
     self:_finish("explained")
@@ -506,7 +511,10 @@ function Request:_complete()
   self:_progress_stop("success", "review")
   ui.clear(self)
   self.state = "review"
-  self._full_rows = r[3] - r[1] + 1
+  -- for refine: where the region is now, and whether the preview deletes it at the end of the buffer (the diff
+  -- reports that empty preview on the line above it)
+  self.range = r
+  self._preview_eof = #new_full == 0 and r[1] > 0 and r[3] == api.nvim_buf_line_count(buf) - 1
   local diff = require("slop.core.ui.diff")
   self.diff = diff.show(buf, { r[1], r[3] + 1 }, new_full, {
     keymaps = util.tbl_get(self.cfg, "keymaps", "diff"),
@@ -556,20 +564,31 @@ function Request:refine(text)
   if not hr then
     return false
   end
+  local buf = self.buf
+  local lc = api.nvim_buf_line_count(buf)
   self._refining = true
   self.diff:reject_all()
   self._refining = false
   self.diff = nil
-  local buf = self.buf
-  local srow = hr[1]
-  local erow = math.min(api.nvim_buf_line_count(buf) - 1, srow + self._full_rows - 1)
-  local range =
-    { srow, self.linewise and 0 or self.range[2], erow, self.linewise and #get_line(buf, erow) or self.range[4] }
-  range[4] = math.min(range[4], #get_line(buf, erow))
-  self.range = range
-  self.old_lines = util.range_text(buf, range)
-  self._ctx.old_text = table.concat(self.old_lines, "\n")
-  self.mark = ui.region_mark(buf, range)
+  -- the restored region ends where the preview ended, moved by the lines the reject brought back (this also covers
+  -- hunks accepted before the refine and lines typed into the preview)
+  local srow = (self._preview_eof and hr[2] > hr[1]) and hr[2] or hr[1]
+  local erow = hr[2] + api.nvim_buf_line_count(buf) - lc - 1
+  lc = api.nvim_buf_line_count(buf)
+  srow = math.min(srow, lc - 1)
+  erow = math.max(srow, math.min(erow, lc - 1))
+  local range
+  if self.linewise then
+    range = { srow, 0, erow, #get_line(buf, erow) }
+  else
+    -- the columns of the region when the diff was shown: the reject restored those lines
+    local scol = math.min(self.range[2], #get_line(buf, srow))
+    range = { srow, scol, erow, math.min(self.range[4], #get_line(buf, erow)) }
+    if erow == srow then
+      range[4] = math.max(range[4], scol)
+    end
+  end
+  self:_snapshot(range)
   self.instruction = self.instruction .. " (refined: " .. text .. ")"
   self.started = vim.uv.now()
   M.active[self.id] = self
