@@ -168,7 +168,7 @@ function api.status(buf)
   for _, r in ipairs(state.cfg and rules_for(path) or {}) do
     names[#names + 1] = ("%s[%d] %s"):format(r.source, r.index, table.concat(r.file_patterns, ","))
   end
-  return {
+  local status = {
     buf = buf,
     path = path,
     enabled = state.cfg ~= nil and render().is_enabled(buf),
@@ -176,9 +176,18 @@ function api.status(buf)
     cloaked = #names > 0,
     blocked = secrets.is_blocked(path),
     rules = names,
-    spans = #api.spans(buf),
     render = state.cfg and state.cfg.render or "overlay",
   }
+  -- `spans` matches every line of the buffer: counted when read, so the other fields stay cheap (completion-source
+  -- filters read `cloaked` on every request, :h slop-cloak-limitations)
+  return setmetatable(status, {
+    __index = function(t, k)
+      if k == "spans" then
+        rawset(t, "spans", #api.spans(buf))
+        return rawget(t, "spans")
+      end
+    end,
+  })
 end
 
 --- Re-render (all buffers when nil).
@@ -303,7 +312,11 @@ return {
     end, false, "'overlay'|'conceal'")
     check("nowrap", cfg.nowrap, "boolean")
     check("builtin_patterns", cfg.builtin_patterns, "boolean")
-    check("exclude", cfg.exclude, "table")
+    check("exclude", cfg.exclude, function(v)
+      return type(v) == "table" and vim.iter(v):all(function(g)
+        return type(g) == "string"
+      end)
+    end, false, "a list of globs")
     check("disable_completion", cfg.disable_completion, "boolean")
     check("nobuflisted", cfg.nobuflisted, "boolean")
     check("fzf_lua", cfg.fzf_lua, "boolean")
@@ -431,7 +444,13 @@ return {
       else
         vim.health.info("fzf-lua found; previewer is patched when the first picker opens")
       end
-      vim.health.info("fzf-lua grep/live_grep RESULT lines are not masked; consider rg_opts --glob=!.env*")
+      vim.health.info(
+        "fzf-lua RESULT lines (grep, live_grep, blines, lines) are not masked; consider rg_opts --glob=!.env*"
+      )
+      vim.health.info(
+        "fzf-lua previews fzf runs itself (git_status/git_diff/git_commits diffs) are not masked;"
+          .. " git_status can use git = { status = { previewer = 'builtin' } }"
+      )
     end
     if s.telescope then
       vim.health.info("telescope: previews masked via User TelescopePreviewerLoaded (needs telescope > 0.1.x)")

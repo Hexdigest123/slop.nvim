@@ -377,6 +377,37 @@ describe("cloak render", function()
     end
   end)
 
+  it("window options a window copies from another one (Neovim's per-buffer window info) are restored", function()
+    local _, env = open(".env", "KEY=secret\n")
+    h.write(dir .. "/other.lua", "x\n")
+    local function hide_in_closed_window()
+      local w1 = api.nvim_get_current_win()
+      vim.cmd.edit(vim.fn.fnameescape(dir .. "/other.lua")) -- w1 keeps the cloaked options in its buffer info
+      vim.cmd("split")
+      local w2 = api.nvim_get_current_win()
+      api.nvim_win_close(w1, true)
+      return w2
+    end
+    -- shown again while masked, in a window that never had it: the options are copied from the closed window
+    local w2 = hide_in_closed_window()
+    vim.cmd("buffer " .. env)
+    assert.is_false(vim.wo[w2].wrap)
+    assert.equal("", vim.wo[w2].foldtext)
+    require("slop").cloak.disable()
+    assert.is_true(vim.wo[w2].wrap, "wrap restored")
+    assert.equal("foldtext()", vim.wo[w2].foldtext, "foldtext restored")
+    -- shown again after the masks were turned off
+    require("slop").cloak.enable()
+    assert.is_false(vim.wo[w2].wrap)
+    local w3 = hide_in_closed_window()
+    require("slop").cloak.disable()
+    vim.cmd("buffer " .. env)
+    assert.is_true(vim.wo[w3].wrap, "wrap restored")
+    assert.equal("foldtext()", vim.wo[w3].foldtext, "foldtext restored")
+    vim.cmd("setlocal nowrap") -- the user's own choice while the masks are off stays
+    assert.is_false(vim.wo[w3].wrap)
+  end)
+
   it("a pattern that throws anyway masks its whole line (screen and AI) and is reported once", function()
     local msgs = {}
     vim.notify = function(m)
@@ -523,6 +554,17 @@ describe("cloak render", function()
     assert.is_true(vim.bo[buf].buflisted, "listed again when the masks are off (buffer hidden)")
   end)
 
+  for _, mode in ipairs({ "overlay", "conceal" }) do
+    it(("a match starting with a multibyte character keeps it visible and masks the rest (%s)"):format(mode), function()
+      open("app.conf", "名前：secretvalue # note\n", {
+        cloak = { render = mode, patterns = { { file_pattern = "*.conf", cloak_pattern = "：%S+" } } },
+      })
+      vim.wait(30)
+      vim.cmd("redraw!")
+      assert.are.same({ "名前：*********** # note" }, screen(1, 40))
+    end)
+  end
+
   it("overlay masks follow 'tabstop' changes, 'vartabstop' and ^X control characters", function()
     open(".env", "TAB=ab\tcdefgh\nC=ab\1cdefXY\n")
     assert.are.same({ "TAB=**********", "C=**********" }, screen(2))
@@ -533,6 +575,76 @@ describe("cloak render", function()
     vim.bo.vartabstop = "4,30"
     vim.cmd("redraw!")
     assert.falsy(all_screen():find("cdefgh", 1, true), "vartabstop")
+  end)
+
+  for _, mode in ipairs({ "overlay", "conceal" }) do
+    it(
+      ("only drawn rows are matched: a closed fold is one row, its first line still masked (%s)"):format(mode),
+      function()
+        local lines = {}
+        for i = 1, 5000 do
+          lines[i] = ("KEY%04d=topsecret%04d"):format(i, i)
+        end
+        open(".env", table.concat(lines, "\n") .. "\n", { cloak = { render = mode } })
+        vim.wait(30)
+        vim.cmd("2,$fold") -- on_win's row range spans the whole fold
+        vim.cmd("normal! gg")
+        local P = require("slop.modules.cloak.patterns")
+        local orig, scanned = P.compute, 0
+        P.compute = function(rules, ls, ...)
+          scanned = scanned + #ls
+          return orig(rules, ls, ...)
+        end
+        local ok, err = pcall(function()
+          api.nvim_buf_set_lines(0, 0, 1, false, { "KEY0001=edited" }) -- a new changedtick: nothing cached
+          vim.cmd("redraw")
+          assert.truthy(scanned < 50, ("rows matched for a 2-row screen: %d"):format(scanned))
+        end)
+        P.compute = orig
+        assert.is_true(ok, err)
+        local s = all_screen()
+        assert.truthy(s:find("KEY0002=*", 1, true), "the fold line is drawn with its mask")
+        assert.falsy(s:find("topsecret", 1, true))
+      end
+    )
+  end
+
+  it("status() stays cheap for big cloaked buffers: the span count is only computed when read", function()
+    local lines = {}
+    for i = 1, 3000 do
+      lines[i] = ("Authorization: Bearer token%d"):format(i)
+    end
+    local _, buf = open("big.http", table.concat(lines, "\n") .. "\n")
+    local P = require("slop.modules.cloak.patterns")
+    local orig, scanned = P.compute, 0
+    P.compute = function(rules, ls, ...)
+      scanned = scanned + #ls
+      return orig(rules, ls, ...)
+    end
+    local ok, err = pcall(function()
+      local st = require("slop").cloak.status(buf)
+      -- what the completion-source filter of :h slop-cloak-limitations reads, on every completion request
+      assert.is_true(st.cloaked)
+      assert.is_true(st.enabled)
+      assert.equal(0, scanned, "whole buffer scanned for status().cloaked")
+      assert.equal(3000, st.spans)
+    end)
+    P.compute = orig
+    assert.is_true(ok, err)
+  end)
+
+  it("an exclude entry that is not a glob string is a config error, not a crash while loading", function()
+    local msgs = {}
+    vim.notify = function(m)
+      msgs[#msgs + 1] = m
+    end
+    require("slop").setup({ cloak = { exclude = { ".env.example", { ".env.sample" } } } })
+    local errs = table.concat(require("slop.config").errors("cloak"), "\n")
+    assert.matches("cloak%.exclude: expected a list of globs", errs)
+    require("slop").load("cloak")
+    for _, m in ipairs(msgs) do
+      assert.falsy(m:find("stack traceback", 1, true), m)
+    end
   end)
 
   it("attach(0, path) masks the current buffer right away", function()

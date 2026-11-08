@@ -348,7 +348,9 @@ function M.match_line(line, pats, try_all)
     if not first or last < first then
       break -- no match, or an empty match: stop (cloak.nvim looped forever here)
     end
-    local prefix = line:sub(first, first)
+    -- the legacy visible first character: a whole UTF-8 character (cloak.nvim kept its first byte, so the mask
+    -- started inside it and was drawn too wide, or not at all in conceal mode)
+    local prefix = line:match("^.[\128-\191]*", first)
     if groups and best.replace ~= nil then
       local ok, res = pcall(string.gsub, line:sub(first, last), best[1], best.replace, 1)
       if ok then
@@ -362,7 +364,9 @@ function M.match_line(line, pats, try_all)
     if last >= col then
       out[#out + 1] = { col = col - 1, end_col = last, prefix = prefix }
     end
-    start = math.max(last, first) + 1
+    -- like cloak.nvim, go on at the match's last char: a match starting there keeps its visible first char under
+    -- this mask (`%x%x%x%x` masks a whole hex run); a 1-char match is passed (cloak.nvim looped forever on it)
+    start = math.max(last, first + 1)
   end
   return out
 end

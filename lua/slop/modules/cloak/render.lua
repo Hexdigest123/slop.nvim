@@ -1,9 +1,11 @@
---- cloak: on-screen masking via a decoration provider (visible rows only, no flash on open/paste/reload).
+--- cloak: on-screen masking via a decoration provider (drawn rows only, no flash on open/paste/reload). Marks are
+--- made in on_line, which runs for the rows Neovim draws: on_win's row range spans closed folds (100k rows after
+--- `zM`), on_line gets a closed fold's first line only, the one its fold line shows.
 ---
 --- overlay (default): ephemeral `virt_text_pos = "overlay"` marks created inside the redraw that shows the
 ---   text; masks are sized by display width (tabs, wide chars). Windows get local 'nowrap' (overlay cannot
 ---   cover continuation rows), restored when the buffer is uncloaked.
---- conceal: persistent `conceal = ""` + inline virt_text marks reconciled for the visible rows (ephemeral
+--- conceal: persistent `conceal = ""` + inline virt_text marks reconciled for the drawn rows (ephemeral
 ---   inline virt_text does not render), windows get conceallevel=2 / concealcursor=nvic (restored later).
 ---   Until a window has conceallevel >= 1 (it got the buffer without BufWinEnter), overlay masks are drawn.
 --- Both modes give windows a local foldtext="" (fold lines are drawn with their masks) and turn 'inccommand'
@@ -38,6 +40,9 @@ local S = {
   bufs_path = {}, ---@type table<integer, string>  path a `false` entry was computed for
   reveal = {}, ---@type table<integer, {buf: integer, srow: integer, erow: integer, ids: integer[]}>
   saved = {}, ---@type table<integer, table<integer, table<string, any>>>  win -> buf -> saved options
+  --- buf -> option -> cloak set it to `to` in place of the user's `from` (other windows may copy `to` along with the
+  --- buffer, see apply_win)
+  orig = {}, ---@type table<integer, table<string, {from: any, to: any}>>
   completion = {}, ---@type table<integer, boolean>  buffers whose completion we disabled
   unlisted = {}, ---@type table<integer, boolean>  nobuflisted: buffer -> it was listed before
   split_src = nil, ---@type integer?  window being split (WinNewPre)
@@ -306,7 +311,11 @@ end
 
 local schedule_win -- forward
 
-local function on_win(_, win, buf, top, bot)
+---@type table<integer, {buf: integer, st: slop.cloak.BufState, tick: integer, hl: string, conceal: boolean}>
+local drawing = {} -- window -> what on_line draws for it in the current redraw
+
+local function on_win(_, win, buf)
+  drawing[win] = nil
   local st = M.buf_state(buf, win)
   if not shown(buf, st) then
     return false
@@ -318,60 +327,75 @@ local function on_win(_, win, buf, top, bot)
     -- mask widths depend on the tab settings too (a wider tab must not reuse a narrower mask)
     st.tick, st.tabs, st.ts, st.vts, st.rows, st.drawn = tick, tabs, ts, vts, {}, {}
   end
-  local hl = (S.cfg and S.cfg.highlight_group) or "SlopCloakMask"
-  local lines = api.nvim_buf_get_lines(buf, top, bot + 1, false)
-  -- conceal marks need conceallevel >= 1; a window that got the buffer without BufWinEnter (fzf-lua swaps
-  -- preview buffers with eventignore, noautocmd floats) only gets it from schedule_win: draw overlays until then
-  if render_mode() == "conceal" and vim.wo[win].conceallevel >= 1 then
+  drawing[win] = {
+    buf = buf,
+    st = st,
+    tick = tick,
+    hl = (S.cfg and S.cfg.highlight_group) or "SlopCloakMask",
+    -- conceal marks need conceallevel >= 1; a window that got the buffer without BufWinEnter (fzf-lua swaps
+    -- preview buffers with eventignore, noautocmd floats) only gets it from schedule_win: draw overlays until then
+    conceal = render_mode() == "conceal" and vim.wo[win].conceallevel >= 1,
+  }
+  if affected(buf, st) then
+    schedule_win(win, buf)
+  end
+  -- the rows are drawn in on_line: on_win's top..bot spans closed folds (100k rows after `zM`), which are
+  -- never drawn and must not be fetched or matched
+  return true
+end
+
+local function on_line(_, win, buf, row)
+  local d = drawing[win]
+  if not d or d.buf ~= buf then
+    return
+  end
+  local st = d.st
+  local line = api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+  if not line then
+    return
+  end
+  local had = st.has_spans
+  if d.conceal then
     local nsc = ns_conceal()
-    for i, line in ipairs(lines) do
-      local row = top + i - 1
-      local rev = revealed_any(buf, row)
-      local key = tick .. (rev and "r" or "") .. line
-      if st.drawn[row] ~= key then
-        st.drawn[row] = key
-        for _, m in ipairs(api.nvim_buf_get_extmarks(buf, nsc, { row, 0 }, { row, -1 }, {})) do
-          api.nvim_buf_del_extmark(buf, nsc, m[1])
-        end
-        if not rev then
-          for _, s in ipairs(row_spans(buf, st, row, line)) do
-            pcall(api.nvim_buf_set_extmark, buf, nsc, row, s.col, {
-              end_col = s.end_col,
-              conceal = "",
-              virt_text = { { s.text, hl } },
-              virt_text_pos = "inline",
-              invalidate = true,
-              undo_restore = false,
-              priority = 200,
-            })
-          end
-        end
+    local rev = revealed_any(buf, row)
+    local key = d.tick .. (rev and "r" or "") .. line
+    if st.drawn[row] ~= key then
+      st.drawn[row] = key
+      for _, m in ipairs(api.nvim_buf_get_extmarks(buf, nsc, { row, 0 }, { row, -1 }, {})) do
+        api.nvim_buf_del_extmark(buf, nsc, m[1])
       end
-    end
-  else
-    local nso = ns()
-    for i, line in ipairs(lines) do
-      local row = top + i - 1
-      if not revealed(win, buf, row) then
+      if not rev then
         for _, s in ipairs(row_spans(buf, st, row, line)) do
-          -- conceal-mode masks are exact (cloak_length): as an overlay it must still cover the whole value
-          local pad = s.width - api.nvim_strwidth(s.text)
-          pcall(api.nvim_buf_set_extmark, buf, nso, row, s.col, {
-            virt_text = { { pad > 0 and s.text .. (" "):rep(pad) or s.text, hl } },
-            virt_text_pos = "overlay",
-            hl_mode = "combine",
-            ephemeral = true,
+          pcall(api.nvim_buf_set_extmark, buf, nsc, row, s.col, {
+            end_col = s.end_col,
+            conceal = "",
+            virt_text = { { s.text, d.hl } },
+            virt_text_pos = "inline",
+            invalidate = true,
+            undo_restore = false,
             priority = 200,
           })
         end
       end
     end
+  elseif not revealed(win, buf, row) then
+    local nso = ns()
+    for _, s in ipairs(row_spans(buf, st, row, line)) do
+      -- conceal-mode masks are exact (cloak_length): as an overlay it must still cover the whole value
+      local pad = s.width - api.nvim_strwidth(s.text)
+      pcall(api.nvim_buf_set_extmark, buf, nso, row, s.col, {
+        virt_text = { { pad > 0 and s.text .. (" "):rep(pad) or s.text, d.hl } },
+        virt_text_pos = "overlay",
+        hl_mode = "combine",
+        ephemeral = true,
+        priority = 200,
+      })
+    end
   end
-  -- after the rows: row_spans() may just have found the first span of a display-only buffer
-  if affected(buf, st) then
+  -- row_spans() may just have found the first span of a display-only buffer: it gets the side effects now
+  if not had and st.has_spans and affected(buf, st) then
     schedule_win(win, buf)
   end
-  return false
 end
 
 -- Window options / completion side effects -----------------------------------------------------
@@ -391,10 +415,27 @@ end
 local applying = false -- apply_win() sets options, which fires the OptionSet handler that calls it
 
 ---@param win integer
-local function apply_win(win)
+---@param buf integer
+---@param opt string
+---@param val any
+local function save_opt(win, buf, opt, val)
+  S.saved[win] = S.saved[win] or {}
+  S.saved[win][buf] = S.saved[win][buf] or {}
+  if S.saved[win][buf][opt] == nil then
+    S.saved[win][buf][opt] = val
+  end
+end
+
+---@param win integer
+---@param entered? boolean  the window just got the buffer (BufWinEnter)
+local function apply_win(win, entered)
   local buf = api.nvim_win_get_buf(win)
   local st = M.buf_state(buf, win)
   local saved = S.saved[win] and S.saved[win][buf]
+  -- A window that gets a buffer copies its window-local options from another window showing it, or from the
+  -- window info Neovim keeps per buffer (also of closed windows): cloak's values arrive without passing here
+  -- first. `orig` tells which values are cloak's, so they are restored there too.
+  local orig = S.orig[buf] or {}
   if S.active and affected(buf, st) then
     local want = win_opts_wanted()
     -- options of an earlier config (render mode or nowrap changed live) go back to the user's value
@@ -409,27 +450,37 @@ local function apply_win(win)
     for opt, val in pairs(want) do
       local cur = vim.wo[win][0][opt]
       if cur ~= val then
-        S.saved[win] = S.saved[win] or {}
-        S.saved[win][buf] = S.saved[win][buf] or {}
-        if S.saved[win][buf][opt] == nil then
-          S.saved[win][buf][opt] = cur
-        end
+        save_opt(win, buf, opt, cur)
+        S.orig[buf] = S.orig[buf] or {}
+        S.orig[buf][opt] = { from = cur, to = val }
         vim.wo[win][0][opt] = val
+      elseif not (saved and saved[opt] ~= nil) and orig[opt] and orig[opt].to == val then
+        save_opt(win, buf, opt, orig[opt].from) -- copied from a cloaked window
       end
     end
-  elseif saved then
-    for opt, val in pairs(saved) do
+  else
+    for opt, val in pairs(saved or {}) do
       pcall(function()
         vim.wo[win][0][opt] = val
       end)
     end
-    S.saved[win][buf] = nil
+    for opt, o in pairs(entered and orig or {}) do
+      if not (saved and saved[opt] ~= nil) and vim.wo[win][0][opt] == o.to then
+        pcall(function()
+          vim.wo[win][0][opt] = o.from -- copied from a cloaked window, never saved here
+        end)
+      end
+    end
+    if saved then
+      S.saved[win][buf] = nil
+    end
   end
 end
 
 --- Apply or restore the window-local options for the buffer currently shown in `win`.
 ---@param win integer
-function M.apply_win(win)
+---@param entered? boolean  the window just got the buffer (BufWinEnter)
+function M.apply_win(win, entered)
   if not api.nvim_win_is_valid(win) then
     S.saved[win] = nil
     return
@@ -438,7 +489,7 @@ function M.apply_win(win)
     return
   end
   applying = true
-  local ok, err = pcall(apply_win, win)
+  local ok, err = pcall(apply_win, win, entered)
   applying = false
   if not ok then
     error(err, 0)
@@ -673,14 +724,15 @@ end
 ---@param rules_for fun(path: string): slop.cloak.Rule[]
 function M.start(cfg, rules_for)
   S.cfg, S.rules, S.active = cfg, rules_for, true
-  api.nvim_set_decoration_provider(ns(), { on_win = on_win })
+  api.nvim_set_decoration_provider(ns(), { on_win = on_win, on_line = on_line })
   local group = require("slop.core.util").augroup("cloak")
   api.nvim_create_autocmd("BufWinEnter", {
     group = group,
     desc = "slop: cloak window options",
     callback = function(ev)
+      local cur = api.nvim_get_current_win() -- the window the buffer entered
       for _, win in ipairs(vim.fn.win_findbuf(ev.buf)) do
-        M.apply_win(win)
+        M.apply_win(win, win == cur)
       end
       M.apply_buf(ev.buf)
     end,
@@ -698,6 +750,7 @@ function M.start(cfg, rules_for)
     desc = "slop: cloak forget buffer",
     callback = function(ev)
       S.bufs[ev.buf], S.bufs_path[ev.buf], S.completion[ev.buf], S.unlisted[ev.buf] = nil, nil, nil, nil
+      S.orig[ev.buf] = nil
     end,
   })
   api.nvim_create_autocmd("WinClosed", {
@@ -707,7 +760,7 @@ function M.start(cfg, rules_for)
       local w = tonumber(ev.match)
       if w then
         M.end_reveal(w)
-        S.saved[w] = nil
+        S.saved[w], drawing[w] = nil, nil
       end
     end,
   })
@@ -785,7 +838,8 @@ function M.stop()
   set_on_leave() -- deletes it (not active)
   M.refresh() -- restores window options, completion and listing (active = false)
   M.invalidate()
-  S.completion, S.saved, S.unlisted = {}, {}, {}
+  S.completion, S.saved, S.unlisted, S.orig = {}, {}, {}, {}
+  drawing = {}
 end
 
 ---@param cfg table

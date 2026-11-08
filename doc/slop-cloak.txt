@@ -128,9 +128,12 @@ A rule (cloak.nvim format):
   }
 <
 `file_pattern`: a glob without `/` matches the file name; a glob with `/`
-matches the full path (also below any directory, e.g. `config/*.yaml`).
-Buffers, picker previews and pseudo-paths all use the same matcher (the
-one |slop-secrets| uses).
+matches the full path (also below any directory, e.g. `config/*.yaml`). A
+leading `~/` is your home directory. Buffers, picker previews and
+pseudo-paths all use the same matcher (the one |slop-secrets| uses). For AI
+redaction, a file reached through a symlink is also matched by its
+target's path (`app.conf -> .env` gets the `.env` rules); the masks on
+screen follow the buffer name.
 
 `cloak_pattern` is a Lua pattern applied to each line. It may also be a list:
 >lua
@@ -163,8 +166,9 @@ Builtin rules (`builtin_patterns = true`)                 *slop-cloak-builtin*
 They are kept even when you set your own `patterns`:
 - `http-client.env.json`, `http-client.private.env.json`,
   `*.private.env.json`: string values (escaped `\"` included).
-- `.npmrc`, `.yarnrc*`: `*Token=`/`*Token:`, `*auth*=`/`*auth*:` (e.g.
-  `_auth=`, yarn's `npmAuthIdent:`) and `_password=` values.
+- `.npmrc`, `.yarnrc`, `.yarnrc.yml`: `*Token=`/`*Token:`,
+  `*auth*=`/`*auth*:` (e.g. `_auth=`, yarn's `npmAuthIdent:`) and
+  `_password=` values.
 - `.netrc`: `password` values (blocked for AI).
 - `.aws/credentials`: access key, secret and session token (blocked).
 - `.nvim/state/**`: whole lines, e.g. the rest cookie jar (blocked).
@@ -212,10 +216,13 @@ Both modes ~
   and in the "[Preview]" split. It is restored when the command line is
   left.
 - The window options are restored when the buffer is uncloaked, also in
-  windows split off a cloaked window (they inherit its local values).
+  windows split off a cloaked window (they inherit its local values) and
+  in windows that get the buffer later (Neovim copies a buffer's window
+  options from another window, even a closed one).
 
-Only visible rows are processed, with a per-row cache that is reset when the
-buffer or its tab settings change.
+Only the rows Neovim draws are processed (a closed fold is one row, even
+over 100k lines), with a per-row cache that is reset when the buffer or its
+tab settings change.
 
 ==============================================================================
 7. INTEGRATIONS                                      *slop-cloak-integrations*
@@ -228,9 +235,16 @@ to tag each preview buffer with its file path and to set the window options
 of |slop-cloak-render| right away (fzf-lua swaps preview buffers without
 autocommands). As a fallback, unnamed buffers in `w:fzf_lua_preview` windows
 are resolved from the selected entry. `:checkhealth slop` shows whether the
-patch is applied. fzf-lua grep RESULT lines are a terminal and cannot be
-masked. Consider excluding secret files, e.g.
-`grep = { rg_opts = "... --glob=!.env*" }`.
+patch is applied. The RESULT lines of pickers that list buffer or file
+lines (grep, live_grep, grep_cword, blines, lines, ...) are text in fzf's
+terminal and cannot be masked: `blines` in a `.env` buffer lists its
+secrets. Consider excluding secret files from grep, e.g.
+`grep = { rg_opts = "... --glob=!.env*" }`. The same goes for previews
+that fzf runs itself instead of the builtin previewer: the diffs of
+`git_status`, `git_diff`, `git_commits` and friends (fzf-lua's `git_diff`
+previewer, delta) and `preview = "<command>"`. `git_status` can use the
+masked builtin previewer instead:
+`git = { status = { previewer = "builtin" } }`.
 
 telescope ~
 On `User TelescopePreviewerLoaded`, the preview buffer is tagged with its
@@ -295,8 +309,9 @@ cloak.disable({scope})
 cloak.is_enabled({buf})        display state of a buffer
 cloak.preview_line({count})    reveal lines; returns false when nothing to do
 cloak.status({buf})            { buf, path, enabled, global, cloaked, blocked,
-                                 rules, spans, render }; cheap for buffers
-                                 no rule applies to
+                                 rules, spans, render }; `spans` is counted
+                                 (over the whole buffer) when it is read,
+                                 the other fields are cheap
 cloak.spans({buf}, {srow}, {erow})
                                masked spans { row, col, end_col, prefix }
 cloak.refresh({buf})           recompute and redraw
@@ -339,7 +354,9 @@ preview_line is per window.
   on screen yet (planned for v2). PEM private-key bodies ARE redacted for
   AI by |slop-secrets|, and `*.pem`/`*.key` files are blocked.
 - Yanks copy the real value (by design).
-- fzf-lua grep result lines are not masked.
+- fzf-lua result lines (grep, blines, lines, ...) and the previews fzf runs
+  itself (the diffs of the git pickers) are not masked; builtin previews
+  are. See |slop-cloak-integrations|.
 - Keyword completion in OTHER buffers scans loaded buffers, so it can offer
   (and insert) values of a cloaked buffer: |i_CTRL-N| and 'autocomplete'
   with the default 'complete' (`.,w,b,u,t`), and buffer sources of

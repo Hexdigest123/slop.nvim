@@ -47,6 +47,13 @@ describe("cloak patterns", function()
     assert.are.same({ { "hunter2", "" } }, spans(r, "token: hunter2"))
   end)
 
+  it("the legacy visible first character is a whole (multibyte) character", function()
+    local r = { { file_pattern = "*", cloak_pattern = "：%S+" } }
+    assert.are.same({ { "secret", "" } }, spans(r, "名前：secret # note"))
+    r = { { file_pattern = "*", cloak_pattern = "é.+" } }
+    assert.are.same({ { "tait", "" } }, spans(r, "x=était"))
+  end)
+
   it("replace without capture groups is ignored (legacy first char)", function()
     local r = { { file_pattern = "*", cloak_pattern = "=.+", replace = "XX" } }
     assert.are.same({ { "abc", "" } }, spans(r, "K=abc"))
@@ -70,6 +77,22 @@ describe("cloak patterns", function()
   it("finds multiple matches per line", function()
     local r = { { file_pattern = "*", cloak_pattern = "=%w+" } }
     assert.are.same({ { "x1", "" }, { "y22", "" } }, spans(r, "A=x1 B=y22"))
+  end)
+
+  it("touching matches: the search goes on at the last char of a match, like cloak.nvim", function()
+    -- `%d%d%d` matches 123, 345, 567, 789: each one's visible first char lies under the previous mask
+    -- (going on after the match instead matched 123, 456, 789 and left 4 and 7 visible)
+    local line = "pin 123456789"
+    local masked = {}
+    for _, sp in ipairs(P.compute(P.normalize({ { file_pattern = "*", cloak_pattern = "%d%d%d" } }), { line }, 0)) do
+      for c = sp.col + 1, sp.end_col do
+        masked[c] = true
+      end
+    end
+    for c = 6, #line do
+      assert.is_true(masked[c] == true, ("column %d (%s) not masked"):format(c, line:sub(c, c)))
+    end
+    assert.is_nil(masked[5], "the first char of the run stays visible")
   end)
 
   it("try_all_patterns: earliest start, tie -> longest; false -> list order", function()
