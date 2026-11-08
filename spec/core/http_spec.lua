@@ -336,6 +336,15 @@ describe("core.http", function()
       end
     end
 
+    --- The `-K` (URL config) file of a curl argv.
+    local function url_file(cmd)
+      for i, a in ipairs(cmd) do
+        if a == "-K" then
+          return cmd[i + 1]
+        end
+      end
+    end
+
     it("starts curl with -q and passes every -H value through a private file, never on argv", function()
       srv = mock.start(function(req, res)
         res.json(
@@ -376,6 +385,65 @@ describe("core.http", function()
       assert.is_nil(vim.uv.fs_stat(file), "header file removed after the run")
     end)
 
+    it("passes URLs (API keys in the query, user:password@) through a private file, never on argv", function()
+      srv = mock.start(function(req, res)
+        res.json(200, { path = req.path, q = req.query, auth = req.headers.authorization })
+      end)
+      local function check_argv(cmd)
+        for _, a in ipairs(cmd) do
+          assert.falsy(a:find("FAKE", 1, true), "secret on argv: " .. a)
+        end
+      end
+      -- request(): the URL is the last argument
+      local url = srv.url:gsub("://", "://me:pw-FAKE-1@") .. '/v1/x?key=sk-FAKE-2&q=a%20b&s="\\'
+      local out = run({ url = url })
+      local cmd = calls[#calls].cmd
+      check_argv(cmd)
+      local file = url_file(cmd)
+      assert.truthy(file, "no -K file in " .. table.concat(cmd, " "))
+      assert.is_nil(vim.uv.fs_stat(file), "the file is removed after the run")
+      assert.is_nil(out.err)
+      local j = out.res:json()
+      assert.equal("/v1/x", j.path)
+      assert.equal('key=sk-FAKE-2&q=a%20b&s="\\', j.q)
+      assert.equal("Basic " .. vim.base64.encode("me:pw-FAKE-1"), j.auth)
+      -- curl() with --url (the rest module), the file is private while curl runs
+      local got, mode
+      http.curl({ "-sS", "--url", srv.url .. "/p?token=tok-FAKE-3" }, {
+        on_exit = function(code, stdout)
+          got = { code = code, body = vim.json.decode(stdout) }
+        end,
+      })
+      cmd = calls[#calls].cmd
+      check_argv(cmd)
+      local st = vim.uv.fs_stat(url_file(cmd))
+      mode = st and st.mode % 512
+      mock.wait(function()
+        return got ~= nil
+      end)
+      assert.equal(384, mode, "the file must be 0600")
+      assert.equal(0, got.code)
+      assert.equal("token=tok-FAKE-3", got.body.q)
+      -- several operations (--next): each URL stays with its own options
+      local seen = {}
+      srv.stop()
+      srv = mock.start(function(req, res)
+        seen[#seen + 1] = req.method .. " " .. req.path
+        res.send(200, req.path)
+      end)
+      got = nil
+      http.curl({ "-sS", srv.url .. "/a", "--next", "-sS", "-X", "DELETE", srv.url .. "/b" }, {
+        on_exit = function(code, stdout)
+          got = { code = code, out = stdout }
+        end,
+      })
+      mock.wait(function()
+        return got ~= nil
+      end)
+      assert.equal(0, got.code)
+      assert.are.same({ "GET /a", "DELETE /b" }, seen)
+    end)
+
     it("finds -H in short clusters and does not take option values for -H", function()
       srv = mock.start(function(req, res)
         res.send(200, (req.headers["x-a"] or "-") .. "," .. (req.headers["x-b"] or "-"))
@@ -396,7 +464,7 @@ describe("core.http", function()
       assert.truthy(vim.tbl_contains(cmd, "-s"), "the rest of the -sH cluster stays")
     end)
 
-    it("removes the header file on cancel, timeout, HTTP error and spawn failure", function()
+    it("removes the header and URL files on cancel, timeout, HTTP error and spawn failure", function()
       local function file_after(handler, extra)
         srv = mock.start(handler)
         local n = #calls
@@ -409,8 +477,9 @@ describe("core.http", function()
           end,
         }, extra or {})
         local hd = http.request(o)
-        local file = header_file(calls[n + 1].cmd)
+        local file, ufile = header_file(calls[n + 1].cmd), url_file(calls[n + 1].cmd)
         assert.truthy(vim.uv.fs_stat(file), "header file exists while curl runs")
+        assert.truthy(vim.uv.fs_stat(ufile), "URL file exists while curl runs")
         if o.cancel_after then
           vim.wait(o.cancel_after)
           hd:cancel()
@@ -421,7 +490,7 @@ describe("core.http", function()
         srv.stop()
         srv = nil
         vim.wait(50)
-        return done, vim.uv.fs_stat(file)
+        return done, vim.uv.fs_stat(file) or vim.uv.fs_stat(ufile)
       end
       local kind, st = file_after(function(_, res)
         res.hang()
@@ -454,9 +523,10 @@ describe("core.http", function()
         return err ~= nil
       end)
       assert.equal("spawn", err.kind)
-      local file = header_file(calls[n + 1].cmd)
-      assert.truthy(file)
+      local file, ufile = header_file(calls[n + 1].cmd), url_file(calls[n + 1].cmd)
+      assert.truthy(file and ufile)
       assert.is_nil(vim.uv.fs_stat(file))
+      assert.is_nil(vim.uv.fs_stat(ufile))
     end)
 
     it("ignores ~/.curlrc (--fail / --include / --verbose there do not change results)", function()

@@ -4,8 +4,9 @@
 --- Rules: never blocks (vim.system; callbacks run on the main loop); body goes via stdin
 --- (`--data-binary @-`, never argv); `--globoff`; metadata from `-w '%{json}'` (no stderr parsing of -v output);
 --- optional cookie jar (`-b/-c <path>`); every request is cancellable and has a timeout.
---- Every curl run (M.curl) starts with `-q` (~/.curlrc is ignored) and gets its `-H` values from a 0600 file in
---- Neovim's private temp dir (`-H @file`), so API keys never appear on argv (ps, /proc/<pid>/cmdline).
+--- Every curl run (M.curl) starts with `-q` (~/.curlrc is ignored) and gets its `-H` values (`-H @file`) and URLs
+--- (`-K file`) from 0600 files in Neovim's private temp dir, so API keys (headers, `?key=`, `user:password@`)
+--- never appear on argv (ps, /proc/<pid>/cmdline).
 ---
 --- request() layout of a curl run:
 ---   stdout  = response body (streamed through a decoder when `stream` is set)
@@ -344,7 +345,8 @@ end
 ---@field on_exit fun(code: integer, stdout: string, stderr: string, signal: integer)  main loop; not called after cancel()
 ---@field on_cancel? fun()                      main loop, right after cancel()
 
--- curl options that take a value: the value must not be mistaken for an option when looking for `-H`
+-- curl options that take a value (`curl --help all`, curl 8.23): the value must not be mistaken for an option
+-- when looking for `-H`, nor for a URL
 local SHORT_VALUE = "XHdFbcoDwuUAeTKxmErzYyQPtC"
 local LONG_VALUE_NAMES = [[
   request header data data-binary data-raw data-ascii data-urlencode json form form-string cookie
@@ -355,17 +357,28 @@ local LONG_VALUE_NAMES = [[
   dns-servers ciphers tls-max stderr trace trace-ascii netrc-file speed-limit speed-time quote hsts
   alt-svc etag-save etag-compare preproxy proxy-cacert noproxy max-filesize output-dir request-target
   continue-at telnet-option ftp-port socks5 socks5-hostname
+  create-file-mode crlfile curves delegation dns-interface dns-ipv4-addr dns-ipv6-addr doh-url ech egd-file
+  engine ftp-account ftp-alternative-to-user ftp-method ftp-ssl-ccc-mode happy-eyeballs-timeout-ms
+  haproxy-clientip hostpubmd5 hostpubsha256 ipfs-gateway ip-tos keepalive-cnt knownhosts krb libcurl
+  login-options mail-auth mail-from mail-rcpt parallel-max parallel-max-host pinnedpubkey proto proto-default
+  proto-redir proxy1.0 proxy-capath proxy-cert proxy-cert-type proxy-ciphers proxy-crlfile proxy-key
+  proxy-key-type proxy-pass proxy-pinnedpubkey proxy-service-name proxy-tls13-ciphers proxy-tlsauthtype
+  proxy-tlspassword proxy-tlsuser pubkey random-file rate sasl-authzid service-name sigalgs socks4 socks4a
+  socks5-gssapi-service ssl-sessions tftp-blksize tls13-ciphers tlsauthtype tlspassword tlsuser trace-config
+  upload-flags vlan-priority
 ]]
 local LONG_VALUE = {}
 for o in LONG_VALUE_NAMES:gmatch("%S+") do
   LONG_VALUE["--" .. o] = true
 end
 
---- Split curl args into the argv without the `-H` values and those values (`-H @file` references stay).
+--- Split curl args into the argv without the `-H` values and URLs, those values (`-H @file` references stay) and
+--- the URLs (`--url` values and positional arguments). With several operations (`--next`) the URLs stay in place.
 ---@param args string[]
----@return string[] argv, string[] headers
-local function take_headers(args)
-  local argv, headers, i = {}, {}, 1
+---@return string[] argv, string[] headers, string[] urls
+local function take_private(args)
+  local argv, headers, urls, i = {}, {}, {}, 1
+  local multi = vim.tbl_contains(args, "--next") or vim.tbl_contains(args, "-:")
   local function header(flag, v)
     if v == nil or v:sub(1, 1) == "@" then
       argv[#argv + 1] = flag
@@ -379,9 +392,14 @@ local function take_headers(args)
     if a == "-H" or a == "--header" then
       header(a, args[i + 1])
       i = i + 1
+    elseif a == "--url" and not multi and args[i + 1] then
+      urls[#urls + 1] = args[i + 1]
+      i = i + 1
     elseif LONG_VALUE[a] then
       vim.list_extend(argv, { a, args[i + 1] })
       i = i + 1
+    elseif a:sub(1, 1) ~= "-" and not multi then
+      urls[#urls + 1] = a -- curl takes every argument that is no option (nor an option's value) as a URL
     elseif a:match("^%-[^-]") then
       -- short cluster ("-sS", "-sSX" + value, "-XPOST", "-HX: 1"): the first letter taking a value consumes the
       -- rest of the cluster, or the next argument when it is the last letter
@@ -414,21 +432,17 @@ local function take_headers(args)
     end
     i = i + 1
   end
-  return argv, headers
+  return argv, headers, urls
 end
 
---- Write header lines to a new 0600 file in Neovim's private temp dir (curl reads it via `-H @file`).
----@param headers string[]
+--- Write lines to a new 0600 file in Neovim's private temp dir.
+---@param lines string[]
 ---@return string? path, string? err
-local function header_file(headers)
+local function private_file(lines)
   local path = vim.fn.tempname()
   local fd, err = uv.fs_open(path, "w", 384) -- 0600
   if not fd then
     return nil, err
-  end
-  local lines = {}
-  for i, h in ipairs(headers) do
-    lines[i] = (h:gsub("[\r\n]+", " ")) -- one header per line (LF only: curl keeps a CR in the value)
   end
   local ok, werr = uv.fs_write(fd, table.concat(lines, "\n") .. "\n")
   uv.fs_close(fd)
@@ -439,9 +453,35 @@ local function header_file(headers)
   return path
 end
 
+--- Header lines for `-H @file`: one header per line (LF only: curl keeps a CR in the value).
+---@param headers string[]
+---@return string? path, string? err
+local function header_file(headers)
+  local lines = {}
+  for i, h in ipairs(headers) do
+    lines[i] = (h:gsub("[\r\n]+", " "))
+  end
+  return private_file(lines)
+end
+
+local CONFIG_ESCAPES = { ["\\"] = "\\\\", ['"'] = '\\"', ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+
+--- `url = "..."` lines of a curl config file (`-K file`; backslash escapes inside double quotes).
+---@param urls string[]
+---@return string? path, string? err
+local function url_file(urls)
+  local lines = {}
+  for i, u in ipairs(urls) do
+    lines[i] = ('url = "%s"'):format((u:gsub('[\\"\n\r\t]', CONFIG_ESCAPES)))
+  end
+  return private_file(lines)
+end
+
 --- Low-level: run curl with raw args (used by request() and by rest's runner). Call from the main loop.
---- `-q` is prepended (~/.curlrc is ignored) and every `-H <value>` is passed through a private 0600 header file
---- (`-H @file`, removed when the run ends), so header values (API keys) never show up on curl's argv.
+--- `-q` is prepended (~/.curlrc is ignored), every `-H <value>` is passed through a private 0600 header file
+--- (`-H @file`) and the URLs (`--url` values, positional arguments) through a private 0600 config file (`-K file`),
+--- both removed when the run ends: header values (API keys) and URLs (`?key=...`, `user:password@`) never show up on
+--- curl's argv.
 ---@param args string[]                          curl arguments (without "curl")
 ---@param opts slop.http.CurlOpts
 ---@return slop.http.Handle
@@ -451,16 +491,22 @@ function M.curl(args, opts)
   local active = true
   local proc ---@type vim.SystemObj?
   local out, err = {}, {}
-  local argv, headers = take_headers(args)
-  local hfile, herr ---@type string?, string?
+  local argv, headers, urls = take_private(args)
+  local hfile, ufile, herr ---@type string?, string?, string?
   if #headers > 0 then
     hfile, herr = header_file(headers)
+  end
+  if not herr and #urls > 0 then
+    ufile, herr = url_file(urls)
   end
   local function cleanup()
     if hfile then
       os.remove(hfile)
-      hfile = nil
     end
+    if ufile then
+      os.remove(ufile)
+    end
+    hfile, ufile = nil, nil
   end
 
   function handle:is_active()
@@ -482,9 +528,10 @@ function M.curl(args, opts)
   end
 
   if herr then
+    cleanup()
     active = false
     vim.schedule(function()
-      opts.on_exit(-1, "", "spawn failed: cannot write the curl header file: " .. tostring(herr), 0)
+      opts.on_exit(-1, "", "spawn failed: cannot write a private curl file: " .. tostring(herr), 0)
     end)
     return handle
   end
@@ -493,6 +540,9 @@ function M.curl(args, opts)
     vim.list_extend(cmd, { "-H", "@" .. hfile })
   end
   vim.list_extend(cmd, argv)
+  if ufile then
+    vim.list_extend(cmd, { "-K", ufile })
+  end
 
   local sys_opts = {
     stdin = opts.stdin,
