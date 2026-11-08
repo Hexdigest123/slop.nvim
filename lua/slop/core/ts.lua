@@ -256,13 +256,15 @@ function M.scopes(buf, pos, opts)
   for _, node in ipairs(nodes_at(buf, row, col)) do
     local found = {}
     while node do
+      local parent = node:parent()
       local t = node:type()
-      local kind = M.classify(t)
+      -- the root (the whole file) is no scope: Python's root `module` would be classified like a Ruby module
+      local kind = parent and M.classify(t)
       -- C/C++ `struct foo` / `enum bar` without a body is a type reference, not a scope
       if kind and (not want or vim.tbl_contains(want, kind)) and (not t:match("_specifier$") or body_of(node)) then
         table.insert(found, 1, make_scope(node, kind, buf))
       end
-      node = node:parent()
+      node = parent
     end
     out = vim.list_extend(found, out) -- trees come innermost first: the outer tree's scopes go before
   end

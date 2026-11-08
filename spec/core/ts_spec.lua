@@ -127,6 +127,33 @@ describe("core.ts", function()
     assert.equal(1, vim.tbl_count(trees), "the far vim.cmd() injection was parsed too")
   end)
 
+  it("the root node of a tree is never a scope (Python's root `module` looks like a Ruby module)", function()
+    local b = buf_with({ "local x = 1", "function f()", "  return x", "end" }, "lua")
+    -- the Lua root (`chunk`) classified like Python's `module` (kind "class" via "^module$")
+    table.insert(ts.kinds, 1, { "^chunk$", "class" })
+    local ok, err = pcall(function()
+      assert.equal("class", ts.classify("chunk"))
+      assert.is_nil(ts.scope(b, { 0, 3 }), "top level: no enclosing scope (not the whole file)")
+      local all = ts.scopes(b, { 2, 4 })
+      assert.equal(1, #all)
+      assert.equal("f", all[1].name)
+    end)
+    table.remove(ts.kinds, 1)
+    assert(ok, err)
+    -- the real thing, when a Python parser is installed (language.add returns nil, err without one)
+    local has_python, added = pcall(vim.treesitter.language.add, "python")
+    if has_python and added then
+      local py = buf_with({ "import os", "", "def f(a):", "    return a", "", "X = f(1)" }, "python")
+      assert.is_nil(ts.scope(py, { 5, 0 }))
+      assert.are.same(
+        { "f" },
+        vim.tbl_map(function(s)
+          return s.name
+        end, ts.scopes(py, { 3, 6 }))
+      )
+    end
+  end)
+
   it("defaults to the cursor position of the current window", function()
     local b = buf_with({ "function f()", "  return 1", "end" }, "lua")
     api.nvim_set_current_buf(b)
