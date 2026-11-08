@@ -10,6 +10,7 @@ local M = {}
 local api = vim.api
 local registered = false
 local source_id ---@type integer? cmp.register_source() result, for unregister_source()
+local waiting = false -- an autocmd registers the source once nvim-cmp is loaded
 
 local function engine()
   return require("slop.modules.complete.engine")
@@ -120,13 +121,46 @@ function M.register()
   return true
 end
 
+--- Register the source now, or as soon as nvim-cmp is loaded (module setup, and a config change to a cmp frontend).
+function M.ensure()
+  if M.register() or waiting then
+    return
+  end
+  waiting = true
+  local id
+  id = api.nvim_create_autocmd({ "InsertEnter", "User" }, {
+    group = require("slop.core.util").augroup("complete"),
+    desc = "slop: register the cmp source once nvim-cmp is loaded",
+    callback = function()
+      if M.register() then
+        waiting = false
+        pcall(api.nvim_del_autocmd, id) -- (returning true would only drop the event that fired)
+      end
+    end,
+  })
+end
+
+--- Open nvim-cmp's menu with only this source (the manual trigger of frontend "cmp", which has no ghost text).
+---@return boolean started
+function M.complete()
+  local cmp = package.loaded["cmp"]
+  if not (M.register() and type(cmp) == "table" and type(cmp.complete) == "function") then
+    return false
+  end
+  local ok, err = pcall(cmp.complete, { config = { sources = { { name = "slop" } } } })
+  if not ok then
+    require("slop.core.log").scope("complete").debug("cmp.complete failed: %s", err)
+  end
+  return ok
+end
+
 --- Unregister the source (module teardown; a later setup() registers it again).
 function M.unregister()
   local cmp = package.loaded["cmp"]
   if registered and source_id and type(cmp) == "table" and type(cmp.unregister_source) == "function" then
     pcall(cmp.unregister_source, source_id)
   end
-  registered, source_id = false, nil
+  registered, source_id, waiting = false, nil, false -- (teardown deletes the augroup, and the waiting autocmd)
 end
 
 ---@return boolean

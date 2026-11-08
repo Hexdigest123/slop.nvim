@@ -26,14 +26,14 @@ inline, further lines below it. It replaces minuet-ai.nvim.
   that work too, because the checks run again on every request.
 - Requests are debounced (250 ms, trailing: the last keystroke always counts).
   Each buffer has its own request, and a new keystroke cancels the old one.
-  Leaving Insert mode or the buffer cancels it too.
+  Leaving Insert mode (also with <C-c>) or the buffer cancels it too.
 - Responses are streamed: the ghost text grows as tokens arrive, and
   generation stops early at the end of the block or after `max_lines`.
 - Typing what the suggestion shows keeps it (no new request), and so does a
-  partial accept. A prefix cache serves positions you return to, even after
-  backspacing.
-- One candidate is fetched by default. <C-n>/<C-p> fetch alternatives lazily
-  and show a counter "(i/n)".
+  partial accept. A prefix cache serves positions of the same file you
+  return to, even after backspacing.
+- One candidate is fetched by default. <C-n> fetches alternatives lazily,
+  <C-p> goes back, and a counter "(i/n)" shows where you are.
 - Never active in buffers blocked by |slop-secrets| (".env*", "*.pem", ...),
   in cloaked lines, in buffers with `vim.b.completion = false` (set by cloak),
   in special buffer types, or in files that are too large. All context passes
@@ -60,7 +60,9 @@ the mapping it replaced (for example nvim-cmp's) or to the native key.
   <C-n>     next candidate (fetches more lazily)     keymaps.next
   <C-p>     previous candidate                       keymaps.prev
   <C-e>     dismiss (no new request until you type)  keymaps.dismiss
-  <M-\>     request a suggestion now                 keymaps.trigger
+  <M-\>     request a suggestion now (frontend       keymaps.trigger
+            "cmp": open the nvim-cmp menu with the
+            slop source)
 
 Normal mode:
   <leader>at  toggle automatic suggestions           keymaps.toggle
@@ -68,6 +70,11 @@ Normal mode:
 Each accept is one undo step. Accepted text is inserted directly, not typed,
 so |.| repeats only what you typed yourself, not the accepted suggestion. Set
 any key to `false` to disable it.
+
+Keys typed right before an accept key count, even when they are still being
+processed (fast typing, a mapping, a macro): typed text that matches the
+suggestion is not inserted twice, and a suggestion that no longer matches is
+not accepted (the key then does its own job).
 
 The Insert-mode keys above wrap a mapping that already exists on the same
 key: slop acts while a suggestion is visible, otherwise your mapping (or the
@@ -147,6 +154,11 @@ tokens. Use a smaller value, such as 4000, for local models.
 Per buffer: `vim.b.slop_complete = false` turns automatic suggestions off for
 that buffer. Manual requests (<M-\>) still work.
 
+Calling |slop.setup()| again applies new `complete` options right away. If
+they are invalid, the error is reported and the previous options stay in
+use. With `complete = false` (or `enabled = false`) nothing is sent anymore,
+not even on request.
+
 ==============================================================================
 4. PROVIDERS (ai service)                            *slop-complete-providers*
 
@@ -161,7 +173,9 @@ reasoning models that inline their thinking) is dropped, never suggested.
   kind           "fim" | "chat"
   service        "mistral", "openai", "anthropic", "gemini", "deepseek",
                  "openrouter", "ollama", "llamacpp", "groq", ...
-  url            endpoint
+  url            endpoint (gemini: the models base URL, or a full
+                 `...:generateContent` / `...:streamGenerateContent` URL,
+                 whose method follows the request's streaming)
   model          model name
   api_key        env var NAME (string), function returning the key, or false
                  (no key, e.g. local servers). Default: <SERVICE>_API_KEY,
@@ -175,7 +189,8 @@ reasoning models that inline their thinking) is dropped, never suggested.
   params         table deep-merged into the request body (top_p, reasoning
                  settings, ollama `options`, ...). A `vim.NIL` value removes
                  that field, also nested, e.g. `{ temperature = vim.NIL }`
-                 for a model that rejects it
+                 for a model that rejects it; a table left empty by such
+                 removals is dropped too
   headers        extra request headers
   transform      fun(http_request, info) -> http_request (rewrite url/body,
                  or set `proxy` / `extra_args` for curl)
@@ -279,7 +294,8 @@ c.accept() / c.accept_word() / c.accept_line() -> boolean
 c.accept_n_lines(n?) -> boolean     n default: a digit typed right after
 c.next() / c.prev() -> boolean     cycle; next fetches alternatives
 c.dismiss() -> boolean
-c.trigger() -> boolean             request now (manual)
+c.trigger() -> boolean             request now (manual; frontend "cmp":
+                                   opens the cmp menu with slop)
 c.toggle(scope?) / c.enable(scope?) / c.disable(scope?)  scope "buffer"
 c.is_enabled(buf?) -> boolean
 c.status(buf?) -> { state = "idle"|"loading"|"shown", index?, total?,
@@ -316,7 +332,8 @@ once nvim-cmp is loaded. Add it to your sources: >lua
 <
 - "both": the source offers the suggestion the ghost text already shows, with
   no extra request.
-- "cmp": no ghost text; the source sends its own requests.
+- "cmp": no ghost text; the source sends its own requests. <M-\>
+  (`keymaps.trigger`) opens the menu with only the slop source.
 
 The source asks only on trigger characters or a manual complete (its keyword
 pattern never matches), so the menu never waits on the model during normal

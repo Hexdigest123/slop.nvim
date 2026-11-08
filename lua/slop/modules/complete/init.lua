@@ -55,10 +55,15 @@ function api.dismiss()
   return engine().dismiss()
 end
 
---- Request a suggestion now (bypasses debounce, auto toggles and `condition`).
+--- Request a suggestion now (bypasses debounce, auto toggles and `condition`). With frontend "cmp" (no ghost
+--- text) it opens nvim-cmp's menu with the slop source.
 ---@return boolean started
 function api.trigger()
-  return engine().trigger(0, { manual = true })
+  local e = engine()
+  if (e.cfg or require("slop.config").get("complete")).frontend == "cmp" then
+    return require("slop.modules.complete.cmp").complete()
+  end
+  return e.trigger(0, { manual = true })
 end
 
 ---@param scope? "global"|"buffer"
@@ -334,16 +339,7 @@ return {
     e.attach()
     require("slop.services.ai.context").track()
     if cfg.frontend ~= "virtualtext" then
-      local cmp = require("slop.modules.complete.cmp")
-      if not cmp.register() then
-        vim.api.nvim_create_autocmd({ "InsertEnter", "User" }, {
-          group = require("slop.core.util").augroup("complete"),
-          desc = "slop: register the cmp source once nvim-cmp is loaded",
-          callback = function()
-            return cmp.register() -- true deletes the autocmd
-          end,
-        })
-      end
+      require("slop.modules.complete.cmp").ensure()
     end
   end,
 

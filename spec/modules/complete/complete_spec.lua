@@ -664,4 +664,135 @@ describe("complete module", function()
       assert.matches(pasted:find("-", 1, true) and "environment variable NAME" or "named by api_key", all)
     end
   end)
+
+  it("<C-c> leaves Insert mode without InsertLeave: the ghost goes away, a streaming request is cancelled", function()
+    responses = { { "foo(bar)" }, { "aaa", "bbb", "ccc", "ddd", delay = 80 } }
+    setup()
+    local finished = {}
+    require("slop.core.events").on("complete", "RequestFinished", function(d)
+      finished[#finished + 1] = d
+    end)
+    open({ "local x = " })
+    vim.keymap.set("i", "<F12>", function()
+      engine.sync(buf)
+      wait_ghost("foo(bar)", true)
+    end)
+    h.feed("A<F12><C-c>")
+    assert.equal("n", api.nvim_get_mode().mode)
+    assert.is_nil(text(), "a finished suggestion must not stay in Normal mode")
+    open({ "local y = " })
+    vim.keymap.set("i", "<F12>", function()
+      engine.sync(buf)
+      wait_ghost("aaa")
+    end)
+    h.feed("A<F12><C-c>")
+    assert.is_nil(text())
+    assert.equal("idle", engine.status(buf).state)
+    assert.equal("cancelled", finished[#finished].error)
+    vim.wait(400)
+    assert.is_nil(text(), "nothing is drawn when the stream goes on")
+  end)
+
+  it("keys typed right before an accept (typeahead: no TextChangedI in between) are not accepted twice", function()
+    responses = { { "üñí')" }, { "üñí')" }, { "üñí')" } }
+    setup({ complete = { cache = false } })
+    open({ "local s = f('äö" })
+    vim.keymap.set("i", "<F12>", function()
+      wait_ghost("üñí')", true)
+    end)
+    h.feed("A<F12>ü<C-y><Esc>") -- one burst: Vim fires TextChangedI only when no key is pending
+    assert.are.same({ "local s = f('äöüñí')" }, lines())
+    -- typed away from the suggestion: nothing stale is inserted, the key does its own job
+    open({ "local t = f('äö" })
+    h.feed("A<F12>x<C-y><Esc>")
+    assert.are.same({ "local t = f('äöx" }, lines())
+  end)
+
+  it("the prefix cache never serves another file's suggestion (same text around the cursor)", function()
+    responses = { { "import os" }, { "local M = {}" } }
+    setup()
+    open({ "" }, "a.py", "python")
+    insert(function()
+      engine.sync(buf)
+      wait_ghost("import os", true)
+    end)
+    open({ "" }, "b.lua", "lua")
+    insert(function()
+      engine.sync(buf)
+      wait_ghost("local M = {}", true)
+    end)
+    assert.equal(2, #srv.requests)
+  end)
+
+  it("candidates = 3 fetches three candidates right away", function()
+    responses = { { "one" }, { "two" }, { "three" }, { "four" } }
+    setup({ complete = { candidates = 3 } })
+    open({ "v = " })
+    local total
+    insert(function()
+      engine.sync(buf)
+      vim.wait(2000, function()
+        return #srv.requests >= 3 and engine.status(buf).state ~= "loading"
+      end, 5)
+      vim.wait(50)
+      total = engine.status(buf).total
+    end)
+    assert.equal(3, total)
+    assert.equal(3, #srv.requests)
+  end)
+
+  it("setup() run again: an invalid complete config is not applied; `enabled = false` stops every request", function()
+    responses = { { "first()" }, { "second()" } }
+    setup()
+    local providers = { mock = { kind = "fim", service = "mistral", url = srv.url, model = "m", api_key = false } }
+    require("slop").setup({ ai = { providers = providers }, complete = { provider = "mock", debounce = "soon" } })
+    open({ "local x = " })
+    insert(function()
+      engine.sync(buf) -- TextChangedI: must not throw (timer:start("soon"))
+      wait_ghost("first()", true)
+    end)
+    require("slop").setup({ ai = { providers = providers }, complete = { provider = "mock", enabled = false } })
+    open({ "local y = " })
+    insert(function()
+      engine.sync(buf)
+      vim.wait(100)
+      assert.is_false(engine.trigger(buf, { manual = true }))
+    end)
+    assert.equal(1, #srv.requests, "a disabled module sends nothing")
+  end)
+
+  it("frontend = cmp: the trigger key opens nvim-cmp with the slop source (not an invisible request)", function()
+    local opened
+    package.loaded["cmp"] = {
+      register_source = function() end,
+      complete = function(o)
+        opened = o
+        return true
+      end,
+    }
+    setup({ complete = { frontend = "cmp" } })
+    open({ "m = " })
+    local started
+    insert(function()
+      started = require("slop").complete.trigger()
+      vim.wait(100)
+    end)
+    assert.is_true(started)
+    assert.equal(0, #srv.requests)
+    assert.are.same({ { name = "slop" } }, opened.config.sources)
+  end)
+
+  it("setup() run again with frontend = cmp registers the nvim-cmp source", function()
+    local registered
+    package.loaded["cmp"] = {
+      register_source = function(name)
+        registered = name
+      end,
+    }
+    setup()
+    assert.is_nil(registered)
+    local providers = { mock = { kind = "fim", service = "mistral", url = srv.url, model = "m", api_key = false } }
+    require("slop").setup({ ai = { providers = providers }, complete = { provider = "mock", frontend = "cmp" } })
+    assert.equal("slop", registered)
+  end)
 end)

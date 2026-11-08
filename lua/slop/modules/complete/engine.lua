@@ -161,6 +161,10 @@ function M.allowed(buf, manual)
   if not util().buf_valid(buf) then
     return false, "invalid buffer"
   end
+  -- setup() run again with `enabled = false` leaves the module loaded (no teardown): it must not send anything
+  if not require("slop.config").enabled("complete") then
+    return false, "module disabled"
+  end
   if vim.b[buf].completion == false then
     return false, "vim.b.completion = false"
   end
@@ -435,8 +439,8 @@ function M.request(buf, req, first, on_more)
             req.index = #req.items
           end
         end)
-      elseif first and #req.items > 0 and #req.items < c.candidates and not req.no_render then
-        M.fetch_more(buf)
+      elseif (first or added > 0) and #req.items > 0 and #req.items < c.candidates and not req.no_render then
+        M.fetch_more(buf) -- `candidates` are fetched right away, one after the other
       end
       M.render(buf)
     end,
@@ -464,7 +468,10 @@ local function cache_keys(buf, row, col)
   local before = api.nvim_buf_get_text(buf, s, 0, row, col, {})
   local last = math.min(api.nvim_buf_line_count(buf) - 1, row + 20)
   local after = api.nvim_buf_get_text(buf, row, col, last, #line_of(buf, last), {})
-  return { prefix = table.concat(before, "\n"), suffix = table.concat(after, "\n") }
+  -- the same text around the cursor in another file (two new empty files) is not the same completion
+  local name = api.nvim_buf_get_name(buf)
+  local doc = ("%s\0%s\0"):format(name ~= "" and name or ("#" .. buf), vim.bo[buf].filetype)
+  return { prefix = doc .. table.concat(before, "\n"), suffix = table.concat(after, "\n") }
 end
 
 ---@class slop.complete.TriggerOpts
@@ -705,10 +712,23 @@ end
 
 -- Actions ----------------------------------------------------------------------------------------
 
+--- Is our ghost visible in `buf` once it caught up with the text? Vim fires TextChangedI / CursorMovedI only when
+--- no key is pending (fast typing, mappings, macros): a key typed right before the accept key would be accepted
+--- twice, and a key that diverged would leave the stale suggestion acceptable.
+---@param buf integer
+---@return boolean
+local function fresh(buf)
+  if not M.visible(buf) then
+    return false
+  end
+  M.sync(buf)
+  return M.visible(buf)
+end
+
 local function with_ghost(fn)
   return function(...)
     local buf = api.nvim_get_current_buf()
-    if not M.visible(buf) then
+    if not fresh(buf) then
       return false
     end
     close_menu()
@@ -749,7 +769,7 @@ end
 ---@return boolean
 function M.accept_n_lines(n)
   local buf = api.nvim_get_current_buf()
-  if not M.visible(buf) then
+  if not fresh(buf) then
     return false
   end
   n = n or read_count()
@@ -764,7 +784,7 @@ end
 ---@return boolean
 function M.cycle(dir)
   local buf = api.nvim_get_current_buf()
-  if not M.visible(buf) then
+  if not fresh(buf) then
     return false
   end
   local st = states[buf]
@@ -908,6 +928,15 @@ function M.attach()
       M.reset(ev.buf)
     end,
   })
+  -- i_CTRL-C leaves Insert mode without InsertLeave: the ghost would stay in Normal mode, the request running
+  api.nvim_create_autocmd("ModeChanged", {
+    group = group,
+    pattern = "[iR]*:[^iR]*",
+    desc = "slop: complete clear (Insert mode left)",
+    callback = function(ev)
+      M.reset(ev.buf)
+    end,
+  })
   api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     group = group,
     desc = "slop: complete forget buffer",
@@ -920,9 +949,14 @@ function M.attach()
     pattern = "SlopConfigChanged",
     desc = "slop: complete reconfigure",
     callback = function()
-      local ok, c = pcall(require("slop.config").get, "complete")
-      if ok and c then
+      local config = require("slop.config")
+      local ok, c = pcall(config.get, "complete")
+      -- an invalid config was reported by config.get(); applying it would throw on every keystroke
+      if ok and c and c.enabled and #config.errors("complete") == 0 then
         M.configure(c)
+        if c.frontend ~= "virtualtext" then
+          require("slop.modules.complete.cmp").ensure() -- (the source is only registered for a cmp frontend)
+        end
       end
     end,
   })
