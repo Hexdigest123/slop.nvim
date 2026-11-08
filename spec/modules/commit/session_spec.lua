@@ -166,6 +166,21 @@ describe("commit module", function()
     assert.matches("%+fine", user)
   end)
 
+  it("absolute secrets.block globs apply to the repo-relative paths of the diff", function()
+    require("slop").setup({ secrets = { block = { ".env*", dir .. "/private/**" } } })
+    h.write(dir .. "/private/notes.txt", "PRIVATE_NOTE=dontsendme\n")
+    h.write(dir .. "/ok.txt", "fine\n")
+    sh(dir, { "add", "-f", "private/notes.txt", "ok.txt" })
+    open()
+    wait(function()
+      return #calls == 1
+    end)
+    local user = calls[1].req.messages[2].content
+    assert.falsy(user:find("dontsendme", 1, true), user)
+    assert.matches("%[slop: diff of private/notes%.txt omitted%]", user)
+    assert.matches("%+fine", user)
+  end)
+
   it("discards a stale result when the user typed a message meanwhile", function()
     h.write(dir .. "/a.txt", "x\n")
     sh(dir, { "add", "a.txt" })
@@ -470,5 +485,61 @@ describe("commit module", function()
     vim.cmd.enew()
     assert.is_false(commit.generate(0))
     assert.is_nil(commit.state(0))
+  end)
+
+  it("a message typed right before the accept key (no TextChangedI yet) is not glued to it", function()
+    h.write(dir .. "/a.txt", "race\n")
+    sh(dir, { "add", "a.txt" })
+    local buf = open()
+    wait(function()
+      return #calls == 1
+    end)
+    calls[1].done("```text\nfeat: ghost\n```")
+    assert.is_true(commit.is_visible(buf))
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    h.feed("ix<C-y><Esc>") -- one burst: Vim fires TextChangedI only when no key is pending
+    assert.equal("x", lines(buf)[1])
+    assert.is_false(ghost.is_visible(buf))
+    assert.equal("stale", commit.state(buf).status)
+  end)
+
+  it("health never prints an api_key value that is not an env var name", function()
+    local orig = vim.health
+    for _, pasted in ipairs({ "sk-live-PASTED0123456789abcdef", "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" }) do
+      require("slop").setup({
+        ai = {
+          providers = {
+            p = { kind = "chat", service = "mistral", url = "http://127.0.0.1:9", model = "m", api_key = pasted },
+          },
+        },
+        commit = { provider = "p" },
+      })
+      local out = {}
+      vim.health = setmetatable({}, {
+        __index = function(_, kind)
+          return function(msg, advice)
+            out[#out + 1] = kind .. ": " .. tostring(msg) .. " " .. vim.inspect(advice)
+          end
+        end,
+      })
+      local ok, err = pcall(require("slop.modules.commit").health)
+      vim.health = orig
+      assert(ok, err)
+      local all = table.concat(out, "\n")
+      assert.is_nil(all:find(pasted, 1, true), all)
+      assert.matches(pasted:find("-", 1, true) and "environment variable NAME" or "named by api_key", all)
+    end
+  end)
+
+  it("unloading the buffer drops its autocmds (no stacking when it is loaded again)", function()
+    local buf = open({ "fix: written", "", "# comment" })
+    wait(function()
+      return commit.state(buf) ~= nil
+    end)
+    assert.truthy(#vim.api.nvim_get_autocmds({ group = "slop.commit", buffer = buf }) > 0)
+    vim.cmd.enew()
+    vim.cmd("bunload " .. buf)
+    assert.is_nil(commit.state(buf))
+    assert.same({}, vim.api.nvim_get_autocmds({ group = "slop.commit", buffer = buf }))
   end)
 end)

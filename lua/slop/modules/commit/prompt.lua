@@ -95,8 +95,9 @@ end
 --- Defence in depth after core.secrets.redact_diff (which works line by line): re-run the secret rules over each
 --- hunk's content as a whole, so multi-line rules (PEM private-key blocks) also apply inside diffs.
 ---@param diff string  a/ b/ headers (see sanitize_diff)
+---@param root? string  the repository the paths are relative to (their rules are looked up by absolute path)
 ---@return string diff, integer n
-function M.redact_hunks(diff)
+function M.redact_hunks(diff, root)
   local secrets = require("slop.core.secrets")
   local out, n = {}, 0
   local path, signs, bodies = nil, {}, {}
@@ -119,7 +120,7 @@ function M.redact_hunks(diff)
     else
       flush()
       if b then
-        path, in_hunk = b, false
+        path, in_hunk = (root and not vim.startswith(b, "/")) and vim.fs.joinpath(root, b) or b, false
       elseif vim.startswith(l, "@@") then
         in_hunk = true
       elseif not sign and l ~= "" and not vim.startswith(l, "\\") then

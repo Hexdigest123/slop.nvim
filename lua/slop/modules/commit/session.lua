@@ -297,8 +297,9 @@ local function gather(st, parsed, opts, cb)
     local secrets = require("slop.core.secrets")
     local prompt = require("slop.modules.commit.prompt")
     local diff = prompt.sanitize_diff(raw.diff)
-    diff = secrets.redact_diff(diff)
-    diff = prompt.redact_hunks(diff)
+    -- the diff's paths are relative to the repository: with its root, absolute / ~/ block globs apply too
+    diff = secrets.redact_diff(diff, { root = root })
+    diff = prompt.redact_hunks(diff, root)
     local budgeted, files, cut = prompt.budget_diff(diff, { max_chars = c.max_diff_chars, summarize = c.summarize })
     local function red(list)
       return vim.tbl_map(function(s)
@@ -510,7 +511,8 @@ function M.attach(buf, opts)
   local st = { buf = buf, kind = kind, status = "idle", seq = 0, variants = {}, index = 0, attempt = 0, initial = {} }
   states[buf] = st
   local group = util().augroup("commit")
-  api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
+  local ids = {} ---@type integer[]
+  ids[1] = api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = group,
     buf = buf,
     desc = "slop: commit: discard stale suggestions",
@@ -520,7 +522,7 @@ function M.attach(buf, opts)
       end
     end,
   })
-  api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
+  ids[2] = api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     group = group,
     buf = buf,
     desc = "slop: commit: forget buffer",
@@ -529,7 +531,11 @@ function M.attach(buf, opts)
       if states[buf] == st then
         states[buf] = nil
       end
-      return true
+      -- an unloaded buffer keeps its buffer-local autocmds (returning true would only drop the BufUnload one):
+      -- loading it again attaches anew
+      for _, id in ipairs(ids) do
+        pcall(api.nvim_del_autocmd, id)
+      end
     end,
   })
   with_comment_char(st, function()
@@ -644,12 +650,28 @@ function M.regenerate(buf)
   return M.generate(buf, { force = true })
 end
 
+--- The state of `buf` when its commit suggestion is visible, after the text typed since the last TextChanged* was
+--- looked at: Vim fires those only when no key is pending (fast typing, mappings, macros), and a message typed right
+--- before the accept key would get the suggestion glued to it (or be dropped by next's regeneration).
+---@param buf integer
+---@return slop.commit.State?
+local function shown(buf)
+  local st = states[buf]
+  if st then
+    check_stale(st)
+  end
+  if not st or not ours(buf) then
+    return nil
+  end
+  return st
+end
+
 ---@param buf? integer
 ---@return boolean accepted  false when no commit suggestion is visible (keymaps fall through)
 function M.accept(buf)
   buf = resolve(buf)
-  local st = states[buf]
-  if not st or not ours(buf) then
+  local st = shown(buf)
+  if not st then
     return false
   end
   if st.status == "streaming" then
@@ -681,8 +703,8 @@ end
 ---@return boolean
 function M.next(buf)
   buf = resolve(buf)
-  local st = states[buf]
-  if not st or not ours(buf) then
+  local st = shown(buf)
+  if not st then
     return false
   end
   if st.status == "streaming" then
@@ -700,8 +722,8 @@ end
 ---@return boolean
 function M.prev(buf)
   buf = resolve(buf)
-  local st = states[buf]
-  if not st or not ours(buf) then
+  local st = shown(buf)
+  if not st then
     return false
   end
   if st.status == "streaming" or #st.variants < 2 then

@@ -91,10 +91,11 @@ below the scissors line, so slop sees exactly that diff, whatever you ran
    - comment lines are dropped, because git would strip them;
    - the body is wrapped at 'textwidth' (default 72) when `wrap` is set.
 6. If you type a message while a request is running, the request is cancelled
-   and its result discarded. Accepting inserts the text above git's comment
-   block as one undo step. If a request fails (e.g. a timeout while
-   streaming), its partial text is removed; the previous variant, if any, is
-   shown again.
+   and its result discarded; a suggestion already shown is dropped too, also
+   when an accept key follows right away. Accepting inserts the text above
+   git's comment block as one undo step. If a request fails (e.g. a timeout
+   while streaming), its partial text is removed; the previous variant, if
+   any, is shown again.
 
 ==============================================================================
 3. KEYMAPS                                               *slop-commit-keymaps*

@@ -269,11 +269,16 @@ return {
       h.error(("provider `%s` has kind `%s`; commit needs a chat provider"):format(c.provider, tostring(p.kind)))
     else
       local src, var = ai.api_key_source(p)
-      local set = src ~= "env" or ((os.getenv(var or "") or "") ~= "")
-      if set then
-        h.ok(("provider `%s` (%s)"):format(c.provider, p.model))
+      local name = tostring(var)
+      local valid = src ~= "env" or ai.valid_var(var)
+      local unset = src == "env" and valid and (os.getenv(name) or "") == ""
+      if not valid then
+        -- never echo the value: it is most likely the key itself
+        h.error(("provider `%s`: %s"):format(c.provider, ai.NOT_A_NAME))
+      elseif unset then
+        h.warn(("provider `%s`: %s is NOT set"):format(c.provider, ai.var_label(name)))
       else
-        h.warn(("provider `%s`: $%s is NOT set"):format(c.provider, var))
+        h.ok(("provider `%s` (%s)"):format(c.provider, p.model))
       end
     end
     h.info(
