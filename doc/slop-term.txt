@@ -106,8 +106,10 @@ Defaults: >lua
 <
 Sizes (`float.width`, `float.height`, `split.size`, `vsplit.size`): a number
 in (0, 1] is a fraction of the editor, a number > 1 is cells, a function
-`fun(columns, lines): integer` is computed (and re-evaluated on |VimResized|).
-Float sizes are the content size; the border is drawn around it.
+`fun(columns, lines): integer` is computed. Float sizes are the content size
+(the border is drawn around it) and are re-evaluated on |VimResized|. A split
+gets its size when it first opens and keeps it ('winfixheight' /
+'winfixwidth'); hidden and shown again, it has the size it was left with.
 
 `shell`: a string is a program, or a program and its arguments, like the
 default 'shell' (e.g. `set shell=zsh\ -l`); a program path may contain spaces
