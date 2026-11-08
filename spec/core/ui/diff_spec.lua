@@ -251,6 +251,48 @@ describe("core.ui.diff", function()
       assert.equal("rejected", done)
     end)
 
+    it("undoing a reject that had its own undo block brings the hunk back; redo rejects it again", function()
+      local buf = new_buf({ "a", "b", "c", "d", "e", "tail" })
+      api.nvim_set_current_buf(buf)
+      local done
+      local hd = diff.show(buf, { 0, 5 }, { "A1", "A2", "A3", "c", "D", "e" }, {
+        on_done = function(r)
+          done = r
+        end,
+      })
+      local function changed()
+        api.nvim_exec_autocmds("TextChanged", { buf = buf })
+      end
+      break_undo()
+      api.nvim_buf_set_lines(buf, 6, 7, false, { "TAIL" }) -- the user edits while reviewing
+      break_undo()
+      assert.is_true(hd:reject(1)) -- cannot be undojoined any more: its own undo block
+      assert.same({ "a", "b", "c", "D", "e", "TAIL" }, lines(buf))
+      break_undo()
+      vim.cmd("silent undo") -- the user takes the reject back
+      changed()
+      assert.same({ "A1", "A2", "A3", "c", "D", "e", "TAIL" }, lines(buf))
+      assert.equal("pending", hd:hunks()[1].state)
+      assert.equal(hd:hunks()[1], hd:hunk_at(2))
+      assert.same({ "a", "b", "d" }, virt_texts(buf))
+      vim.cmd("silent redo")
+      changed()
+      assert.equal("rejected", hd:hunks()[1].state)
+      assert.same({ "d" }, virt_texts(buf))
+      vim.cmd("silent undo")
+      changed()
+      assert.equal("pending", hd:hunks()[1].state)
+      -- a new change after the undo starts another undo branch: the reject stays undone
+      break_undo()
+      api.nvim_buf_set_lines(buf, 6, 7, false, { "TAIL2" })
+      break_undo()
+      changed()
+      assert.equal("pending", hd:hunks()[1].state)
+      hd:reject_all()
+      assert.same({ "a", "b", "c", "d", "e", "TAIL2" }, lines(buf))
+      assert.equal("rejected", done)
+    end)
+
     it("reject_all restores the old text when 'undolevels' is -1", function()
       local buf = new_buf({ "x", "y" })
       vim.bo[buf].undolevels = -1
@@ -269,6 +311,98 @@ describe("core.ui.diff", function()
       api.nvim_win_set_cursor(0, { 3, 0 })
       assert.is_true(hd:reject())
       assert.same({ "one", "mine", "two", "three" }, lines(buf))
+    end)
+
+    it("range(): a line opened right above the review is not part of it; rejected first hunks are", function()
+      local buf = new_buf({ "x", "a", "b", "y" })
+      api.nvim_set_current_buf(buf)
+      local hd = diff.show(buf, { 1, 3 }, { "A", "B" })
+      break_undo()
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      h.feed("Omine<Esc>", "nx")
+      assert.same({ 2, 4 }, hd:range()) -- edit's refine re-reads the original region from here
+      hd:close()
+      assert.same({ "x", "mine", "a", "b", "y" }, lines(buf))
+
+      -- rejecting the hunk at the region's first row: the restored lines stay in the range
+      local del = new_buf({ "x", "a", "b", "c", "y" })
+      local hd2 = diff.show(del, { 1, 5 }, { "c", "Y" }) -- deletes "a", "b" at the region start
+      assert.same({ 1, 3 }, hd2:range())
+      assert.is_true(hd2:reject(1))
+      assert.same({ "x", "a", "b", "c", "Y" }, lines(del))
+      assert.same({ 1, 5 }, hd2:range())
+      hd2:close()
+
+      local chg = new_buf({ "a", "b", "c", "d", "e" })
+      local hd3 = diff.show(chg, { 0, 4 }, { "A1", "A2", "A3", "c", "D" }) -- 2 lines -> 3 at the region start
+      assert.equal(2, #hd3:hunks())
+      assert.same({ 0, 5 }, hd3:range())
+      assert.is_true(hd3:reject(1))
+      assert.same({ "a", "b", "c", "D", "e" }, lines(chg))
+      assert.same({ 0, 4 }, hd3:range())
+      hd3:close()
+    end)
+
+    it("range() of an empty preview at the end of the buffer is empty there", function()
+      local buf = new_buf({ "a", "b", "c", "d" })
+      api.nvim_set_current_buf(buf)
+      local refined = 0
+      local hd = diff.show(buf, { 2, 4 }, {}, { -- the last lines deleted
+        on_refine = function()
+          refined = refined + 1
+        end,
+      })
+      assert.same({ "a", "b" }, lines(buf))
+      assert.same({ 2, 2 }, hd:range())
+      api.nvim_win_set_cursor(0, { 1, 0 }) -- "a" is neither the review nor next to it: the keys fall through
+      h.feed("<C-r>")
+      assert.equal(0, refined)
+      api.nvim_win_set_cursor(0, { 2, 0 }) -- the deleted lines are shown below "b"
+      h.feed("<C-r>")
+      assert.equal(1, refined)
+      assert.is_true(hd:reject(1))
+      assert.same({ "a", "b", "c", "d" }, lines(buf))
+      -- an empty preview elsewhere keeps its empty range at the deletion point
+      local mid = new_buf({ "a", "b", "c", "d" })
+      local hd2 = diff.show(mid, { 1, 3 }, {})
+      assert.same({ "a", "d" }, lines(mid))
+      assert.same({ 1, 1 }, hd2:range())
+      hd2:close()
+    end)
+
+    it("a new review over rows another review has pending takes them over", function()
+      local buf = new_buf({ "fn()", "body", "end", "x", "tail" })
+      local done1
+      local h1 = diff.show(buf, { 0, 4 }, { "-- doc v1", "fn()", "body", "end", "X" }, {
+        on_done = function(r)
+          done1 = r
+        end,
+      })
+      assert.equal(2, #h1:hunks())
+      -- the doc key again on the same item: the shown (v1) doc is rewritten by a second review
+      local h2 = diff.show(buf, { 0, 1 }, { "-- doc v2" })
+      assert.equal("accepted", h1:hunks()[1].state) -- kept: it is the text the new review starts from
+      assert.equal("pending", h1:hunks()[2].state) -- elsewhere: still under review
+      assert.is_true(h1:is_active())
+      h2:accept_all()
+      h1:reject_all() -- must not revert the newer, accepted text
+      assert.same({ "-- doc v2", "fn()", "body", "end", "x", "tail" }, lines(buf))
+      assert.equal("partial", done1)
+
+      -- a deletion at the edge of the new rows stays under review: rejecting it puts its lines back next to them
+      local b2 = new_buf({ "a", "gone", "b", "c" })
+      local h3 = diff.show(b2, { 1, 2 }, {})
+      local h4 = diff.show(b2, { 1, 2 }, { "B" })
+      assert.equal("pending", h3:hunks()[1].state)
+      h4:accept_all()
+      h3:reject_all()
+      assert.same({ "a", "gone", "B", "c" }, lines(b2))
+      -- an insertion inside another review's pending hunk takes that hunk over
+      local b3 = new_buf({ "a", "b", "c" })
+      local h5 = diff.show(b3, { 0, 3 }, { "A1", "A2", "A3" })
+      diff.show(b3, { 1, 1 }, { "between" })
+      assert.is_false(h5:is_active())
+      assert.same({ "A1", "between", "A2", "A3" }, lines(b3))
     end)
 
     it("restores EOF deletions after an empty last line and a whole-buffer deletion exactly", function()

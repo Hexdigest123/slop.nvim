@@ -58,16 +58,23 @@ function M.name(buf)
   return type(n) == "string" and n or nil
 end
 
---- Existing scratch buffer by name (nil if none / wiped).
+--- Buffer called "slop://<name>" (whatever its state), or -1.
+---@param name string
+---@return integer
+local function by_name(name)
+  return vim.fn.bufnr("^" .. vim.fn.escape(PREFIX .. name, "\\/.*$^~[]") .. "$")
+end
+
+--- Existing scratch buffer by name (nil if none / wiped / :bdelete'd, which resets its options and variables).
 ---@param name string
 ---@return integer?
 function M.find(name)
   local b = bufs[name]
-  if b and api.nvim_buf_is_valid(b) then
+  if b and M.name(b) == name then
     return b
   end
   bufs[name] = nil
-  local nr = vim.fn.bufnr("^" .. vim.fn.escape(PREFIX .. name, "\\/.*$^~[]") .. "$")
+  local nr = by_name(name)
   if nr > 0 and M.name(nr) == name then
     bufs[name] = nr
     return nr
@@ -102,14 +109,22 @@ function M.get(name, opts)
   augroup()
   local buf = M.find(name)
   if not buf then
-    buf = api.nvim_create_buf(false, true)
+    -- a buffer still called slop://<name> lost its scratch state (:bdelete unloads it and resets its options and
+    -- variables): set it up again, a new buffer could not take the name (E95)
+    local stale = by_name(name)
+    buf = stale > 0 and stale or api.nvim_create_buf(false, true)
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].bufhidden = "hide"
     vim.bo[buf].swapfile = false
     vim.bo[buf].buflisted = false
     vim.bo[buf].undolevels = -1
+    if not api.nvim_buf_is_loaded(buf) then
+      vim.fn.bufload(buf)
+    end
     vim.b[buf].slop_scratch = name
-    pcall(api.nvim_buf_set_name, buf, PREFIX .. name)
+    if stale <= 0 then
+      pcall(api.nvim_buf_set_name, buf, PREFIX .. name)
+    end
     vim.bo[buf].modifiable = opts.modifiable == true
     bufs[name] = buf
   end

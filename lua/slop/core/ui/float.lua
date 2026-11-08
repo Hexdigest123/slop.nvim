@@ -51,6 +51,7 @@ local api = vim.api
 ---@field private _own boolean           buffer created by open()
 ---@field private _au integer[]
 ---@field private _closed boolean
+---@field private _keys {key: string, fn: function, saved: table?}[]  close_keys mapped on a caller's buffer
 local Handle = {}
 Handle.__index = Handle
 
@@ -243,8 +244,19 @@ function Handle:_finish()
     pcall(api.nvim_del_autocmd, id)
   end
   if not self._own and api.nvim_buf_is_valid(self.buf) then
-    for _, key in ipairs(self.opts.close_keys or {}) do
-      pcall(vim.keymap.del, "n", key, { buf = self.buf })
+    -- a caller's buffer: remove our close keys (unless mapped anew since) and give back the buffer's own mappings
+    for _, k in ipairs(self._keys) do
+      local cur = api.nvim_buf_call(self.buf, function()
+        return vim.fn.maparg(k.key, "n", false, true)
+      end)
+      if type(cur) == "table" and cur.callback == k.fn then
+        pcall(vim.keymap.del, "n", k.key, { buf = self.buf })
+        if k.saved then
+          pcall(api.nvim_buf_call, self.buf, function()
+            vim.fn.mapset("n", false, k.saved)
+          end)
+        end
+      end
     end
   end
   if self.opts.on_close then
@@ -305,7 +317,8 @@ function M.open(opts)
     api.nvim_set_option_value(k, v, { win = win, scope = "local" })
   end
 
-  local h = setmetatable({ buf = buf, win = win, opts = opts, _own = own, _au = {}, _closed = false }, Handle)
+  local h =
+    setmetatable({ buf = buf, win = win, opts = opts, _own = own, _au = {}, _closed = false, _keys = {} }, Handle)
   handles[win] = h
 
   h._au[#h._au + 1] = api.nvim_create_autocmd("WinClosed", {
@@ -331,9 +344,20 @@ function M.open(opts)
     })
   end
   for _, key in ipairs(opts.close_keys or {}) do
-    require("slop.core.keymaps").set_buf(buf, "n", key, function()
+    local saved
+    if not own then
+      saved = api.nvim_buf_call(buf, function()
+        return vim.fn.maparg(key, "n", false, true)
+      end)
+      if not (type(saved) == "table" and (saved.buf or saved.buffer) == 1) then
+        saved = nil -- (not buffer-local)
+      end
+    end
+    local function close()
       h:close()
-    end, { desc = "close float", nowait = true })
+    end
+    require("slop.core.keymaps").set_buf(buf, "n", key, close, { desc = "close float", nowait = true })
+    h._keys[#h._keys + 1] = { key = key, fn = close, saved = saved }
   end
   ensure_resize()
   return h

@@ -143,6 +143,35 @@ describe("core.ui.ghost", function()
     assert.are.same({ "", "# comment" }, lines())
   end)
 
+  it("a Normal-mode accept puts the cursor on the first byte of a multibyte last character", function()
+    for _, case in ipairs({
+      { "feat: café", 9 }, -- "é" is bytes 9-10
+      { "fix: cafe\204\129", 8 }, -- "e" + U+0301 COMBINING ACUTE ACCENT: one character, bytes 8-10
+    }) do
+      api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
+      api.nvim_win_set_cursor(0, { 1, 0 })
+      ghost.show(buf, 0, 0, case[1])
+      assert.is_true(ghost.accept(buf))
+      assert.same({ 1, case[2] }, api.nvim_win_get_cursor(0), case[1])
+    end
+    -- typing there must not split the character
+    h.feed("iX<Esc>", "nx")
+    assert.are.same({ "fix: cafXe\204\129" }, lines())
+  end)
+
+  it("expands tabs to the next tab stop, as the accepted text will be shown", function()
+    vim.bo[buf].tabstop = 8
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "\tab", "" })
+    ghost.show(buf, 0, 3, "c\td\nx\ty\n\tz")
+    local d = marks()[1][4]
+    -- "\tab" is 10 cells wide: "c" ends at cell 11, its tab reaches the stop at 16
+    assert.equal("c     d", d.virt_text[1][1])
+    assert.equal("x       y", d.virt_lines[1][1][1])
+    assert.equal("        z", d.virt_lines[2][1][1])
+    assert.is_true(ghost.accept(buf))
+    assert.are.same({ "\tabc\td", "x\ty", "\tz", "" }, lines())
+  end)
+
   it("accept keeps a buffer-local 'undolevels' local and leaves the global one alone", function()
     local global = vim.go.undolevels
     vim.bo[buf].undolevels = -1 -- e.g. a big-file helper; slop's own scratch buffers do the same

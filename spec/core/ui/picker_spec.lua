@@ -184,6 +184,44 @@ describe("core.ui.picker", function()
       assert.equal("vsplit", got.action)
     end)
 
+    it("selecting or cancelling from Insert mode leaves the source window's cursor where it was", function()
+      local src = vim.api.nvim_get_current_win()
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { "hello wörld foo" })
+      for _, key in ipairs({ "<CR>", "<Esc>", "<C-c>" }) do
+        vim.api.nvim_win_set_cursor(src, { 1, 7 }) -- on "ö" (2 bytes)
+        local _, got = open({ "a", "b" })
+        -- (feedkeys runs before startinsert! takes effect: enter Insert mode by hand, as a user would be in it)
+        h.feed("i" .. key)
+        wait_for(function()
+          return got.called == 1
+        end)
+        assert.equal(src, vim.api.nvim_get_current_win())
+        assert.equal("n", vim.api.nvim_get_mode().mode)
+        assert.same({ 1, 7 }, vim.api.nvim_win_get_cursor(src), key)
+      end
+    end)
+
+    it("closing after the user left the prompt does not end Insert mode in the window they went to", function()
+      local src = vim.api.nvim_get_current_win()
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { "abc" })
+      vim.api.nvim_win_set_cursor(src, { 1, 1 })
+      local hd, got = open({ "a", "b" })
+      -- selene: allow(global_usage)
+      _G.slop_test_leave = function()
+        vim.api.nvim_set_current_win(src) -- still inserting, as after a mouse click into another window
+        hd.close()
+      end
+      -- "X" is typed after the close: inserted when Insert mode survived (a Normal-mode X would delete the "a")
+      h.feed("i<Cmd>lua _G.slop_test_leave()<CR>X")
+      -- selene: allow(global_usage)
+      _G.slop_test_leave = nil
+      wait_for(function()
+        return got.called == 1
+      end)
+      assert.is_nil(got.item)
+      assert.are.same({ "aXbc" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    end)
+
     it("cancel calls on_select(nil) exactly once", function()
       local hd, got = open({ "a" })
       hd.close()
@@ -227,6 +265,29 @@ describe("core.ui.picker", function()
       assert.equal(2, vim.api.nvim_win_get_cursor(hd._handles.preview.win)[1])
       assert.equal("lua", vim.bo[hd._bufs.preview].filetype)
       assert.equal(dir .. "/x.lua", vim.b[hd._bufs.preview].slop_secret_path)
+      hd.close()
+    end)
+
+    it("lines previews of a file are tagged with its path, so cloak masks them like the file", function()
+      vim.o.columns, vim.o.lines = 160, 50
+      local items = { { text = "req" }, { text = "plain" } }
+      local hd = open(items, {
+        preview = function(it)
+          if it.text == "req" then
+            -- e.g. rest: one request block of an .http file
+            return { lines = { "GET https://x", "Authorization: Bearer abc" }, path = "/p/api.http" }
+          end
+          return { lines = { "nothing secret" } }
+        end,
+      })
+      local pbuf = hd._bufs.preview
+      assert.are.same({ "GET https://x", "Authorization: Bearer abc" }, vim.api.nvim_buf_get_lines(pbuf, 0, -1, false))
+      assert.equal("/p/api.http", vim.b[pbuf].slop_secret_path)
+      assert.equal("http", vim.bo[pbuf].filetype)
+      assert.is_true(require("slop.core.secrets").is_cloaked(pbuf))
+      hd._move(1)
+      -- the next preview is not that file any more
+      assert.is_nil(vim.b[pbuf].slop_secret_path)
       hd.close()
     end)
 

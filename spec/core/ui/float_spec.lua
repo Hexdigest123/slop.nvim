@@ -113,6 +113,31 @@ describe("core.ui.float", function()
     assert.is_false(f:is_valid())
   end)
 
+  it("close_keys on a caller's buffer give back its own mapping and leave a newer one alone", function()
+    local buf = api.nvim_create_buf(false, true)
+    local function q_desc()
+      for _, m in ipairs(api.nvim_buf_get_keymap(buf, "n")) do
+        if m.lhs == "q" then
+          return m.desc
+        end
+      end
+    end
+    vim.keymap.set("n", "q", "<Nop>", { buf = buf, desc = "own q" })
+    local f = float.open({ buf = buf, close_keys = { "q" } })
+    assert.equal("slop: close float", q_desc())
+    f:close()
+    assert.equal("own q", q_desc())
+    -- mapped after open() (rest maps its result keys right after showing the buffer): not ours to delete
+    local f2 = float.open({ buf = buf, close_keys = { "q" } })
+    vim.keymap.set("n", "q", "<Nop>", { buf = buf, desc = "newer q" })
+    f2:close()
+    assert.equal("newer q", q_desc())
+    vim.keymap.del("n", "q", { buf = buf })
+    local f3 = float.open({ buf = buf, close_keys = { "q" } })
+    api.nvim_win_close(f3.win, true)
+    assert.is_nil(q_desc())
+  end)
+
   it("close_on_leave closes it when focus leaves", function()
     local prev = api.nvim_get_current_win()
     local f = float.open({ close_on_leave = true })

@@ -15,9 +15,10 @@ local api = vim.api
 
 ---@class slop.picker.Preview
 ---@field lines? string[]                 literal preview content
----@field path? string                    or preview a file ...
+---@field path? string                    or preview a file ... (with `lines`: the file they come from, so cloak
+---                                       masks them like that file)
 ---@field lnum? integer                   ... at this line (1-based)
----@field filetype? string
+---@field filetype? string                default: detected from `path`
 
 ---@alias slop.picker.Chunks {[1]: string, [2]: string?}[]
 
@@ -174,6 +175,7 @@ local function fill_preview(buf, pv)
   if type(pv) ~= "table" then
     pv = nil -- preview() returned something unusable: show nothing rather than throw
   end
+  local path = pv and type(pv.path) == "string" and pv.path ~= "" and pv.path or nil
   if pv then
     if pv.lines then
       -- nvim_buf_set_lines() rejects items containing "\n": split them into lines
@@ -181,14 +183,16 @@ local function fill_preview(buf, pv)
       for _, l in ipairs(pv.lines) do
         vim.list_extend(lines, vim.split(tostring(l), "\n", { plain = true }))
       end
-    elseif pv.path then
+      ft = path and vim.filetype.match({ filename = path }) or nil
+    elseif path then
       local content
-      lines, content = read_preview(pv.path)
-      ft = content and vim.filetype.match({ filename = pv.path }) or nil
-      vim.b[buf].slop_secret_path = pv.path
+      lines, content = read_preview(path)
+      ft = content and vim.filetype.match({ filename = path }) or nil
     end
     ft = pv.filetype or ft
   end
+  -- cloak masks the preview like the file it shows (lines from a file too), not like a file shown before
+  vim.b[buf].slop_secret_path = path
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
@@ -442,13 +446,26 @@ local function pick_builtin(items, opts)
 
   local function close_all()
     state.closing = true
+    -- only end Insert mode when the prompt is focused: a user who left it for another window (a mouse click in
+    -- Insert mode) stays in the mode they are in there
+    local focused = handles.prompt ~= nil
+      and handles.prompt:is_valid()
+      and api.nvim_get_current_win() == handles.prompt.win
     for _, h in pairs(handles) do
       if h:is_valid() then
         h:close()
       end
     end
-    if api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    if focused and api.nvim_get_mode().mode:sub(1, 1) == "i" then
       vim.cmd("stopinsert")
+      -- :stopinsert ends Insert mode after the current key, in the window we are back in now, and moves its cursor
+      -- one character left (like <Esc>): one character right first, so it stays where it was
+      local win = api.nvim_get_current_win()
+      local cur = api.nvim_win_get_cursor(win)
+      local line = api.nvim_buf_get_lines(api.nvim_win_get_buf(win), cur[1] - 1, cur[1], false)[1] or ""
+      if cur[2] < #line then
+        pcall(api.nvim_win_set_cursor, win, { cur[1], cur[2] + 1 })
+      end
     end
   end
   local function cancel()

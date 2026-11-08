@@ -217,6 +217,18 @@ local function cells(n)
   end
 end
 
+--- :stopinsert ends Insert mode only after the current key, in the window that is current by then, and moves that
+--- window's cursor one character left, like <Esc>. When the prompt closes that is the window the user came from: put
+--- its cursor one character right first, so it ends up where it was.
+local function keep_cursor_after_stopinsert()
+  local win = api.nvim_get_current_win()
+  local cur = api.nvim_win_get_cursor(win)
+  local line = api.nvim_buf_get_lines(api.nvim_win_get_buf(win), cur[1] - 1, cur[1], false)[1] or ""
+  if cur[2] < #line then
+    pcall(api.nvim_win_set_cursor, win, { cur[1], cur[2] + 1 })
+  end
+end
+
 local function source_win(opts)
   if opts.win and api.nvim_win_is_valid(opts.win) then
     return opts.win
@@ -299,7 +311,8 @@ function M.open(opts)
     -- only touch the mode and the focus when the prompt itself is focused: a user who left it for another
     -- window (cancel on leave) stays where they went, in the mode they are in
     local was_current = fh ~= nil and fh:is_valid() and api.nvim_get_current_win() == fh.win
-    if was_current and api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    local stop = was_current and api.nvim_get_mode().mode:sub(1, 1) == "i"
+    if stop then
       vim.cmd.stopinsert()
     end
     if fh and fh:is_valid() then
@@ -308,13 +321,21 @@ function M.open(opts)
     if was_current then
       restore_focus()
     end
-    if text then
-      if opts.history then
-        add_history(opts.history, text, hist_buf)
+    local ok, err = pcall(function()
+      if text then
+        if opts.history then
+          add_history(opts.history, text, hist_buf)
+        end
+        opts.on_submit(text)
+      elseif opts.on_cancel then
+        opts.on_cancel()
       end
-      opts.on_submit(text)
-    elseif opts.on_cancel then
-      opts.on_cancel()
+    end)
+    if stop then
+      keep_cursor_after_stopinsert() -- after the callbacks: in the window Insert mode will end in
+    end
+    if not ok then
+      error(err, 0)
     end
   end
 

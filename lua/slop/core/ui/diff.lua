@@ -30,6 +30,7 @@ local util = require("slop.core.util")
 ---@field state "pending"|"accepted"|"rejected"
 ---@field mark? integer                    tracking extmark (internal)
 ---@field eof? boolean                     pure deletion at the end of the buffer (internal)
+---@field seq? integer                     undo number of the change that rejected it (internal)
 
 ---@class slop.diff.Opts
 ---@field keymaps? table<string, string|false>  accept, reject, accept_all, reject_all, next, prev, refine (buffer-local)
@@ -143,6 +144,30 @@ local function undotree(buf)
   end)
 end
 
+--- Is the change with undo number `seq` part of the buffer's current state (on the undo-tree path to `seq_cur`,
+--- which undotree() lists at the top level)? 0 (no undo information) and changes undo can no longer reach count as
+--- applied.
+---@param ut table  undotree()
+---@param seq integer
+---@return boolean
+local function applied(ut, seq)
+  if seq <= 0 then
+    return true
+  elseif seq > ut.seq_cur then
+    return false
+  end
+  local entries = ut.entries or {}
+  if #entries == 0 or seq < entries[1].seq then
+    return true
+  end
+  for _, e in ipairs(entries) do
+    if e.seq == seq then
+      return true
+    end
+  end
+  return false
+end
+
 --- Rows [s, e) currently covered by a tracking mark.
 ---@return integer? s, integer? e
 local function mark_rows(buf, id, eof)
@@ -199,6 +224,7 @@ end
 ---@field private _seq integer?          undo seq of our latest change
 ---@field private _seq_base integer?     undo seq right after the initial apply
 ---@field private _region integer?       tracking mark of the whole preview
+---@field private _region_eof boolean?   an empty preview at the end of the buffer (the region is a point)
 ---@field private _decor table<integer, integer[]>
 ---@field private _done boolean
 local Handle = {}
@@ -220,7 +246,7 @@ function Handle:range()
   if not self._region or not util.buf_valid(self.buf) then
     return nil
   end
-  local s, e = mark_rows(self.buf, self._region)
+  local s, e = mark_rows(self.buf, self._region, self._region_eof)
   if not s then
     return nil
   end
@@ -524,7 +550,24 @@ end
 function Handle:_revert(h)
   local s, e = self:_rows(h)
   if s then
+    local r = self:range()
     replace_rows(self.buf, s, e, h.old_lines)
+    if r and r[1] == s then
+      -- the restored lines belong to the review region, but its start (right gravity, like the hunks': a line the
+      -- user opens above the review is not part of it) moved past them
+      local m = api.nvim_buf_get_extmark_by_id(self.buf, ns_track(), self._region, { details = true })
+      local d = m[3] or {}
+      if m[1] and d.end_row then
+        pcall(api.nvim_buf_set_extmark, self.buf, ns_track(), s, 0, {
+          id = self._region,
+          end_row = d.end_row,
+          end_col = d.end_col,
+          right_gravity = true,
+          end_right_gravity = true,
+          strict = false,
+        })
+      end
+    end
   end
   h.state = "rejected"
   self:_clear_decor(h)
@@ -545,6 +588,7 @@ function Handle:reject(index)
     self:_edit(function()
       self:_revert(h)
     end)
+    h.seq = self._seq -- undo/redo of this change is followed (_sync_undo)
   else
     h.state = "rejected"
   end
@@ -628,6 +672,69 @@ function Handle:reject_all()
     end
   end
   self:_finish()
+end
+
+--- Follow undo/redo of the review's own changes (on TextChanged): undoing the preview closes the review as
+--- "rejected" without touching the buffer again; undoing a reject that got its own undo block (the buffer changed
+--- in between) brings its hunk back for review, redoing it rejects the hunk again.
+---@param ut table  undotree() of the buffer
+function Handle:_sync_undo(ut)
+  if self._seq_base and not applied(ut, self._seq_base) then
+    self._active = false -- user undid the preview: no further edits
+    for _, h in ipairs(self._hunks) do
+      if h.state == "pending" then
+        h.state = "rejected"
+      end
+    end
+    self:_finish("rejected")
+    return
+  end
+  local changed = false
+  for _, h in ipairs(self._hunks) do
+    if h.seq and h.seq ~= self._seq_base then -- (a reject joined to the preview goes with it)
+      local reverted = applied(ut, h.seq)
+      if h.state == "rejected" and not reverted then
+        h.state, changed = "pending", true
+      elseif h.state ~= "rejected" and reverted then
+        h.state, changed = "rejected", true
+        self:_clear_decor(h)
+      end
+    end
+  end
+  if changed then
+    self:_maybe_finish()
+  end
+end
+
+--- Would rejecting hunk rows [hs, he) touch new text in rows [s, e)? An empty range is a point between rows.
+local function overlaps(hs, he, s, e)
+  if hs == he then
+    return s < hs and hs < e -- a deletion: at an edge of the new rows its lines would come back next to them
+  elseif s == e then
+    return hs < s and s < he -- an insertion inside the hunk
+  end
+  return hs < e and s < he
+end
+
+--- Rows [s, e) (equal: an insertion point) are about to be reviewed anew (show()): this review's pending hunks there
+--- leave it as accepted. Their text stays (the new review starts from it); rejecting them later would revert the new
+--- review's text, accepted or not.
+---@param s integer
+---@param e integer
+function Handle:_supersede(s, e)
+  local changed = false
+  for _, h in ipairs(self._hunks) do
+    if h.state == "pending" then
+      local hs, he = self:_rows(h)
+      if hs and overlaps(hs, he, s, e) then
+        h.state, changed = "accepted", true
+        self:_clear_decor(h)
+      end
+    end
+  end
+  if changed then
+    self:_maybe_finish()
+  end
 end
 
 --- Close the review; pending hunks are rejected.
@@ -791,14 +898,8 @@ local function setup_buf(buf, handle)
         end
         local ut = undotree(buf)
         for _, hd in ipairs(vim.list_slice(list)) do
-          if hd._active and hd._seq_base and ut.seq_cur < hd._seq_base then
-            hd._active = false -- user undid the preview: no further edits
-            for _, h in ipairs(hd._hunks) do
-              if h.state == "pending" then
-                h.state = "rejected"
-              end
-            end
-            hd:_finish("rejected")
+          if hd._active then
+            hd:_sync_undo(ut)
           end
         end
       end,
@@ -909,6 +1010,11 @@ function M.show(buf, range, new_lines, opts)
     return self
   end
 
+  -- another review's pending hunks in these rows are taken over (before applying: their marks are in today's rows)
+  for _, other in ipairs(M.list(buf)) do
+    other:_supersede(s, e)
+  end
+
   -- apply bottom-to-top (one tick -> one undo block)
   self:_edit(function()
     for i = #self._hunks, 1, -1 do
@@ -940,13 +1046,19 @@ function M.show(buf, range, new_lines, opts)
       h.mark = api.nvim_buf_set_extmark(buf, track, row, 0, { right_gravity = false })
     end
   end
-  self._region = api.nvim_buf_set_extmark(buf, track, math.min(s, lc - 1), 0, {
-    end_row = math.min(s + #new_lines, lc),
-    end_col = 0,
-    right_gravity = false,
-    end_right_gravity = true,
-    strict = false,
-  })
+  if #new_lines == 0 and s >= lc then
+    -- an empty preview at the end: the region is the point after the last line (like the hunk's), not that line
+    self._region_eof = true
+    self._region = api.nvim_buf_set_extmark(buf, track, lc - 1, #get_line(buf, lc - 1), { right_gravity = true })
+  else
+    self._region = api.nvim_buf_set_extmark(buf, track, math.min(s, lc - 1), 0, {
+      end_row = math.min(s + #new_lines, lc),
+      end_col = 0,
+      right_gravity = true, -- a line opened right above the review is not part of it (_revert keeps our own text in)
+      end_right_gravity = true,
+      strict = false,
+    })
+  end
 
   by_buf[buf] = by_buf[buf] or {}
   table.insert(by_buf[buf], self)

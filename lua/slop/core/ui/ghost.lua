@@ -58,15 +58,33 @@ local function resolve(buf)
   return buf
 end
 
-local function display(s, buf)
-  if s:find("\t", 1, true) then
-    local ts = vim.bo[buf].tabstop
-    s = s:gsub("\t", string.rep(" ", ts > 0 and ts or 8))
+--- Display form of `s` when it starts at display column `col`: virtual text shows a tab as one cell, so tabs are
+--- expanded to the next tab stop (as the text will look once accepted) and other control characters made printable.
+---@param s string
+---@param buf integer
+---@param col? integer
+---@return string text, integer col  display column after the text
+local function display(s, buf, col)
+  col = col or 0
+  if not s:find("%c") then
+    return s, col + api.nvim_strwidth(s)
   end
-  if s:find("%c") then
-    s = vim.fn.strtrans(s)
+  local ts = vim.bo[buf].tabstop
+  ts = ts > 0 and ts or 8
+  local out = {}
+  for seg, tab in s:gmatch("([^\t]*)(\t?)") do
+    if seg:find("%c") then
+      seg = vim.fn.strtrans(seg)
+    end
+    out[#out + 1] = seg
+    col = col + api.nvim_strwidth(seg)
+    if tab ~= "" then
+      local n = ts - col % ts
+      out[#out + 1] = (" "):rep(n)
+      col = col + n
+    end
   end
-  return s
+  return table.concat(out), col
 end
 
 local function counter_text(c, loading)
@@ -108,7 +126,9 @@ local function render(buf, row, col, lines, opts, mark)
     undo_restore = false,
     invalidate = false,
   }
-  local first = display(lines[1] or "", buf)
+  -- the first line continues the buffer line at `col`: its tabs stop where they will once inserted there
+  local _, start = display(line:sub(1, col), buf)
+  local first = display(lines[1] or "", buf, start)
   local vt = {}
   if first ~= "" then
     vt[#vt + 1] = { first, hl }
@@ -288,8 +308,10 @@ local function insert(buf, row, col, part)
   if api.nvim_win_get_buf(win) == buf then
     local mode = api.nvim_get_mode().mode
     local c = ecol
-    if not mode:match("^[iR]") then
-      c = math.max(0, ecol - 1)
+    if not mode:match("^[iR]") and ecol > 0 then
+      -- on the last inserted character: its first byte (inside a multibyte character, typing would split it)
+      local text = api.nvim_buf_get_lines(buf, erow, erow + 1, false)[1] or ""
+      c = math.max(0, vim.fn.byteidx(text, vim.fn.charidx(text, ecol - 1)))
     end
     pcall(api.nvim_win_set_cursor, win, { erow + 1, c })
   end

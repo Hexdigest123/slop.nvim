@@ -78,6 +78,20 @@ describe("core.ui.input", function()
     assert.equal(1, n)
   end)
 
+  it("submitting or cancelling from Insert mode leaves the source window's cursor where it was", function()
+    api.nvim_buf_set_lines(0, 0, -1, false, { "hello wörld foo" })
+    for _, key in ipairs({ "<C-s>", "<C-c>" }) do
+      api.nvim_win_set_cursor(src, { 1, 7 }) -- on "ö" (2 bytes)
+      local hd = input.open({ on_submit = function() end })
+      hd:set_text("x")
+      -- (feedkeys runs before startinsert! takes effect: enter Insert mode by hand, as a user would be in it)
+      h.feed("A" .. key)
+      assert.equal(src, api.nvim_get_current_win())
+      assert.equal("n", api.nvim_get_mode().mode)
+      assert.same({ 1, 7 }, api.nvim_win_get_cursor(src), key)
+    end
+  end)
+
   it("leaving for another window cancels without pulling the focus back", function()
     vim.cmd("vsplit")
     local other = api.nvim_get_current_win()
