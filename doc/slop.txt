@@ -49,7 +49,9 @@ vim.pack: >lua
 <
 There is no need to lazy-load slop itself. If you do (e.g. lazy.nvim
 `event = "VeryLazy"`), the modules that load when a file is read (cloak,
-todo, context) are loaded right away for the files already open.
+todo, context) are loaded right away for the files already open, and the
+modules of a filetype (rest, commit) for the buffers that already have it.
+The same goes for a module that a later `setup()` call enables.
 
 ==============================================================================
 3. CONFIGURATION                                  *slop-config* *slop.setup()*
@@ -80,16 +82,25 @@ Core options: >lua
       },
     }
 <
-`log.max_entries` is the number of messages `:Slop log` keeps (an integer
->= 1). `secrets.block` globs without a "/" match the file name, the others
-match below any directory. `secrets.agent_reads`: "deny" (default): ACP
-agents cannot read blocked files; "allow": they get them with every secret
-value redacted. Agents can never edit, move or delete a blocked file (see
+Options are merged into the defaults, except lists: a list you give
+replaces the default one (to add a glob to `secrets.block`, list the
+defaults too). `log.max_entries` is the number of messages `:Slop log`
+keeps (an integer >= 1). `secrets.block` globs without a "/" match the file
+name, the others match below any directory; a leading `~/` is your home
+directory. `secrets.agent_reads`: "deny"
+(default): ACP agents cannot read blocked files; "allow": slop's own
+`fs/read_text_file` serves them to an agent, with every secret value
+redacted (binary files, with NUL bytes, are still refused). Either way, a
+permission request of an agent's own tool that touches a blocked file is
+rejected (with it, the agent would read the file itself, unredacted), and
+agents can never edit, move or delete a blocked file (see
 |slop-edit-agents|). `secrets.detectors = false` turns the built-in token
 detectors off (|slop-secrets|).
 
 Every module is configured under its name, e.g. `opts.term = { ... }`.
-`opts.<module> = false` (or `{ enabled = false }`) disables it.
+`opts.<module> = false` (or `{ enabled = false }`) disables it; a later
+`setup()` that disables a loaded module unloads it, like `:Slop modules
+disable`.
 User modules: `opts.modules = { mine = require("my.slop_module") }`, a table
 of name = spec (the spec is used as it is, see |slop-module|).
 
@@ -133,7 +144,7 @@ The `<Plug>` mappings of slop's startup keys exist right away; the others
 entry, see |slop-module|) are created when the module first loads. The
 `<Plug>` of a key that falls through does nothing when there is nothing to
 act on. While a module is disabled (`:Slop modules disable`), its mappings
-only say so.
+only say so (a key that falls through passes the key on).
 
 A key that falls through (nothing to accept, cursor not in a hunk, ...)
 behaves as if slop had not mapped it: the previous mapping or the native
@@ -176,6 +187,9 @@ Text sent to an AI provider or agent always passes through slop's redaction.
 Hiding/revealing cloaks on screen never turns redaction off.
 
 - Files matching `secrets.block` (|slop-config|) are never sent.
+- A file reached through a symlink is also matched by its target's path:
+  `app.conf -> .env` is blocked like `.env`, and the target's cloak rules
+  redact it.
 - Values found by secrets providers (|slop-cloak| rules) are replaced by
   `secrets.placeholder` ("<redacted>"). A provider that errors fails
   closed: every line it was given is redacted.
@@ -231,7 +245,8 @@ See `lua/slop/modules/hello/` for a complete example.
 A module found on the 'runtimepath' loads on first use (`:Slop mine ...`,
 `require("slop").mine`). Its keymaps, default keys and `<Plug>` mappings
 are created when it loads, not at startup. To have them (and load events)
-from startup, register it as a user module with a `manifest`: >lua
+from startup, register it as a user module (`opts.modules`, also in
+`vim.g.slop`) with a `manifest`: >lua
     -- lua/my/slop_module.lua: the spec above, plus
     manifest = {
       keys = { run = { mode = "n", lhs = "<leader>xm", desc = "run mine" } },
@@ -240,9 +255,12 @@ from startup, register it as a user module with a `manifest`: >lua
     -- init.lua
     require("slop").setup({ modules = { mine = require("my.slop_module") } })
 <
-Keep `manifest.keys.<action>.lhs` equal to `defaults.keymaps.<action>`. The
-event that loads a module is replayed into its augroup: create its
-autocmds in `require("slop.core.util").augroup("mine")`.
+Keep `manifest.keys.<action>.lhs` equal to `defaults.keymaps.<action>`. A
+broken `manifest` (an unknown event, a bad mode) is reported and skipped.
+The event that loads a module is replayed into its augroup: create its
+autocmds in `require("slop.core.util").augroup("mine")`. A handler that
+fails on the replayed event is reported; it never stops the command that
+fired the event (the file is still read).
 
 ==============================================================================
 12. MODULES

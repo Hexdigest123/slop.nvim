@@ -152,6 +152,8 @@ function M.read_file(path)
 end
 
 --- Atomically write a file: write `<path>.tmp.<pid>.<n>`, fsync, rename over `path`. Creates parent dirs.
+--- An existing file keeps its permissions. A symlink at `path` is replaced, never written through: a cloned
+--- repository may ship `.nvim/state/...` links pointing at the user's files.
 ---@param path string
 ---@param text string
 ---@return boolean ok, string? err
@@ -163,10 +165,17 @@ function M.write_file(path, text)
       return false, err
     end
   end
+  local old = uv.fs_lstat(path)
+  old = old and old.type == "file" and old or nil
+  local mode = old and old.mode % 512 or 420 -- the permission bits
   local tmp = ("%s.tmp.%d.%d"):format(path, uv.os_getpid(), uv.hrtime())
-  local fd, err = uv.fs_open(tmp, "w", 420)
+  local fd, err = uv.fs_open(tmp, "w", mode)
   if not fd then
     return false, err
+  end
+  if old then
+    -- the exact mode (open() applies the umask): a file made private (0600) must not come back readable
+    uv.fs_fchmod(fd, mode)
   end
   local ok, werr = uv.fs_write(fd, text, 0)
   uv.fs_fsync(fd)

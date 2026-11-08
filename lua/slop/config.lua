@@ -214,8 +214,29 @@ local function module_errors()
       local is_module = manifest[k] or user_mods[k] or require("slop.core.registry").kind(k) == "module"
       if is_module and type(v) ~= "table" and v ~= false then
         out[k] = { ("%s: expected table|false, got %s"):format(k, type(v)) }
-      elseif is_module and type(v) == "table" and v.enabled ~= nil and type(v.enabled) ~= "boolean" then
-        out[k] = { ("%s.enabled: expected boolean, got %s"):format(k, type(v.enabled)) }
+      elseif is_module and type(v) == "table" then
+        local errs = {}
+        if v.enabled ~= nil and type(v.enabled) ~= "boolean" then
+          errs[#errs + 1] = ("%s.enabled: expected boolean, got %s"):format(k, type(v.enabled))
+        end
+        -- the startup keys (manifest): a bad one is not mapped, and the module may never load to report it
+        local entry = manifest[k] or (user_mods[k] and user_mods[k].manifest)
+        local keys = type(entry) == "table" and type(entry.keys) == "table" and entry.keys or {}
+        local km = v.keymaps
+        if km ~= nil and type(km) ~= "table" then
+          errs[#errs + 1] = ("%s.keymaps: expected table, got %s"):format(k, type(km))
+        elseif km ~= nil then
+          for action in pairs(keys) do
+            local lhs = km[action]
+            if lhs ~= nil and lhs ~= false and type(lhs) ~= "string" then
+              errs[#errs + 1] = ("%s.keymaps.%s: expected string|false, got %s"):format(k, action, type(lhs))
+            end
+          end
+        end
+        if #errs > 0 then
+          table.sort(errs)
+          out[k] = errs
+        end
       end
     end
   end
@@ -380,6 +401,29 @@ local function is_level(v)
   return (type(v) == "string" and M.log_levels[v] ~= nil) or type(v) == "number"
 end
 
+---@param v any
+---@param ok_item fun(item: any): boolean
+local function is_list_of(v, ok_item)
+  if type(v) ~= "table" or not vim.islist(v) then
+    return false
+  end
+  for _, item in ipairs(v) do
+    if not ok_item(item) then
+      return false
+    end
+  end
+  return true
+end
+
+local function is_string(v)
+  return type(v) == "string"
+end
+
+--- A vim.fs.root() marker: a name, a list of names (same priority) or a function.
+local function is_marker(v)
+  return type(v) == "string" or type(v) == "function" or is_list_of(v, is_string)
+end
+
 local core_schema = {
   ui = function(c, check)
     check("border", c.border, { "string", "table" })
@@ -395,13 +439,18 @@ local core_schema = {
     end, false, "integer >= 1")
   end,
   project = function(c, check)
-    check("root_markers", c.root_markers, "table")
+    check("root_markers", c.root_markers, function(v)
+      return is_list_of(v, is_marker)
+    end, false, "list of markers (name, list of names or function)")
     check("dir", c.dir, function(v)
       return type(v) == "string" and v ~= ""
     end, false, "non-empty string")
   end,
   secrets = function(c, check)
-    check("block", c.block, "table")
+    -- (a map would silently block nothing: the defaults are replaced and only list items are globs)
+    check("block", c.block, function(v)
+      return is_list_of(v, is_string)
+    end, false, "list of file globs")
     check("placeholder", c.placeholder, "string")
     check("agent_reads", c.agent_reads, function(v)
       return v == "deny" or v == "allow"
@@ -417,9 +466,18 @@ local function check_keymaps(prefix, km, defaults, out)
   end
   for k, v in pairs(km) do
     local path = prefix .. "." .. tostring(k)
-    if type(v) == "table" then
-      check_keymaps(path, v, type(defaults) == "table" and defaults[k] or nil, out)
+    local d = type(defaults) == "table" and defaults[k] or nil
+    if type(d) == "table" then
+      -- a group of keys (e.g. edit's diff = { accept = "ga", ... }); false turns them all off
+      if type(v) == "table" then
+        check_keymaps(path, v, d, out)
+      elseif v ~= false then
+        out[#out + 1] = path .. ": expected table|false, got " .. type(v)
+      end
+    elseif type(v) == "table" and d == nil then
+      check_keymaps(path, v, nil, out) -- not a default key (reported as unknown): its leaves must be keys
     elseif type(v) ~= "string" and v ~= false then
+      -- (a list of keys for one action would silently turn the key off)
       out[#out + 1] = path .. ": expected string|false, got " .. type(v)
     end
   end
@@ -455,7 +513,8 @@ function M.validate(ns, cfg)
       out[#out + 1] = err
     end
   end
-  return out
+  -- a module schema may check what the core checks already (its keymaps)
+  return require("slop.core.util").uniq(out)
 end
 
 --- Resolved config of a namespace. Without `ns`, returns the core namespaces { ui, log, project, secrets }.

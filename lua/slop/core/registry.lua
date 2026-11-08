@@ -673,6 +673,45 @@ local function buffer_event(ev)
   return ev.match == nil or ev.match == api.nvim_buf_get_name(ev.buf)
 end
 
+--- Run `fn` inside a Vim `:try`. An error of an autocmd callback run by nvim_exec_autocmds() is no Lua error of that
+--- call (pcall() never sees it): inside another command, e.g. the BufReadPre of an `:edit` run from Lua (pickers,
+--- vim.cmd), it fails that command and the file is not read. The `:try` catches it here instead.
+---@param fn fun()
+---@return string? err
+local function vim_try(fn)
+  local reg = require("slop.core.registry") -- the table the `:lua` lines below reach
+  local saved = reg._trying
+  local job = { fn = fn } ---@type {fn: fun(), err?: string}
+  reg._trying = job
+  local ok, err = pcall(
+    api.nvim_exec2,
+    table.concat({
+      "try",
+      "lua require('slop.core.registry')._try(true)",
+      "catch",
+      "lua require('slop.core.registry')._try(false, vim.v.exception)",
+      "endtry",
+    }, "\n"),
+    {}
+  )
+  reg._trying = saved
+  return job.err or (not ok and tostring(err) or nil)
+end
+
+--- vim_try() helper, called from its `:try` block.
+---@private
+function M._try(run, exception)
+  local job = M._trying
+  if not job then
+    return
+  end
+  if run then
+    job.fn()
+  else
+    job.err = exception
+  end
+end
+
 --- After an event-triggered load, re-fire the event for the module's own augroup ("slop.<name>"),
 --- because autocmds created while an event runs do not see that event.
 ---@param name string
@@ -690,9 +729,18 @@ function M.replay(name, ev)
     -- with `buf` the match would become the buffer's file name and pattern handlers would miss the event
     o.pattern = ev.match
   end
-  -- runs inside the triggering event: what the handlers report is shown after it (see log.deferred())
+  -- runs inside the triggering event: a failing handler must not fail it, and what the handlers report is shown
+  -- after it (see log.deferred())
   log().deferred(function()
-    pcall(api.nvim_exec_autocmds, ev.event, o)
+    local err = vim_try(function()
+      api.nvim_exec_autocmds(ev.event, o)
+    end)
+    if err then
+      log().notify(
+        ("slop: module '%s': its %s handler failed: %s"):format(name, ev.event, (err:gsub("^Vim%(%a*%):", ""))),
+        vim.log.levels.ERROR
+      )
+    end
   end)
 end
 
@@ -714,11 +762,10 @@ function M.enable(name)
   return M.load(name)
 end
 
---- Disable at runtime. Calls spec.teardown() when present (then the module can be set up again later);
---- otherwise removes its global keymaps and warns that a restart is needed to fully unload it.
+--- Unload a module that was disabled: remove its global keymaps, call spec.teardown() when present (then the
+--- module can be set up again later), otherwise warn that a restart is needed to fully unload it.
 ---@param name string
-function M.disable(name)
-  config().set_enabled(name, false)
+local function unload(name)
   require("slop.core.keymaps").remove(name)
   if M.is_loaded(name) then
     local spec = M.spec(name)
@@ -729,18 +776,43 @@ function M.disable(name)
       end
       state[name] = nil
     else
+      state[name].kept = true -- (said once: a later setup() that leaves it disabled does not repeat it)
       log().notify(("slop: %s has no teardown; restart Neovim to fully unload it"):format(name), vim.log.levels.WARN)
     end
   end
   require("slop.core.events").emit(nil, "ModuleDisabled", { name = name })
 end
 
---- Called by config.setup(): forget failed loads and cached specs of user modules.
+--- Disable at runtime. Calls spec.teardown() when present (then the module can be set up again later);
+--- otherwise removes its global keymaps and warns that a restart is needed to fully unload it.
+---@param name string
+function M.disable(name)
+  config().set_enabled(name, false)
+  unload(name)
+end
+
+--- Called by config.setup(): unload the loaded modules it disabled, forget failed loads and cached specs of
+--- user modules.
 function M.on_config_changed()
   for name, st in pairs(state) do
     if st.status == "failed" then
       state[name] = nil
     end
+  end
+  -- `<module> = false` in a later setup(): like :Slop modules disable (its autocmds would go on otherwise)
+  local off = {}
+  for name, st in pairs(state) do
+    if st.status == "loaded" then
+      if M.is_enabled(name) then
+        st.kept = nil
+      elseif not st.kept then
+        off[#off + 1] = name
+      end
+    end
+  end
+  table.sort(off)
+  for _, name in ipairs(off) do
+    unload(name)
   end
   for name in pairs(specs) do
     if not M.is_loaded(name) then

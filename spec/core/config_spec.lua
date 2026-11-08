@@ -217,6 +217,60 @@ describe("config", function()
     assert.is_false(config.get("secrets").detectors)
   end)
 
+  it("secrets.block must be a list of globs; project.root_markers a list of markers", function()
+    -- a map is no list: every default glob would be gone and nothing blocked, silently
+    config.setup({ secrets = { block = { env = ".env*" } } })
+    assert.are.same({ "secrets.block: expected list of file globs, got table" }, config.errors("secrets"))
+    config.setup({ secrets = { block = { "*.x", 5 } } })
+    assert.equal(1, #config.errors("secrets"))
+    config.setup({ secrets = { block = { "*.x" } } })
+    assert.are.same({}, config.errors("secrets"))
+    -- a marker vim.fs.root() cannot use throws from every project.root() outside a match of the others
+    config.setup({ project = { root_markers = { ".git", 1 } } })
+    assert.are.same(
+      { "project.root_markers: expected list of markers (name, list of names or function), got table" },
+      config.errors("project")
+    )
+    config.setup({
+      project = {
+        root_markers = {
+          { ".git", "Makefile" },
+          "package.json",
+          function()
+            return false
+          end,
+        },
+      },
+    })
+    assert.are.same({}, config.errors("project"))
+  end)
+
+  it("a table where one key belongs, or a key where a group belongs, is reported (it disabled the keys)", function()
+    config.setup({ hello = { keymaps = { greet = { "<F1>", "<F2>" } } } })
+    assert.are.same({ "hello.keymaps.greet: expected string|false, got table" }, config.errors("hello"))
+    -- a group of keys (the edit diff review keys) takes a table, or false for all of them
+    config.setup({ edit = { keymaps = { diff = { accept = "<F3>" } } } })
+    assert.are.same({}, config.errors("edit"))
+    config.setup({ edit = { keymaps = { diff = false } } })
+    assert.are.same({}, config.errors("edit"))
+    config.setup({ edit = { keymaps = { diff = "ga" } } })
+    assert.are.same({ "edit.keymaps.diff: expected table|false, got string" }, config.errors("edit"))
+    config.setup({ edit = { keymaps = { diff = { accept = { "ga" } } } } })
+    assert.are.same({ "edit.keymaps.diff.accept: expected string|false, got table" }, config.errors("edit"))
+  end)
+
+  it("setup() reports a bad startup key at once (it is not mapped: the module would not load through it)", function()
+    config.setup({ term = { keymaps = { toggle = { "<C-\\>" } } } })
+    local text = table.concat(
+      vim.tbl_map(function(n)
+        return n.msg
+      end, notes),
+      "\n"
+    )
+    assert.matches("term%.keymaps%.toggle: expected string|false, got table", text)
+    assert.falsy(package.loaded["slop.modules.term"], "no module code loaded for it")
+  end)
+
   it("reports option mistakes that leave a module disabled", function()
     config.setup({ term = { enabled = "yes" }, hello = true })
     local text = table.concat(

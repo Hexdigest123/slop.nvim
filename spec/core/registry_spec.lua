@@ -180,6 +180,60 @@ describe("registry", function()
     assert.is_true(registry.is_loaded("t"))
   end)
 
+  it(
+    "a setup() that disables a loaded module unloads it like :Slop modules disable; enabling loads it again",
+    function()
+      local torn, setups = 0, 0
+      local spec = fake("offm", {
+        setup = function()
+          setups = setups + 1
+          vim.api.nvim_create_autocmd("User", {
+            group = require("slop.core.util").augroup("offm"),
+            pattern = "SlopOffmProbe",
+            callback = function() end,
+          })
+        end,
+        teardown = function()
+          torn = torn + 1
+          pcall(vim.api.nvim_del_augroup_by_name, "slop.offm")
+        end,
+      })
+      local disabled = {}
+      vim.api.nvim_create_autocmd("User", {
+        pattern = "SlopModuleDisabled",
+        callback = function(ev)
+          disabled[#disabled + 1] = ev.data.name
+        end,
+      })
+      config.setup({ modules = { offm = spec } })
+      assert.truthy(registry.load("offm"))
+      config.setup({ modules = { offm = spec }, offm = false })
+      assert.equal(1, torn)
+      assert.equal("disabled", registry.status("offm"))
+      assert.are.same({ "offm" }, disabled)
+      assert.equal(0, #vim.api.nvim_get_autocmds({ event = "User", pattern = "SlopOffmProbe" }))
+      config.setup({ modules = { offm = spec }, offm = { enabled = false } }) -- still off: nothing to do
+      assert.equal(1, torn)
+      assert.are.same({ "offm" }, disabled)
+      config.setup({ modules = { offm = spec } })
+      assert.truthy(registry.load("offm"))
+      assert.equal(2, setups)
+      -- a module without teardown stays loaded: say once that a restart is needed
+      local notes = {}
+      vim.notify = function(msg)
+        notes[#notes + 1] = msg
+      end
+      local kept = fake("keptm")
+      config.setup({ modules = { keptm = kept } })
+      assert.truthy(registry.load("keptm"))
+      config.setup({ modules = { keptm = kept }, keptm = false })
+      config.setup({ modules = { keptm = kept }, keptm = false })
+      assert.equal(1, #vim.tbl_filter(function(m)
+        return m:find("keptm has no teardown", 1, true) ~= nil
+      end, notes))
+    end
+  )
+
   it("replays the trigger event into the module augroup", function()
     local seen
     config.setup({
@@ -376,6 +430,48 @@ describe("lazy triggers (plugin/slop.lua)", function()
     assert.are.same({ "BufReadPost:a.txt", "BufReadPost:b.txt" }, calls)
   end)
 
+  it("a module handler that fails on the replayed event is reported after the read (not dropped)", function()
+    local spec = vim.tbl_extend("force", fake("brokenm"), {
+      manifest = { cmd = true, events = { "BufReadPre" } },
+      setup = function()
+        vim.api.nvim_create_autocmd("BufReadPre", {
+          group = require("slop.core.util").augroup("brokenm"),
+          callback = function()
+            error("handler bug")
+          end,
+        })
+      end,
+    })
+    setup({ modules = { brokenm = spec } })
+    h.source_plugin()
+    local p = file("r.txt", "kept\n")
+    assert.truthy(pcall(vim.cmd.edit, p))
+    assert.are.same({ "kept" }, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    assert.truthy(
+      vim.wait(1000, function()
+        return table.concat(notes, "\n"):find("brokenm.*BufReadPre.*handler bug") ~= nil
+      end),
+      table.concat(notes, "\n")
+    )
+  end)
+
+  it("a module enabled by a later setup() loads for the files and filetypes already open", function()
+    local spec, calls = module("laterm", { "BufReadPost" }, { "BufReadPost" })
+    local ftspec = vim.tbl_extend("force", fake("laterft"), { manifest = { cmd = true, ft = { "slopft2" } } })
+    setup({ modules = { laterm = spec, laterft = ftspec }, laterm = false, laterft = false })
+    h.source_plugin()
+    vim.cmd.edit(file("open.txt"))
+    vim.bo.filetype = "slopft2"
+    vim.wait(50)
+    assert.is_false(registry.is_loaded("laterm"))
+    assert.is_false(registry.is_loaded("laterft"))
+    setup({ modules = { laterm = spec, laterft = ftspec } })
+    assert.truthy(vim.wait(1000, function()
+      return registry.is_loaded("laterm") and registry.is_loaded("laterft")
+    end))
+    assert.are.same({ "BufReadPost:open.txt" }, calls)
+  end)
+
   it("replays a non-buffer event with its pattern (LspProgress kind)", function()
     local seen = {}
     local spec = vim.tbl_extend("force", fake("lspm"), {
@@ -454,6 +550,86 @@ describe("lazy triggers (plugin/slop.lua)", function()
       return registry.is_loaded("latem")
     end))
     assert.are.same({ "BufReadPost:late.txt" }, calls)
+  end)
+
+  it("sourced late: an ft module gets FileType replayed for every buffer that already has the filetype", function()
+    local seen = {}
+    local bufs = {}
+    for i = 1, 3 do
+      vim.cmd.edit(file(("f%d.slopft"):format(i)))
+      vim.bo.filetype = "slopft"
+      bufs[i] = vim.api.nvim_get_current_buf()
+    end
+    local spec = vim.tbl_extend("force", fake("ftm"), {
+      manifest = { cmd = true, ft = { "slopft" } },
+      setup = function()
+        vim.api.nvim_create_autocmd("FileType", {
+          group = require("slop.core.util").augroup("ftm"),
+          pattern = "slopft",
+          callback = function(a)
+            seen[#seen + 1] = a.buf
+          end,
+        })
+      end,
+    })
+    setup({ modules = { ftm = spec } })
+    h.source_plugin()
+    assert.truthy(vim.wait(1000, function()
+      return registry.is_loaded("ftm")
+    end))
+    vim.wait(50)
+    table.sort(seen)
+    assert.are.same(bufs, seen)
+  end)
+
+  it("a user module's broken manifest is reported and stops neither the other modules nor plugin/slop.lua", function()
+    for _, order in ipairs({ "setup first (vim.pack)", "plugin first (lazy.nvim)" }) do
+      h.reset()
+      notes = {}
+      registry, config = require("slop.core.registry"), require("slop.config")
+      local mods = {
+        badev = fake("badev", { manifest = { events = { "BufReadPots" } } }),
+        badkey = fake("badkey", {
+          defaults = { enabled = true, keymaps = { x = "<F9>" } },
+          manifest = { keys = { x = { mode = "?", lhs = "<F9>", desc = "x" } } },
+        }),
+      }
+      local calls = {}
+      for i = 1, 6 do -- several, so that some come after the broken ones in pairs() order
+        local name = "good" .. i
+        mods[name] = module(name, { "BufReadPost" }, { "BufReadPost" }, {
+          defaults = { enabled = true, keymaps = { run = "<F" .. i .. ">" } },
+          keymaps = { run = { mode = "n", desc = "run", rhs = function() end } },
+        })
+        mods[name].manifest.keys = { run = { mode = "n", lhs = "<F" .. i .. ">", desc = "run " .. name } }
+        local setup_fn = mods[name].setup
+        mods[name].setup = function()
+          calls[#calls + 1] = name
+          setup_fn()
+        end
+      end
+      if order == "setup first (vim.pack)" then
+        setup({ modules = mods })
+        assert.truthy(pcall(h.source_plugin), order)
+      else
+        h.source_plugin()
+        setup({ modules = mods })
+      end
+      for i = 1, 6 do
+        assert.equal("<Plug>(slop-good" .. i .. "-run)", vim.fn.maparg("<F" .. i .. ">", "n"), order)
+      end
+      assert.equal("<Plug>(slop-term-toggle)", vim.fn.maparg(" \\", "n"), order)
+      vim.cmd.edit(file("a.txt"))
+      assert.equal(6, #calls, order)
+      assert.truthy(
+        vim.wait(1000, function()
+          local text = table.concat(notes, "\n")
+          return text:find("'badev'.*BufReadPots") ~= nil and text:find("'badkey'") ~= nil
+        end),
+        order .. ": " .. table.concat(notes, "\n")
+      )
+      vim.cmd("silent! %bwipe!")
+    end
   end)
 
   it("first press through a stub: string rhs keeps order and count; expr keys load outside textlock", function()

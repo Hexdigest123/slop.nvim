@@ -49,6 +49,57 @@ describe(":Slop", function()
     assert.are.same({ "term" }, complete("5Sl te"))
   end)
 
+  it("completes the word at the cursor, not at the end of the line", function()
+    local c = require("slop.core.commands")
+    -- what Nvim passes a Lua completion: the whole line, the cursor position (bytes before it) and an
+    -- arg_lead that runs on to the end of the line
+    assert.are.same({ "term" }, c.complete("te toggle", "Slop te toggle", 7))
+    assert.truthy(vim.tbl_contains(c.complete(" float", "Slop term  float", 10), "toggle"))
+    assert.are.same({ "enable" }, c.complete("en hello", "Slop modules en hello", 15))
+    -- and on a real command line: <Tab> after "te" with more text behind the cursor
+    local line
+    local id = vim.api.nvim_create_autocmd("CmdlineChanged", {
+      callback = function()
+        line = vim.fn.getcmdline()
+      end,
+    })
+    h.feed(":Slop te toggle<Home>" .. ("<Right>"):rep(7) .. "<Tab><C-c>", "tx")
+    vim.api.nvim_del_autocmd(id)
+    assert.equal("Slop term toggle", line)
+  end)
+
+  it("a word with escaped blanks (`my\\ file`) is one argument, as typed, also mid-line", function()
+    local seen
+    require("slop").setup({
+      modules = {
+        esc = {
+          name = "esc",
+          description = "completion test",
+          defaults = { enabled = true },
+          setup = function() end,
+          commands = {
+            open = {
+              impl = function() end,
+              complete = function(lead, args)
+                seen = { lead = lead, args = vim.deepcopy(args) }
+                return #args <= 1 and { [[my\ file.lua]] } or {}
+              end,
+            },
+          },
+        },
+      },
+    })
+    assert.are.same({ [[my\ file.lua]] }, complete([[Slop esc open my\ fi]]))
+    assert.are.same({ lead = [[my\ fi]], args = { [[my\ fi]] } }, seen)
+    local c = require("slop.core.commands")
+    local line = [[Slop esc open my\ fi more]]
+    assert.are.same({ [[my\ file.lua]] }, c.complete([[my\ fi more]], line, #[[Slop esc open my\ fi]]))
+    assert.are.same({ lead = [[my\ fi]], args = { [[my\ fi]] } }, seen)
+    -- an escaped backslash does not escape the blank after it
+    c.complete("", [[Slop esc open a\\ ]], 0)
+    assert.are.same({ lead = "", args = { [[a\\]], "" } }, seen)
+  end)
+
   it("completes :Slop modules enable|disable", function()
     assert.are.same({ "disable", "enable" }, complete("Slop modules "))
     assert.are.same({ "hello" }, complete("Slop modules enable h"))

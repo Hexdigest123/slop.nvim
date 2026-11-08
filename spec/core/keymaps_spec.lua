@@ -157,6 +157,48 @@ describe("keymaps", function()
     assert.equal("", vim.api.nvim_buf_get_lines(other, 1, 2, false)[1])
   end)
 
+  it("a fall-through hands over to another slop fall-through map behind it, never to itself", function()
+    local km = require("slop.core.keymaps")
+    local hits = {}
+    local ghost = true
+    -- a global one (the AI completion's accept) and a buffer-local one (a commit message's accept)
+    km.fallthrough("i", "<C-y>", function()
+      hits[#hits + 1] = "global"
+      if not ghost then
+        return false
+      end
+      vim.api.nvim_put({ "G" }, "c", false, true)
+    end, { desc = "global" })
+    local buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_set_current_buf(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "abc", "" })
+    km.fallthrough("i", "<C-y>", function()
+      hits[#hits + 1] = "local"
+      return false -- no commit message suggestion here
+    end, { desc = "local", buf = buf })
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    h.feed("a<C-y><Esc>", "tx")
+    assert.are.same({ "local", "global" }, hits)
+    assert.equal("G", vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1])
+    -- neither has anything to do: the native key runs, once
+    hits, ghost = {}, false
+    vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "" })
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    h.feed("a<C-y><Esc>", "tx")
+    assert.are.same({ "local", "global" }, hits)
+    assert.equal("a", vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1], "i_CTRL-Y copies the char above")
+    -- applied again (a module enabled again), a fall-through does not hand over to its old version
+    local n = 0
+    for _ = 1, 2 do
+      km.fallthrough("i", "<C-g>", function()
+        n = n + 1
+        return false
+      end, { desc = "again" })
+    end
+    h.feed("a<C-g><Esc>", "tx")
+    assert.equal(1, n)
+  end)
+
   it("a nowait fall-through `gr` behaves as if unmapped when other maps go on from it (grn, grx, gr<Esc>)", function()
     local km = require("slop.core.keymaps")
     for _, lhs in ipairs({ "grn", "grr", "gra", "gri", "grt", "grx" }) do

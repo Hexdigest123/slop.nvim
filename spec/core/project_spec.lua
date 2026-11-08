@@ -81,4 +81,25 @@ describe("project", function()
     assert.is_true(project.write_file(root .. "/a/b/c.txt", "hi"))
     assert.equal("hi", h.read(root .. "/a/b/c.txt"))
   end)
+
+  it("write_file keeps the file's permissions and never writes through a symlink", function()
+    -- a cloned repository may ship `.nvim/state/...` as links to the user's files (~/.bashrc): replace the link
+    local target = root .. "/home/.bashrc"
+    h.write(target, "export PATH\n")
+    local link = root .. "/.nvim/state/marks/marks.json"
+    vim.fn.mkdir(vim.fs.dirname(link), "p")
+    assert.truthy(vim.uv.fs_symlink(target, link))
+    assert.is_true(project.write_json(link, { a = 1 }))
+    assert.equal("file", vim.uv.fs_lstat(link).type, "the link is replaced by the written file")
+    assert.equal("export PATH\n", h.read(target), "the link's target is untouched")
+    assert.are.same({ a = 1 }, project.read_json(link))
+    assert.are.same({}, vim.fn.glob(root .. "/.nvim/state/marks/*.tmp.*", false, true))
+    -- e.g. rest's history.json, made private (0600) because it may hold secrets: a rewrite keeps it private
+    local priv = root .. "/.nvim/state/rest/history.json"
+    h.write(priv, "{}")
+    vim.uv.fs_chmod(priv, 384)
+    assert.is_true(project.write_json(priv, { b = 2 }))
+    assert.equal(384, vim.uv.fs_stat(priv).mode % 512)
+    assert.are.same({ b = 2 }, project.read_json(priv))
+  end)
 end)

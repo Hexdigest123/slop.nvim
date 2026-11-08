@@ -139,16 +139,47 @@ function M.run(cmd)
   end
 end
 
+--- Words of a command line the way Nvim splits <f-args>: blanks separate words unless escaped with a backslash
+--- (`my\ file` is one word, kept as typed; `\\` is an escaped backslash). A trailing blank starts an empty word (the
+--- one being typed).
+---@param s string
+---@return string[]
+local function words_of(s)
+  local out, start, i = {}, 1, 1
+  while i <= #s do
+    local c = s:sub(i, i)
+    if c == "\\" then
+      i = i + 2
+    elseif c:match("%s") then
+      out[#out + 1] = s:sub(start, i - 1)
+      i = (s:find("%S", i) or #s + 1)
+      start = i
+    else
+      i = i + 1
+    end
+  end
+  out[#out + 1] = s:sub(start)
+  return out
+end
+
 --- Completion for :Slop. Handles a range prefix ("'<,'>Slop ..."), bang and abbreviations (":Sl ...").
 --- Level 1: core subcommands + enabled modules; level 2: the module's subcommands (spec loaded, no setup);
 --- level 3+: the subcommand's complete(arg_lead, args_after_sub, cmdline).
 ---@param arg_lead string
 ---@param cmdline string
+---@param cursor_pos? integer  bytes before the cursor (Nvim passes the whole line); 0/nil: at the end
 ---@return string[]
-function M.complete(arg_lead, cmdline, _)
+function M.complete(arg_lead, cmdline, cursor_pos)
+  if type(cursor_pos) == "number" and cursor_pos > 0 and cursor_pos < #cmdline then
+    -- completing in the middle of the line: what follows the cursor is not part of it (Nvim's arg_lead for a Lua
+    -- completion runs on to the end of the line, but only the word before the cursor is replaced)
+    cmdline = cmdline:sub(1, cursor_pos)
+    local all = words_of(cmdline)
+    arg_lead = all[#all]
+  end
   -- the command as typed: user commands may be abbreviated (":Sl", ":Slo")
   local rest = cmdline:match("%f[%a]Sl%a*!?%s+(.*)$") or ""
-  local words = vim.split(rest, "%s+", { trimempty = false })
+  local words = words_of(rest)
   if #words <= 1 then
     local names = vim.list_extend(vim.tbl_keys(M.core), registry().names({ enabled = true }))
     return util.complete_prefix(names, arg_lead)

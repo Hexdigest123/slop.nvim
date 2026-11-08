@@ -119,6 +119,7 @@ end
 -- Fall-through ---------------------------------------------------------------------------------
 
 local ours = setmetatable({}, { __mode = "k" }) ---@type table<function, table>
+local running = {} ---@type table<function, true>  fall-through callbacks handing their key over right now
 
 ---@param keys string
 ---@param remap boolean
@@ -147,9 +148,21 @@ local function slop_fallthrough(m)
   return m.callback ~= nil and ours[m.callback] ~= nil
 end
 
---- The mapping of `lhs` that a fall-through should hand over to (excluding slop fall-through maps).
-local function previous(mode, lhs, buf)
+--- The mapping a fall-through map replaces when it is set (kept to hand over to). Never a slop fall-through map:
+--- that would be its own old version when a module is set up again.
+local function replaced(mode, lhs, buf)
   return lookup(mode, norm(lhs), buf, slop_fallthrough)
+end
+
+local function handing_over(m)
+  return m.callback ~= nil and running[m.callback] ~= nil
+end
+
+--- The mapping of `lhs` a pressed fall-through hands over to: the next one, buffer-local before global, also a
+--- slop fall-through map (a commit message's `<C-y>` hands over to the AI completion's global one), but none
+--- that is handing over already (not itself: no loops).
+local function previous(mode, lhs, buf)
+  return lookup(mode, norm(lhs), buf, handing_over)
 end
 
 --- Does another mapping (in `buf` or global, not the one with callback `self`) start with raw `key` and go on?
@@ -228,16 +241,13 @@ end
 ---@return fun() fallback  call to perform the fall-through manually
 function M.fallthrough(mode, lhs, handler, opts)
   local buf = opts.buf and (opts.buf == 0 and api.nvim_get_current_buf() or opts.buf) or nil
-  local captured = previous(mode, lhs, buf)
+  local captured = replaced(mode, lhs, buf)
   -- keymap dicts hold the buffer id in `buf` (0.12; `buffer` before), 0 for a global map
   if captured and buf and (captured.buf or captured.buffer) == 0 then
     captured = nil -- global maps are looked up at press time (may be (re)defined later, e.g. by cmp)
   end
   local cb
-  local function this(m)
-    return m.callback == cb
-  end
-  local function fallback()
+  local function hand_over()
     local key = norm(lhs)
     local prev = captured or previous(mode, lhs, buf)
     if not continued(mode, key, buf, cb) then
@@ -256,7 +266,7 @@ function M.fallthrough(mode, lhs, handler, opts)
     end
     -- the longest mapping that matches the start of the keys runs, the rest is typed on (mappings apply)
     for n = #typed, #key + 1, -1 do
-      local m = lookup(mode, typed:sub(1, n), buf, this)
+      local m = lookup(mode, typed:sub(1, n), buf, handing_over)
       if m then
         if n < #typed then
           feed(typed:sub(n + 1), true)
@@ -269,6 +279,15 @@ function M.fallthrough(mode, lhs, handler, opts)
       feed(typed:sub(#key + 1), true)
     end
     run_previous(prev, lhs)
+  end
+  local function fallback()
+    local was = running[cb]
+    running[cb] = true -- (lookups skip it while the key goes on down the chain)
+    local ok, err = pcall(hand_over)
+    running[cb] = was
+    if not ok then
+      error(err, 0)
+    end
   end
   cb = function()
     local ok, res = pcall(handler)
