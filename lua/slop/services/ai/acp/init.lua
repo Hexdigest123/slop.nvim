@@ -5,11 +5,12 @@
 ---   demand after it exits (acp/client.lua, transport in acp/rpc.lua).
 --- * Client capabilities advertised: fs.readTextFile ONLY. The default handler (`acp.read_text_file`) serves live
 ---   buffers first, redacts with core.secrets and refuses blocked paths (symlinks resolved; config
----   `secrets.agent_reads = "allow"` serves them with their secret values redacted). No write/terminal
----   capabilities (agent requests for them get -32601).
+---   `secrets.agent_reads = "allow"` serves them with their secret values redacted) and binary files. No
+---   write/terminal capabilities (agent requests for them get -32601).
 --- * Permission requests without a turn handler go through `acp.decide()`: read/search/fetch/think allowed,
 ---   everything else rejected, always answering with the agent's own optionId. Decisions see the whole tool call:
----   the client merges every tool_call / tool_call_update of the session into the request's `toolCall`.
+---   the client merges every tool_call / tool_call_update of the session into the request's `toolCall`. A tool call
+---   touching a blocked file is always rejected: with a permission the agent reads with its own tools, unredacted.
 ---@class slop.acp
 local M = {}
 
@@ -49,7 +50,8 @@ local function ensure_leave()
 end
 
 --- Shared long-lived client per agent name (spawned lazily on first start()). A client whose agent config
---- (cmd/env/auth_method) changed is stopped and replaced.
+--- (cmd/env/auth_method) changed is stopped and replaced; the other agent options (mode, read_outside_root, ...)
+--- of a re-run setup() apply to the running client.
 ---@param opts slop.acp.ClientOpts|string
 ---@return slop.acp.Client
 function M.client(opts)
@@ -62,6 +64,7 @@ function M.client(opts)
   local fresh = mod.new(opts.agent, cfg, opts)
   local cur = clients[opts.agent]
   if cur and cur.signature == fresh.signature and cur.state ~= "stopped" then
+    cur.config = cfg
     return cur
   end
   if cur then
@@ -109,11 +112,19 @@ end
 
 local MAX_READ = 4 * 1024 * 1024
 
+--- Normalize a path from an agent. Never with environment variables expanded: "$MISTRAL_API_KEY" would become the
+--- key, and the path is quoted back to the agent in error messages.
+---@param path string
+---@return string
+local function normalize(path)
+  return vim.fs.normalize(path, { expand_env = false })
+end
+
 local function buffer_for(path)
   for _, b in ipairs(api.nvim_list_bufs()) do
     if api.nvim_buf_is_loaded(b) then
       local name = api.nvim_buf_get_name(b)
-      if name ~= "" and vim.fs.normalize(name) == path then
+      if name ~= "" and normalize(name) == path then
         return b
       end
     end
@@ -183,7 +194,7 @@ end
 --- Default `fs/read_text_file` handler: live buffer first (unsaved state), else disk; `line` is 1-based,
 --- `limit` a line count. Redacted with core.secrets. Blocked paths are refused unless config
 --- `secrets.agent_reads = "allow"` (their secret values are still redacted); paths outside `opts.root`
---- (default core.project.root()) are refused unless `opts.read_outside_root` is set.
+--- (default core.project.root()) are refused unless `opts.read_outside_root` is set; binary files are refused.
 ---@param params {path: string, line?: integer, limit?: integer}
 ---@param opts? {root?: string, read_outside_root?: boolean}
 ---@return string? text, table? err
@@ -193,7 +204,7 @@ function M.read_text_file(params, opts)
   if type(path) ~= "string" or path == "" then
     return nil, { code = -32602, message = "path is required" }
   end
-  path = vim.fs.normalize(path)
+  path = normalize(path)
   if path:sub(1, 1) ~= "/" and not path:match("^%a:[/\\]") then
     return nil, { code = -32602, message = "path must be absolute: " .. path }
   end
@@ -232,6 +243,12 @@ function M.read_text_file(params, opts)
     end
     if lines[#lines] == "" then
       lines[#lines] = nil
+    end
+  end
+  for _, l in ipairs(lines) do
+    -- a NUL byte (readfile() and the API return it as NL): a binary file, whose bytes are no valid JSON text
+    if l:find("\n", 1, true) then
+      return nil, { code = -32603, message = "slop: binary file: " .. path }
     end
   end
   if blocked then
@@ -336,12 +353,11 @@ local function pick(options, verdict)
   end
 end
 
--- Tool kinds that only read files: with secrets.agent_reads = "allow" they may touch blocked files.
-local READ_KINDS = { read = true, search = true }
-
 --- Decide a `session/request_permission` request. Returns the agent's own optionId (nil = answer "cancelled"),
 --- the verdict and a human-readable reason. A tool call touching a blocked file (symlinks resolved) is rejected,
---- except reads when config `secrets.agent_reads = "allow"`; writes, moves and deletes of blocked files never pass.
+--- whatever its kind and also with config `secrets.agent_reads = "allow"`: a granted permission lets the agent use
+--- its own tools (opencode asks before reading *.env, then reads the file itself), which slop cannot redact.
+--- `agent_reads = "allow"` only lets slop's own fs/read_text_file serve blocked files, redacted.
 ---@param req {toolCall?: table, options?: table[]}
 ---@param policy? {allow?: string[]}
 ---@return string? option_id, "allow"|"reject" verdict, string reason
@@ -356,13 +372,11 @@ function M.decide(req, policy)
   local verdict, reason = "reject", ("tool kind '%s' is not allowed"):format(kind)
   if allowed[kind] then
     verdict, reason = "allow", ("tool kind '%s' is allowed"):format(kind)
-    if not (READ_KINDS[kind] and blocked_reads_allowed()) then
-      local secrets = require("slop.core.secrets")
-      for _, p in ipairs(M.tool_paths(tc)) do
-        if is_blocked(secrets, p) then
-          verdict, reason = "reject", "blocked file: " .. p
-          break
-        end
+    local secrets = require("slop.core.secrets")
+    for _, p in ipairs(M.tool_paths(tc)) do
+      if is_blocked(secrets, p) then
+        verdict, reason = "reject", "blocked file: " .. p
+        break
       end
     end
   end

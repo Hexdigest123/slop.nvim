@@ -229,6 +229,54 @@ describe("services.ai.acp", function()
       assert.matches("outside the project root", r[7].error.message)
     end)
 
+    it("never expands environment variables in a path it reads (their values would come back in errors)", function()
+      local secret = "sk-live-ENVLEAK0123456789abcdef"
+      vim.uv.os_setenv("SLOP_TEST_LEAK", secret)
+      local dir = h.tmpdir("acpenv")
+      vim.cmd.cd(dir)
+      local paths = { "$SLOP_TEST_LEAK", "/$SLOP_TEST_LEAK", dir .. "/$SLOP_TEST_LEAK.txt" }
+      local turn = {}
+      for _, p in ipairs(paths) do
+        turn[#turn + 1] = { read = { path = p } }
+      end
+      local log = mock.setup({ turns = { turn } }, { ai = { agents = { mock = { read_outside_root = true } } } })
+      local res = run_turn(acp.client("mock"))
+      mock.wait(function()
+        return res.done
+      end)
+      local r = log.responses("fs/read_text_file")
+      assert.equal(#paths, #r)
+      for i, e in ipairs(r) do
+        assert.is_nil(vim.json.encode(e):find("ENVLEAK", 1, true), paths[i] .. ": " .. vim.json.encode(e))
+      end
+      -- the read API itself, any root policy
+      for _, p in ipairs(paths) do
+        for _, outside in ipairs({ false, true }) do
+          local text, err = acp.read_text_file({ path = p }, { root = dir, read_outside_root = outside })
+          assert.is_nil(vim.json.encode({ text or "", err or {} }):find("ENVLEAK", 1, true), p)
+        end
+      end
+    end)
+
+    it("refuses binary files (their bytes are no valid JSON text) instead of sending them", function()
+      local dir = h.tmpdir("acpbin")
+      h.write(dir .. "/image.png", "\137PNG\r\n\26\n\0\0\0\rIHDR\0\0\0\1\255\216\255")
+      h.write(dir .. "/ok.txt", "plain\n")
+      vim.cmd.cd(dir)
+      local log = mock.setup({
+        turns = { { { read = { path = dir .. "/image.png" } }, { read = { path = dir .. "/ok.txt" } } } },
+      })
+      local res = run_turn(acp.client("mock"))
+      mock.wait(function()
+        return res.done
+      end)
+      local r = log.responses("fs/read_text_file")
+      assert.equal(2, #r)
+      assert.is_nil(r[1].result)
+      assert.matches("binary", r[1].error and r[1].error.message or "")
+      assert.equal("plain", r[2].result and r[2].result.content)
+    end)
+
     it("refuses reads through a symlink to a blocked file and serves a linked file's live buffer", function()
       local dir = h.tmpdir("acplink")
       h.write(dir .. "/.env", "API_KEY=sk-live-1234567890abcdef\n")
@@ -324,7 +372,12 @@ describe("services.ai.acp", function()
       assert.matches("BEGIN RSA PRIVATE KEY", pem)
       assert.is_nil(pem:find("SECRETBODY", 1, true))
       assert.equal(env, reads[3].result.content) -- through the symlink: the target's rules apply
-      assert.same({ "allow-once", "allow-once" }, outcomes)
+      -- a permission lets the agent read with its OWN tools (opencode asks before reading *.env), which slop cannot
+      -- redact: refused like any other blocked path, only slop's own fs/read_text_file serves them (redacted)
+      assert.same({ "reject", "reject" }, outcomes)
+      local read_env =
+        { toolCall = { kind = "read", locations = { { path = dir .. "/.env" } } }, options = ALLOW_REJECT }
+      assert.equal("reject", (acp.decide(read_env)))
       -- writes, moves and deletes of blocked files stay refused
       assert.equal("reject", (acp.decide(edit_env, policy)))
       for _, kind in ipairs({ "move", "delete" }) do
@@ -602,6 +655,37 @@ describe("services.ai.acp", function()
       assert.is_false(c1:is_running())
     end)
 
+    it("a setup() that keeps cmd/env keeps the process but applies the other agent options", function()
+      local dir = h.tmpdir("acpcfg")
+      local outside = h.tmpdir("acpcfg-outside") .. "/other.txt"
+      h.write(outside, "not yours\n")
+      vim.cmd.cd(dir)
+      local turn = { { read = { path = outside } } }
+      local log, cfg = mock.setup(
+        { turns = { turn, turn } },
+        { ai = { agents = { mock = { read_outside_root = true } } } }
+      )
+      local client = acp.client("mock")
+      local res = run_turn(client)
+      mock.wait(function()
+        return res.done
+      end)
+      -- read_outside_root dropped again (e.g. the config file re-sourced)
+      require("slop").setup({ ai = { agents = { mock = cfg } } })
+      local same = acp.client("mock")
+      assert.equal(client, same)
+      local res2 = run_turn(same)
+      mock.wait(function()
+        return res2.done
+      end)
+      local r = log.responses("fs/read_text_file")
+      assert.equal(2, #r)
+      assert.equal("not yours", r[1].result and r[1].result.content)
+      assert.is_nil(r[2].result)
+      assert.matches("outside the project root", r[2].error and r[2].error.message or "")
+      assert.equal(1, #log.received("initialize"))
+    end)
+
     it("closes sessions with session/close when supported", function()
       local log = mock.setup({})
       local client = acp.client("mock")
@@ -615,6 +699,39 @@ describe("services.ai.acp", function()
       end)
       assert.equal(1, #log.received("session/close"))
       assert.is_nil(client.sessions[res.session.id])
+    end)
+  end)
+
+  describe("config", function()
+    it("validates the documented agent options (not only at first use)", function()
+      local config = require("slop.config")
+      local function errs(agent)
+        return table.concat(config.validate("ai", { providers = {}, agents = { x = agent } }), "\n")
+      end
+      local good = {
+        cmd = { "x", "acp" },
+        env = { A = "1" },
+        auth_method = "key",
+        timeout = 1000,
+        init_timeout = 5000,
+        read_outside_root = false,
+      }
+      assert.equal("", errs(good))
+      local bad = {
+        cmd = {},
+        env = "A=1",
+        auth_method = 3,
+        timeout = "30s",
+        init_timeout = 0,
+        read_outside_root = "yes",
+      }
+      for field, value in pairs(bad) do
+        local agent = vim.deepcopy(good)
+        agent[field] = value
+        assert.matches("ai%.agents%.x%." .. field, errs(agent))
+      end
+      assert.matches("ai%.agents%.x%.env", errs(vim.tbl_extend("force", good, { env = { A = { "nested" } } })))
+      assert.matches("ai%.agents%.x%.cmd", errs(vim.tbl_extend("force", good, { cmd = { "x", 1 } })))
     end)
   end)
 
