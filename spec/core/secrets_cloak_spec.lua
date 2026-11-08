@@ -143,6 +143,21 @@ describe("secrets v2", function()
       assert.is_false(secrets.is_blocked("/p/http-client.env.json"))
     end)
 
+    it("a symlink is redacted with the rules of its target (AI only; display spans follow the name)", function()
+      local dir = h.tmpdir("cloaklink")
+      h.write(dir .. "/api.http", "GET /x\nAuthorization: Bearer abc\n")
+      assert(vim.uv.fs_symlink(dir .. "/api.http", dir .. "/requests.txt"))
+      local lines = { "GET /x", "Authorization: Bearer abc" }
+      assert.are.same(
+        { "GET /x", "Authorization: Bearer <redacted>" },
+        (secrets.redact_lines(dir .. "/requests.txt", lines))
+      )
+      vim.cmd.edit(dir .. "/requests.txt")
+      local buf = vim.api.nvim_get_current_buf()
+      assert.is_true(secrets.is_cloaked(buf, { 1, 0, 1, 25 }))
+      assert.equal("GET /x\nAuthorization: Bearer <redacted>", (secrets.redact_text(table.concat(lines, "\n"), buf)))
+    end)
+
     it("redact_diff redacts cloak spans of non-blocked files", function()
       local diff = table.concat({
         "diff --git a/api.http b/api.http",

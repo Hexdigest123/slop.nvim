@@ -146,6 +146,122 @@ describe("secrets", function()
     assert.are.same({ "/a/b.lua" }, secrets.filter_paths({ "/a/.env", "/a/b.lua", "/a/k.pem" }))
   end)
 
+  it("filter_paths normalizes each path once (bulk filtering of a project's file list)", function()
+    local paths = {}
+    for i = 1, 500 do
+      paths[#paths + 1] = ("/p/src/file%d.lua"):format(i)
+    end
+    vim.list_extend(paths, { "/p/.env", "/p/home/.kube/config", "/p/.nvim/state/rest/cookies.txt" })
+    assert.is_false(secrets.is_blocked("/p/x.lua")) -- providers loaded, config resolved
+    local normalize, calls = vim.fs.normalize, 0
+    vim.fs.normalize = function(...)
+      calls = calls + 1
+      return normalize(...)
+    end
+    local ok, kept = pcall(secrets.filter_paths, paths)
+    vim.fs.normalize = normalize
+    assert(ok, kept)
+    assert.equal(500, #kept)
+    assert.equal("/p/src/file500.lua", kept[500])
+    -- (it was once per path and glob: ~27 globs, 1.5 s for 20k paths)
+    assert.is_true(calls <= #paths + 5, ("%d vim.fs.normalize calls for %d paths"):format(calls, #paths))
+  end)
+
+  it("redact_diff with opts.root: absolute and ~/ globs (and symlinks) match the repo-relative diff paths", function()
+    local root = h.tmpdir("repo")
+    local home = vim.fs.normalize(vim.uv.os_homedir())
+    require("slop.config").setup({ cloak = false, secrets = { block = { root .. "/private/**", "~/vault/**" } } })
+    local function diff(p)
+      return ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -0,0 +1 @@\n+TOKEN=abc123"):format(p, p, p, p)
+    end
+    local out = secrets.redact_diff(diff("private/notes.txt"))
+    assert.truthy(out:find("TOKEN=abc123", 1, true), "without root the relative path cannot match")
+    out = secrets.redact_diff(diff("private/notes.txt"), { root = root })
+    assert.falsy(out:find("TOKEN=abc123", 1, true), out)
+    assert.matches("diff of private/notes%.txt omitted", out, "the header keeps the diff's own path")
+    -- a repository below ~/vault
+    out = secrets.redact_diff(diff("a.txt"), { root = home .. "/vault/repo" })
+    assert.falsy(out:find("TOKEN=abc123", 1, true), out)
+    -- a tracked symlink to a blocked file
+    require("slop.config").setup({ cloak = false })
+    h.write(root .. "/.env", "TOKEN=abc123\n")
+    assert.truthy(vim.uv.fs_symlink(root .. "/.env", root .. "/settings.conf"))
+    out = secrets.redact_diff(diff("settings.conf"), { root = root })
+    assert.falsy(out:find("TOKEN=abc123", 1, true), out)
+    -- and the paths of the other sections are unchanged
+    out = secrets.redact_diff(diff("main.lua"), { root = root })
+    assert.truthy(out:find("TOKEN=abc123", 1, true))
+    assert.matches("^diff %-%-git a/main%.lua b/main%.lua", out)
+  end)
+
+  it("an empty secrets.placeholder does not hang redact_diff", function()
+    -- in a child nvim: a busy loop cannot be interrupted from Lua, the child is killed after the timeout
+    local script = vim.fn.tempname() .. ".lua"
+    h.write(
+      script,
+      [[
+      require("slop").setup({ secrets = { placeholder = "" } })
+      local secrets = require("slop.core.secrets")
+      local diff = table.concat({
+        "diff --git a/main.lua b/main.lua", "--- a/main.lua", "+++ b/main.lua", "@@ -1 +1 @@",
+        "-x", "+aws = AKIAIOSFODNN7EXAMPLE",
+      }, "\n")
+      local out, n = secrets.redact_diff(diff)
+      io.stdout:write(vim.json.encode({ out = out, n = n }))
+    ]]
+    )
+    local res = vim
+      .system({ vim.v.progpath, "--headless", "--clean", "-u", "NONE", "--cmd", "set rtp^=" .. h.root, "-l", script }, {
+        text = true,
+      })
+      :wait(15000)
+    assert.equal(0, res.code, "redact_diff hung or failed: " .. tostring(res.stderr))
+    local got = vim.json.decode(res.stdout)
+    assert.equal("diff --git a/main.lua b/main.lua\n--- a/main.lua\n+++ b/main.lua\n@@ -1 +1 @@\n-x\n+aws = ", got.out)
+    assert.equal(1, got.n)
+  end)
+
+  describe("symlinks", function()
+    it("a link with an innocent name to a blocked file is blocked (paths and buffers)", function()
+      require("slop.config").setup({ cloak = false })
+      local dir = h.tmpdir("links")
+      h.write(dir .. "/.env", "API_KEY=supersecret\n")
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/app.conf"))
+      assert.is_true(secrets.is_blocked(dir .. "/app.conf"))
+      assert.equal("<redacted>", (secrets.redact_text("API_KEY=supersecret", dir .. "/app.conf")))
+      vim.cmd.edit(dir .. "/app.conf")
+      local buf = vim.api.nvim_get_current_buf()
+      assert.equal(dir .. "/app.conf", vim.api.nvim_buf_get_name(buf), "precondition: the buffer keeps the link name")
+      assert.is_true(secrets.is_blocked(buf))
+      assert.is_true(secrets.is_cloaked(buf))
+      assert.are.same({ "<redacted>" }, (secrets.redact_lines(buf, vim.api.nvim_buf_get_lines(buf, 0, -1, false))))
+      -- a linked directory: the target path is matched by "/" globs (.kube/config)
+      vim.fn.mkdir(dir .. "/.kube", "p")
+      h.write(dir .. "/.kube/config", "token: abc\n")
+      assert(vim.uv.fs_symlink(dir .. "/.kube", dir .. "/kube"))
+      assert.is_true(secrets.is_blocked(dir .. "/kube/config"))
+      assert.are.same({ dir .. "/main.lua" }, secrets.filter_paths({ dir .. "/app.conf", dir .. "/main.lua" }))
+      -- a relative path is not resolved against Neovim's cwd (diff paths are relative to the repository)
+      local cwd = vim.fn.getcwd()
+      vim.cmd.cd(dir)
+      local ok, err = pcall(function()
+        assert.is_false(secrets.is_blocked("app.conf"))
+      end)
+      vim.cmd.cd(cwd)
+      assert(ok, err)
+    end)
+  end)
+
+  it("globs starting with ~/ match below the home directory", function()
+    require("slop.config").setup({ cloak = false, secrets = { block = { "~/private/**", "~/.config/app/token.json" } } })
+    local home = vim.fs.normalize("~")
+    assert.is_true(secrets.is_blocked(home .. "/private/notes.txt"))
+    assert.is_true(secrets.is_blocked(home .. "/.config/app/token.json"))
+    assert.is_false(secrets.is_blocked(home .. "/public/notes.txt"))
+    assert.is_false(secrets.is_blocked("/elsewhere/private/notes.txt"))
+    assert.is_true(secrets.match_glob("~/.aws/credentials", home .. "/.aws/credentials"))
+  end)
+
   it("loads secret providers (manifest provides = secrets) on first query", function()
     secrets.is_blocked("/p/x.lua")
     assert.is_true(require("slop.core.registry").is_loaded("cloak"))

@@ -13,7 +13,8 @@
 --- (".env*", "*.pem", "*.key", "*.p12", "*.pfx", "*secret*", "*credential*", "*private-key*").
 ---
 --- Effective path contract: a buffer's path is `vim.b[buf].slop_secret_path` if set (scratch/preview
---- buffers showing a file's content set it), else its buffer name.
+--- buffers showing a file's content set it), else its buffer name. An absolute path that is (or lies below) a
+--- symlink is also matched by its target's path (block globs, and provider rules for AI redaction).
 ---
 --- Display toggles (e.g. :Slop cloak toggle) never disable redaction.
 --- Call from the main loop (not from luv callbacks): the first query lazily loads secret providers
@@ -135,23 +136,83 @@ local function compile(glob)
   return c
 end
 
+---@class slop.secrets.Matcher
+---@field base? vim.lpeg.Pattern  matches the basename (glob without "/")
+---@field path? vim.lpeg.Pattern  matches the full path (glob with "/": as given, or below any directory)
+
+local matchers = {} ---@type table<string, slop.secrets.Matcher|false>
+local sets = {} ---@type table<string, slop.secrets.Matcher>  glob lists combined (key: globs joined by "\0")
+local nsets = 0
+
+--- Compiled form of a glob (cached; false when it is invalid). A leading "~/" is the home directory.
+---@param glob string
+---@return slop.secrets.Matcher|false
+local function matcher(glob)
+  local m = matchers[glob]
+  if m == nil then
+    local g = glob
+    if g:sub(1, 2) == "~/" then
+      -- paths are normalized ("~" expanded), so the glob must be too (glob characters in the home dir escaped)
+      local home = vim.fs.normalize(vim.uv.os_homedir() or "~"):gsub("[%*%?%[%]{}\\]", "\\%0")
+      g = home .. g:sub(2)
+    end
+    if not g:find("/", 1, true) then
+      local base = compile(g)
+      m = base and { base = base } or false
+    else
+      local full, deep = compile(g), compile("**/" .. g:gsub("^%*%*/", ""))
+      local path = full and deep and (full + deep) or full or deep
+      m = path and { path = path } or false
+    end
+    matchers[glob] = m
+  end
+  return m
+end
+
+--- Does a matcher accept a NORMALIZED path (whose basename is `base`)?
+---@param m slop.secrets.Matcher|false
+---@param path string
+---@param base string
+---@return boolean
+local function accepts(m, path, base)
+  if not m then
+    return false
+  end
+  return (m.base ~= nil and m.base:match(base) ~= nil) or (m.path ~= nil and m.path:match(path) ~= nil)
+end
+
+--- One matcher for a list of globs (any of them matches), cached per list.
+---@param globs string[]
+---@return slop.secrets.Matcher
+local function glob_set(globs)
+  local key = table.concat(globs, "\0")
+  local s = sets[key]
+  if not s then
+    s = {}
+    for _, g in ipairs(globs) do
+      local m = matcher(g)
+      if m and m.base then
+        s.base = s.base and (s.base + m.base) or m.base
+      elseif m and m.path then
+        s.path = s.path and (s.path + m.path) or m.path
+      end
+    end
+    if nsets >= 32 then -- config generations / provider rule changes: keep the cache small
+      sets, nsets = {}, 0
+    end
+    sets[key], nsets = s, nsets + 1
+  end
+  return s
+end
+
 --- Does `path` match `glob`? Globs without "/" match the basename; others match the full path
---- (also anywhere below a directory, i.e. as "**/<glob>").
+--- (also anywhere below a directory, i.e. as "**/<glob>"). A leading "~/" is the home directory.
 ---@param glob string
 ---@param path string
 ---@return boolean
 function M.match_glob(glob, path)
   path = vim.fs.normalize(path)
-  if not glob:find("/", 1, true) then
-    local pat = compile(glob)
-    return pat and pat:match(vim.fs.basename(path)) ~= nil or false
-  end
-  local pat = compile(glob)
-  if pat and pat:match(path) then
-    return true
-  end
-  local deep = compile("**/" .. glob:gsub("^%*%*/", ""))
-  return deep and deep:match(path) ~= nil or false
+  return accepts(matcher(glob), path, vim.fs.basename(path))
 end
 
 --- Globs currently blocking files (config secrets.block + provider block lists).
@@ -164,7 +225,37 @@ function M.block_globs()
   return out
 end
 
---- Must this file never be sent to AI at all? Accepts a path or a buffer number.
+--- Target of an absolute NORMALIZED path that is (or lies below) a symlink, when it differs from the path: globs and
+--- provider rules match on names, so a link with an innocent name must not expose a blocked file. Relative paths
+--- (diff paths are relative to the repository) are not resolved against Neovim's cwd.
+---@param path string
+---@return string?
+local function link_target(path)
+  if not (vim.startswith(path, "/") or path:match("^%a:[/\\]")) then
+    return nil
+  end
+  local real = vim.uv.fs_realpath(path) -- canonical already (Windows: backslashes)
+  if real and real:find("\\", 1, true) then
+    real = vim.fs.normalize(real)
+  end
+  return real ~= path and real or nil
+end
+
+--- Is `path` (or the target of a symlink at `path`) matched by the glob set?
+---@param set slop.secrets.Matcher
+---@param path string
+---@return boolean
+local function blocked_by(set, path)
+  path = vim.fs.normalize(path)
+  if accepts(set, path, vim.fs.basename(path)) then
+    return true
+  end
+  local real = link_target(path)
+  return real ~= nil and accepts(set, real, vim.fs.basename(real))
+end
+
+--- Must this file never be sent to AI at all? Accepts a path or a buffer number. A symlink is blocked when its
+--- target is.
 ---@param src string|integer
 ---@return boolean
 function M.is_blocked(src)
@@ -173,20 +264,18 @@ function M.is_blocked(src)
   if not path or path == "" then
     return false
   end
-  for _, g in ipairs(M.block_globs()) do
-    if M.match_glob(g, path) then
-      return true
-    end
-  end
-  return false
+  return blocked_by(glob_set(M.block_globs()), path)
 end
 
---- Drop blocked paths from a list.
+--- Drop blocked paths from a list (each path is normalized once; the globs are combined once per call).
 ---@param paths string[]
 ---@return string[]
 function M.filter_paths(paths)
+  ensure()
+  local set = glob_set(M.block_globs())
   return vim.tbl_filter(function(p)
-    return not M.is_blocked(p)
+    local path = to_path(p)
+    return not (path and path ~= "" and blocked_by(set, path))
   end, paths)
 end
 
@@ -416,13 +505,24 @@ local function collect(path, lines, first_row, display_only, buf)
       token_spans(lines, add)
     end
   end
+  -- AI redaction of a symlink also applies the rules of its target (display spans follow the name only)
+  local real = not display_only and path and path ~= "" and link_target(vim.fs.normalize(path)) or nil
   for _, p in ipairs(M.providers()) do
-    if
-      p.spans
-      and (not display_only or p.display)
-      and (not p.match_path or (path and path ~= "" and p.match_path(path)))
-    then
-      local ok, spans = pcall(p.spans, path or "", lines, first_row)
+    local srcs = {} ---@type string[]  paths the provider is asked about
+    if p.spans and (not display_only or p.display) then
+      if not p.match_path then
+        srcs[1] = path or ""
+      else
+        if path and path ~= "" and p.match_path(path) then
+          srcs[#srcs + 1] = path
+        end
+        if real and p.match_path(real) then
+          srcs[#srcs + 1] = real
+        end
+      end
+    end
+    for _, src in ipairs(srcs) do
+      local ok, spans = pcall(p.spans, src, lines, first_row)
       local good = ok and (spans == nil or type(spans) == "table")
       for _, s in ipairs(good and spans or {}) do
         good = good and valid_span(s)
@@ -556,15 +656,36 @@ end
 --- is blocked: the "-" lines hold the old file's content), other content lines are redacted with that file's
 --- providers. Each hunk is redacted as a whole (old side = context + "-" lines with the old path's rules, new side =
 --- context + "+" lines), so multi-line rules such as PEM key bodies apply inside diffs.
+--- `opts.root`: the directory the diff's paths are relative to (a repository's top level). With it, each path is
+--- also matched as an absolute path: absolute and `~/` globs apply, and so do the rules of a symlink's target.
 ---@param diff string
+---@param opts? {root?: string}
 ---@return string diff, integer n
-function M.redact_diff(diff)
+function M.redact_diff(diff, opts)
   ensure()
+  -- (a table only: callers pass on multiple results, e.g. redact_diff(sanitize_diff(d)) gives a count here)
+  local root = type(opts) == "table" and type(opts.root) == "string" and opts.root ~= "" and vim.fs.normalize(opts.root)
+    or nil
+  --- The path rules see: absolute below `root` (the diff header keeps the relative one).
+  ---@param p string?  nil: a hunk before any file header
+  ---@return string?
+  local function full(p)
+    if root and p and not (vim.startswith(p, "/") or p:match("^%a:[/\\]")) then
+      return vim.fs.joinpath(root, p)
+    end
+    return p
+  end
+  local function blocked(p)
+    return M.is_blocked(p) or M.is_blocked(full(p))
+  end
   local out, n = {}, 0
   local path, old_path, skipping, in_hunk = nil, nil, false, false
   local hunk = {} ---@type {sign: string, body: string}[]
   local ph = M.placeholder()
   local function count(str, needle)
+    if needle == "" then
+      return 0 -- an empty placeholder: find() would match at the same position forever
+    end
     local c, init = 0, 1
     while true do
       local a, b = str:find(needle, init, true)
@@ -582,7 +703,7 @@ function M.redact_diff(diff)
         idx[#idx + 1], bodies[#bodies + 1] = i, e.body
       end
     end
-    local red = M.redact_lines(keep == "-" and old_path or path, bodies, 0)
+    local red = M.redact_lines(full(keep == "-" and old_path or path), bodies, 0)
     local res = {}
     for j, i in ipairs(idx) do
       res[i] = red[j]
@@ -614,11 +735,11 @@ function M.redact_diff(diff)
     if b then
       flush()
       path, old_path, in_hunk = b, a, false
-      local blocked = M.is_blocked(b) and b or (a ~= b and M.is_blocked(a) and a)
-      skipping = blocked ~= false
+      local omit = blocked(b) and b or (a ~= b and blocked(a) and a)
+      skipping = omit ~= false
       out[#out + 1] = l
       if skipping then
-        out[#out + 1] = ("[slop: diff of %s omitted]"):format(blocked)
+        out[#out + 1] = ("[slop: diff of %s omitted]"):format(omit)
         n = n + 1
       end
     elseif not skipping then
@@ -632,7 +753,7 @@ function M.redact_diff(diff)
         if pa then
           old_path = pa
         end
-        if pa and pa ~= path and M.is_blocked(pa) then
+        if pa and pa ~= path and blocked(pa) then
           skipping = true
           out[#out + 1] = ("[slop: diff of %s omitted]"):format(pa)
           n = n + 1
@@ -640,7 +761,7 @@ function M.redact_diff(diff)
         local pb = not skipping and l:match("^%+%+%+ b/(.+)$")
         if pb and pb ~= path then
           path = pb
-          skipping = M.is_blocked(pb)
+          skipping = blocked(pb)
           if skipping then
             out[#out + 1] = ("[slop: diff of %s omitted]"):format(pb)
             n = n + 1
