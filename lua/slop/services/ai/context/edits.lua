@@ -96,6 +96,11 @@ function M.flush(buf)
   if tick == snap.tick then
     return
   end
+  if not trackable(buf) then
+    -- renamed to a blocked file, or grown past max_buffer_bytes (a diff of megabytes takes seconds): untracked
+    snapshots[buf] = nil
+    return
+  end
   local cur = api.nvim_buf_get_lines(buf, 0, -1, false)
   local a = table.concat(snap.lines, "\n") .. "\n"
   local b = table.concat(cur, "\n") .. "\n"

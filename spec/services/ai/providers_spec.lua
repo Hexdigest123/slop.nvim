@@ -179,6 +179,35 @@ describe("services.ai providers", function()
     assert.equal("fim", body.transformed)
   end)
 
+  it("openai-compatible FIM with n > 1 streams the first candidate only, never a mix of all", function()
+    srv = mock.start(function(_, res)
+      res.stream(200, {
+        mock.sse({ choices = { { index = 0, text = "foo" } } }),
+        mock.sse({ choices = { { index = 1, text = "BAR" } } }),
+        mock.sse({ choices = { { index = 0, text = "(x)", finish_reason = "stop" } } }),
+        mock.sse({ choices = { { index = 1, text = "BAZ", finish_reason = "stop" } } }),
+        mock.sse("[DONE]"),
+      })
+    end)
+    setup({ d = { kind = "fim", service = "deepseek", url = srv.url, model = "m", api_key = api_key } })
+    local shown = {}
+    local out = wait_done(function(done)
+      ai.complete_fim({
+        provider = "d",
+        prompt = "p",
+        suffix = "s",
+        n = 2,
+        on_chunk = function(_, text)
+          shown[#shown + 1] = text
+        end,
+        on_done = done,
+      })
+    end)
+    assert.equal(2, vim.json.decode(srv.requests[1].body).n)
+    assert.are.same({ "foo(x)" }, out.value)
+    assert.are.same({ "foo", "foo(x)" }, shown)
+  end)
+
   it("fim_template puts special tokens in the prompt and omits suffix (llama.cpp /v1/completions)", function()
     srv = mock.start(function(_, res)
       res.json(200, { choices = { { text = "mid" } } })
@@ -531,7 +560,7 @@ describe("services.ai providers", function()
     local oa, gm = vim.json.decode(srv.requests[1].body), vim.json.decode(srv.requests[2].body)
     assert.is_nil(oa.temperature)
     assert.equal("low", oa.reasoning_effort)
-    assert.is_nil(gm.generationConfig.temperature)
+    assert.is_nil((gm.generationConfig or {}).temperature) -- emptied by the removal: left out, not sent as []
     assert.equal("hi", gm.contents[1].parts[1].text)
   end)
 
@@ -551,6 +580,148 @@ describe("services.ai providers", function()
     assert.equal("config", out.err.kind)
     assert.matches("invalid request", out.err.message)
     assert.are.same({ "RequestStarted#1", "RequestFinished#1" }, seen)
+  end)
+
+  it("gemini: a full method url follows the request's stream mode", function()
+    -- like the real API: :streamGenerateContent?alt=sse answers SSE, :generateContent one JSON object
+    srv = mock.start(function(req, res)
+      local cand = { candidates = { { content = { parts = { { text = "Go" } } }, finishReason = "STOP" } } }
+      if req.path:find(":streamGenerateContent$") and req.query:find("alt=sse", 1, true) then
+        res.stream(200, { mock.sse(cand) })
+      elseif req.path:find(":generateContent$") and not req.query:find("alt=sse", 1, true) then
+        res.json(200, cand)
+      else
+        res.json(400, { error = { message = "unexpected " .. req.target } })
+      end
+    end)
+    local base = srv.url .. "/v1beta/models/gemini-x"
+    setup({
+      gen = {
+        kind = "chat",
+        service = "gemini",
+        url = base .. ":generateContent",
+        model = "gemini-x",
+        api_key = api_key,
+      },
+      sse = {
+        kind = "chat",
+        service = "gemini",
+        url = base .. ":streamGenerateContent?alt=sse",
+        model = "gemini-x",
+        api_key = api_key,
+      },
+    })
+    for _, name in ipairs({ "gen", "sse" }) do
+      for _, stream in ipairs({ true, false }) do
+        local out = wait_done(function(done)
+          ai.chat({ provider = name, stream = stream, messages = { { role = "user", content = "q" } }, on_done = done })
+        end)
+        local label = ("%s, stream = %s"):format(name, tostring(stream))
+        assert.is_nil(out.err and out.err.message, label)
+        assert.equal("Go", out.value, label)
+      end
+    end
+  end)
+
+  it("params: removals never change the provider config and never leave an empty object ([]) behind", function()
+    srv = mock.start(function(_, res)
+      res.json(200, { candidates = { { content = { parts = { { text = "ok" } } } } } })
+    end)
+    setup({
+      gm = {
+        kind = "chat",
+        service = "gemini",
+        url = srv.url,
+        model = "g",
+        api_key = api_key,
+        params = { generationConfig = { temperature = vim.NIL } },
+      },
+    })
+    -- 1st: no generation settings at all (generationConfig comes from params alone); 2nd: temperature only
+    for _, temperature in ipairs({ false, 0.4 }) do
+      wait_done(function(done)
+        ai.chat({
+          provider = "gm",
+          temperature = temperature or nil,
+          stream = false,
+          messages = { { role = "user", content = "hi" } },
+          on_done = done,
+        })
+      end)
+    end
+    assert.equal(vim.NIL, ai.provider("gm").params.generationConfig.temperature)
+    for i, req in ipairs(srv.requests) do
+      assert.is_nil(req.body:find('"temperature"', 1, true), "request " .. i .. ": " .. req.body)
+      assert.is_nil(req.body:find("[]", 1, true), "request " .. i .. ": " .. req.body)
+    end
+  end)
+
+  it("a response of an unexpected shape fails the request: on_done once, with an error", function()
+    srv = mock.start(function(_, res)
+      -- e.g. a provider pointed at another server's endpoint (llama.cpp /completion answers {content = "..."})
+      res.json(200, { content = "plain", choices = 5, candidates = { { content = { parts = "x" } } } })
+    end)
+    setup({
+      cl = { kind = "chat", service = "anthropic", url = srv.url, model = "c", api_key = api_key },
+      oa = { kind = "chat", service = "openai", url = srv.url, model = "o", api_key = api_key },
+      fim = { kind = "fim", service = "ollama", url = srv.url, model = "q", api_key = false },
+      gm = { kind = "chat", service = "gemini", url = srv.url, model = "g", api_key = api_key },
+    })
+    for _, name in ipairs({ "cl", "oa", "fim", "gm" }) do
+      local out = wait_done(function(done)
+        local req = { provider = name, stream = false, on_done = done }
+        if name == "fim" then
+          req.prompt, req.suffix = "p", "s"
+          ai.complete_fim(req)
+        else
+          req.messages = { { role = "user", content = "q" } }
+          ai.chat(req)
+        end
+      end)
+      assert.equal("decode", out.err and out.err.kind, name)
+    end
+  end)
+
+  it("a provider function that fails (fim_template, chat_fim) is a config error, never thrown at the caller", function()
+    setup({
+      tpl = {
+        kind = "fim",
+        service = "ollama",
+        url = "http://127.0.0.1:9/v1/completions",
+        model = "m",
+        api_key = false,
+        fim_template = function()
+          error("template boom")
+        end,
+      },
+      shots = {
+        kind = "chat",
+        service = "openrouter",
+        url = "http://127.0.0.1:9/v1/chat/completions",
+        model = "m",
+        api_key = false,
+        chat_fim = {
+          few_shots = function()
+            error("few_shots boom")
+          end,
+        },
+      },
+    })
+    local seen = {}
+    for _, ev in ipairs({ "RequestStarted", "RequestFinished" }) do
+      require("slop.core.events").on("ai", ev, function()
+        seen[#seen + 1] = ev
+      end)
+    end
+    for _, name in ipairs({ "tpl", "shots" }) do
+      local out = wait_done(function(done)
+        local ok, err = pcall(ai.complete_fim, { provider = name, prompt = "p", suffix = "s", on_done = done })
+        assert(ok, err)
+      end)
+      assert.equal("config", out.err.kind, name)
+      assert.matches("boom", out.err.message)
+    end
+    assert.equal(0, #seen) -- like every other request that cannot be built: no events
   end)
 
   it("chat-FIM: inline <think> reasoning is dropped; a streaming fence never freezes the live preview", function()

@@ -54,6 +54,33 @@ describe("ai api key resolution", function()
     assert.equal(2, calls)
   end)
 
+  it(
+    "a provider or agent set to false (an invalid entry, reported as such) breaks neither providers() nor health()",
+    function()
+      require("slop.config").setup({ ai = { providers = { codestral = false }, agents = { vibe = false } } })
+      local errs = table.concat(require("slop.config").errors("ai"), "\n")
+      assert.matches("ai%.providers%.codestral", errs)
+      assert.matches("ai%.agents%.vibe", errs)
+      for _, kind in ipairs({ false, "chat" }) do
+        local ok, list = pcall(ai.providers, kind or nil)
+        assert(ok, list)
+        assert.are.same({ "mistral_chat" }, list)
+      end
+      local out, orig = {}, vim.health
+      vim.health = setmetatable({}, {
+        __index = function(_, kind)
+          return function(msg)
+            out[#out + 1] = kind .. ": " .. tostring(msg)
+          end
+        end,
+      })
+      local hok, herr = pcall(ai.health)
+      vim.health = orig
+      assert(hok, herr)
+      assert.matches("mistral_chat", table.concat(out, "\n"))
+    end
+  )
+
   it("a key pasted into api_key is never echoed (errors, health)", function()
     local pasted = { "sk-live-PASTED0123456789abcdef", "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" }
     local _, err = ai.api_key({ service = "x", api_key = pasted[1] })

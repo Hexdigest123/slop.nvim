@@ -95,11 +95,42 @@ function M.schema(cfg, check)
       end, false, "false|'qwen'|'deepseek'|'codellama'|'starcoder'|'codestral'|function")
     end
   end
+  local function positive(v)
+    return type(v) == "number" and v > 0
+  end
   for name, a in pairs(cfg.agents or {}) do
-    check("agents." .. name .. ".cmd", type(a) == "table" and a.cmd or nil, "table")
-    check("agents." .. name .. ".mode", type(a) == "table" and a.mode or nil, function(v)
+    local pre = "agents." .. name
+    a = type(a) == "table" and a or {}
+    check(pre .. ".cmd", a.cmd, function(v)
+      if type(v) ~= "table" or #v == 0 then
+        return false
+      end
+      for _, x in ipairs(v) do
+        if type(x) ~= "string" then
+          return false
+        end
+      end
+      return true
+    end, false, "non-empty list of strings")
+    check(pre .. ".mode", a.mode, function(v)
       return v == nil or v == false or type(v) == "string"
     end, true, "false|mode id")
+    -- the options used when the agent starts or answers: a wrong type would only fail there, obscurely
+    check(pre .. ".env", a.env, function(v)
+      if type(v) ~= "table" then
+        return false
+      end
+      for _, x in pairs(v) do
+        if type(x) ~= "string" and type(x) ~= "number" and type(x) ~= "boolean" then
+          return false
+        end
+      end
+      return true
+    end, true, "table of name = value")
+    check(pre .. ".auth_method", a.auth_method, "string", true)
+    check(pre .. ".timeout", a.timeout, positive, true, "positive number (ms)")
+    check(pre .. ".init_timeout", a.init_timeout, positive, true, "positive number (ms)")
+    check(pre .. ".read_outside_root", a.read_outside_root, "boolean", true)
   end
 end
 
@@ -120,7 +151,8 @@ end
 function M.providers(kind)
   local out = {}
   for name, p in pairs(cfg().providers) do
-    if not kind or p.kind == kind then
+    -- (an entry that is no table, e.g. `codestral = false`, is a config error and no provider)
+    if type(p) == "table" and (not kind or p.kind == kind) then
       out[#out + 1] = name
     end
   end
@@ -329,22 +361,31 @@ local function run(kind, req, finish, on_text)
   if p.max_tokens and akind == "chat" then
     areq.max_tokens = math.max(areq.max_tokens or 0, p.max_tokens)
   end
-  if chat_fim then
-    local cf = require("slop.services.ai.chat_fim")
-    areq = {
-      messages = cf.messages(p, req),
-      max_tokens = areq.max_tokens,
-      temperature = req.temperature,
-      stream = stream,
-    }
-  end
-  local hreq = adapter[akind](p, areq, key)
-  if type(hreq.body) == "table" then
-    if type(p.params) == "table" then
-      hreq.body = vim.tbl_deep_extend("force", hreq.body, p.params)
+  -- user code runs here (fim_template, chat_fim templates and few_shots, registered adapters): its failure is a
+  -- config error for on_done, like a failing transform, never an error thrown at the caller
+  local built, hreq = pcall(function()
+    if chat_fim then
+      areq = {
+        messages = require("slop.services.ai.chat_fim").messages(p, req),
+        max_tokens = areq.max_tokens,
+        temperature = req.temperature,
+        stream = stream,
+      }
     end
-    -- after the merge, so params = { temperature = vim.NIL } drops a field the model rejects
-    providers.compact(hreq.body)
+    local r = adapter[akind](p, areq, key)
+    if type(r) == "table" and type(r.body) == "table" then
+      if type(p.params) == "table" then
+        -- a copy: the merge keeps sub-tables the body lacks by reference, and compact() edits them in place
+        r.body = vim.tbl_deep_extend("force", r.body, vim.deepcopy(p.params))
+      end
+      -- after the merge, so params = { temperature = vim.NIL } drops a field the model rejects
+      providers.compact(r.body)
+    end
+    return r
+  end)
+  if not built or type(hreq) ~= "table" then
+    local why = built and "no request" or (tostring(hreq):gsub("^[^\n]-:%d+: ", ""))
+    return fail(cb, "config", ("provider %s: cannot build the request: %s"):format(label, why))
   end
   if type(p.headers) == "table" then
     hreq.headers = vim.tbl_extend("force", hreq.headers or {}, p.headers)
@@ -365,12 +406,17 @@ local function run(kind, req, finish, on_text)
   local acc = {}
   local text = ""
   local stream_err
+  local bad_chunk -- first chunk the adapter could not read (an error only when no text came at all)
   local shown = ""
   local t0 = vim.uv.hrtime()
   if stream then
     hreq.stream = adapter.stream_mode or "sse"
     hreq.on_chunk = function(chunk)
-      local delta, _, emsg = adapter.delta(chunk, akind)
+      local ok, delta, _, emsg = pcall(adapter.delta, chunk, akind)
+      if not ok then
+        bad_chunk = bad_chunk or (tostring(delta):gsub("^[^\n]-:%d+: ", ""))
+        return
+      end
       if emsg then
         stream_err = emsg
       end
@@ -400,8 +446,8 @@ local function run(kind, req, finish, on_text)
     if err then
       if err.response then
         local body = err.response:json()
-        local msg = (adapter.error_message or providers.error_message)(body)
-        if msg then
+        local okm, msg = pcall(adapter.error_message or providers.error_message, body)
+        if okm and type(msg) == "string" then
           err.message = ("%s: %s"):format(err.message, msg)
         end
       end
@@ -415,17 +461,27 @@ local function run(kind, req, finish, on_text)
     if stream_err then
       return finish(nil, nil, { kind = "http", message = stream_err })
     end
+    if bad_chunk and text == "" then
+      return finish(nil, nil, { kind = "decode", message = "unexpected stream data: " .. bad_chunk })
+    end
     local items
     if not stream then
       local body, derr = res:json()
       if body == nil then
         return finish(nil, nil, { kind = "decode", message = "invalid JSON response: " .. tostring(derr) })
       end
-      if akind == "chat" then
-        text = adapter.parse_chat(body) or ""
-      else
-        items = adapter.parse_fim(body) or {}
-        text = items[1] or ""
+      -- a body of another shape (another server's endpoint) must still end in exactly one on_done
+      local parsed, perr = pcall(function()
+        if akind == "chat" then
+          text = adapter.parse_chat(body) or ""
+        else
+          items = adapter.parse_fim(body) or {}
+          text = items[1] or ""
+        end
+      end)
+      if not parsed then
+        local why = tostring(perr):gsub("^[^\n]-:%d+: ", "")
+        return finish(nil, nil, { kind = "decode", message = "unexpected response: " .. why })
       end
     end
     if chat_fim then
@@ -493,9 +549,8 @@ end
 function M.health()
   local h = vim.health
   local c = cfg()
-  local names = vim.tbl_keys(c.providers)
-  table.sort(names)
-  for _, name in ipairs(names) do
+  -- entries that are no table were reported with the config errors above
+  for _, name in ipairs(M.providers()) do
     local p = c.providers[name]
     local source, var = M.api_key_source(p)
     local label = ("provider `%s` (%s, %s)"):format(name, tostring(p.kind), tostring(p.service))
@@ -526,7 +581,8 @@ function M.health()
   local agents = vim.tbl_keys(c.agents)
   table.sort(agents)
   for _, name in ipairs(agents) do
-    local cmd = c.agents[name].cmd
+    local a = c.agents[name]
+    local cmd = type(a) == "table" and a.cmd or nil
     local exe = type(cmd) == "table" and cmd[1] or nil
     if exe and vim.fn.executable(exe) == 1 then
       h.ok(("agent `%s`: `%s` found"):format(name, exe))

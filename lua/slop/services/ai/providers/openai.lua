@@ -92,7 +92,14 @@ function M.delta(ev)
   if obj.error then
     return nil, true, P.error_message(obj)
   end
-  local c = obj.choices and obj.choices[1]
+  -- with n > 1 the chunks of every candidate arrive interleaved, each with its index: stream the first candidate
+  local c
+  for _, x in ipairs(type(obj.choices) == "table" and obj.choices or {}) do
+    if type(x) == "table" and (x.index == nil or x.index == 0) then
+      c = x
+      break
+    end
+  end
   local text = choice_text(c)
   local done = type(c) == "table" and c.finish_reason ~= nil and c.finish_reason ~= vim.NIL or nil
   return text ~= "" and text or nil, done

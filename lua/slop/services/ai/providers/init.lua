@@ -87,18 +87,26 @@ end
 
 -- Shared helpers for adapters --------------------------------------------------------------------
 
+---@param t table
+---@return boolean removed
+local function compact(t)
+  local removed = false
+  for k, v in pairs(t) do
+    if v == vim.NIL or (type(v) == "table" and compact(v) and next(v) == nil) then
+      t[k] = nil
+      removed = true
+    end
+  end
+  return removed
+end
+
 --- Remove nil-ish values (vim.NIL) from a request body, nested tables included (`params` uses vim.NIL to drop a
---- field, e.g. generationConfig = { temperature = vim.NIL }).
+--- field, e.g. generationConfig = { temperature = vim.NIL }). A table those removals leave empty goes too: an
+--- empty table is encoded as a JSON array (`"generationConfig":[]` is an invalid request).
 ---@param t table
 ---@return table
 function M.compact(t)
-  for k, v in pairs(t) do
-    if v == vim.NIL then
-      t[k] = nil
-    elseif type(v) == "table" then
-      M.compact(v)
-    end
-  end
+  compact(t)
   return t
 end
 

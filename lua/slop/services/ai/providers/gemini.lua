@@ -7,14 +7,30 @@ local M = {}
 
 M.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
 
---- Full endpoint for a provider: url may be the models base (model + method appended) or a full method url.
+--- Full endpoint for a provider: url may be the models base (model + method appended) or a full method url. The
+--- method of a full url follows the request: a streamed request needs :streamGenerateContent?alt=sse (SSE), any
+--- other one :generateContent (one JSON object); either answer to the other request would read as empty.
 ---@param p slop.ai.ProviderConfig
 ---@param stream boolean
 ---@return string
 function M.endpoint(p, stream)
   local url = (p.url and p.url ~= "") and p.url or M.base_url
-  if url:find(":generateContent", 1, true) or url:find(":streamGenerateContent", 1, true) then
-    return url
+  for _, method in ipairs({ ":streamGenerateContent", ":generateContent" }) do
+    local base, rest = url:match("^(.-)" .. method .. "(.*)$")
+    if base then
+      if rest ~= "" and rest:sub(1, 1) ~= "?" then
+        return url -- more path after the method: no API url, used as it is
+      end
+      local params = stream and { "alt=sse" } or {}
+      for kv in rest:sub(2):gmatch("[^&]+") do
+        if not kv:match("^alt=") then
+          params[#params + 1] = kv
+        end
+      end
+      return base
+        .. (stream and ":streamGenerateContent" or ":generateContent")
+        .. (#params > 0 and ("?" .. table.concat(params, "&")) or "")
+    end
   end
   url = url:gsub("/+$", "")
   if stream then

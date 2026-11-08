@@ -51,8 +51,8 @@ function M.take_tail(lines, max)
   end
   local total = #lines[n]
   if total > max then
-    local l, i = lines[n], #lines[n] - max + 1
-    if vim.str_utf_start(l, i) ~= 0 then -- never start inside a multibyte character
+    local l, i = lines[n], #lines[n] - math.max(max, 0) + 1
+    if i <= #l and vim.str_utf_start(l, i) ~= 0 then -- never start inside a multibyte character
       i = i + vim.str_utf_end(l, i) + 1
     end
     return { l:sub(i) }, n == 1 and #lines[n] <= max
@@ -80,8 +80,8 @@ function M.take_head(lines, max)
   end
   local total = #lines[1]
   if total > max then
-    local l, e = lines[1], max
-    if vim.str_utf_end(l, e) ~= 0 then -- never end inside a multibyte character
+    local l, e = lines[1], math.max(max, 0)
+    if e >= 1 and vim.str_utf_end(l, e) ~= 0 then -- never end inside a multibyte character
       e = e + vim.str_utf_start(l, e) - 1
     end
     return { l:sub(1, e) }, false
@@ -273,7 +273,8 @@ local function edits_blocks(buf)
   local out = {}
   for i = #ev, 1, -1 do -- most recent first (priority)
     local e = ev[i]
-    if api.nvim_buf_is_valid(e.buf) and not secrets.is_blocked(e.path) then
+    -- the buffer's current name counts too: one renamed to a blocked file (:saveas .env) is a secrets file now
+    if api.nvim_buf_is_valid(e.buf) and not secrets.is_blocked(e.path) and not secrets.is_blocked(e.buf) then
       -- redact_diff is hunk-aware: it sees the lines without their "+"/"-"/" " prefix, so the PEM rule and the
       -- path's providers apply (redact_text would miss a pasted key). It wants a git header, dropped again.
       local hdr = ("diff --git a/%s b/%s\n"):format(e.path, e.path)
@@ -293,7 +294,12 @@ local function ring_blocks(buf, win_first, win_last)
   for i = #ring, 1, -1 do
     local c = ring[i]
     local overlaps = c.buf == buf and c.srow <= win_last and (c.srow + #c.lines) >= win_first
-    if not overlaps and api.nvim_buf_is_valid(c.buf) and not secrets.is_blocked(c.path) then
+    if
+      not overlaps
+      and api.nvim_buf_is_valid(c.buf)
+      and not secrets.is_blocked(c.path)
+      and not secrets.is_blocked(c.buf)
+    then
       local lines = secrets.redact_lines(c.path, c.lines, c.srow)
       out[#out + 1] = snippet_block(relpath(c.path, buf), lines)
     end
@@ -690,14 +696,18 @@ function M.file(path, opts)
   end
   abs = vim.fs.normalize(abs)
   local secrets = require("slop.core.secrets")
-  if secrets.is_blocked(abs) then
+  -- a symlink with an innocent name must not expose a blocked file (block globs and cloak rules match names)
+  local real = vim.uv.fs_realpath(abs)
+  real = real and vim.fs.normalize(real) or nil
+  if secrets.is_blocked(abs) or (real and secrets.is_blocked(real)) then
     return nil, "blocked by secrets rules: " .. path
   end
   local max = opts.max_bytes or (100 * 1024)
   local text
   local b = -1 -- exact name match (bufnr() takes a file-pattern and accepts partial matches)
   for _, x in ipairs(api.nvim_list_bufs()) do
-    if api.nvim_buf_is_loaded(x) and vim.fs.normalize(api.nvim_buf_get_name(x)) == abs then
+    local name = api.nvim_buf_is_loaded(x) and vim.fs.normalize(api.nvim_buf_get_name(x))
+    if name and (name == abs or name == real) then
       b = x
       break
     end
@@ -728,10 +738,15 @@ function M.file(path, opts)
   pcall(function()
     rel = require("slop.core.project").relpath(abs, root)
   end)
+  -- the rules of the name and of the file it resolves to
+  text = secrets.redact_text(text, abs)
+  if real and real ~= abs then
+    text = secrets.redact_text(text, real)
+  end
   return {
     path = abs,
     rel = rel,
-    text = (secrets.redact_text(text, abs)),
+    text = text,
     filetype = vim.filetype.match({ filename = abs }),
     truncated = truncated or nil,
   }

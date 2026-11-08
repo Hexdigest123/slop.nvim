@@ -89,6 +89,18 @@ describe("services.ai.context", function()
       end
       assert.are.same({ "xyz" }, (ctx.take_tail({ "abcxyz" }, 3)))
       assert.are.same({}, (ctx.take_tail({}, 3)))
+      -- a share of 0 chars (any budget below 7 is a valid config): nothing kept, no "index out of range"
+      assert.are.same({ { "" }, false }, { ctx.take_tail({ "a", "bc" }, 0) })
+      assert.are.same({ { "" }, false }, { ctx.take_head({ "ab", "c" }, 0) })
+    end)
+
+    it("fim() works with any positive budget", function()
+      local b = file_buf(h.tmpdir("tiny") .. "/t.lua", { "local a = 1", "local b = foo(2)", "return a" }, "lua")
+      for _, budget in ipairs({ 1, 5, 6, 7, 20 }) do
+        local ok, c = pcall(ctx.fim, b, 1, 14, { budget = budget, neighbors = false, recent_edits = false })
+        assert(ok, c)
+        assert.truthy(#c.prompt + #c.suffix <= 2 * budget + 40, budget)
+      end
     end)
 
     it("split_budget is 35/15/35/15 and resolve_budget handles auto", function()
@@ -243,6 +255,37 @@ describe("services.ai.context", function()
       assert.matches("%-%- %-local A = 1\n%-%- %+local A = 2 %-%- <redacted>", c.prompt)
       assert.matches("%-%- End of recent edits", c.prompt)
       assert.falsy(c.prompt:find("SECRETX", 1, true))
+    end)
+
+    it("recent edits and ring chunks stop for a buffer renamed to a blocked file or grown too big", function()
+      local edits = require("slop.services.ai.context.edits")
+      local dir = h.tmpdir("renamed")
+      local o = file_buf(dir .. "/notes.txt", { "first line", "second line", "third line" }, "text")
+      edits.snapshot(o, true)
+      api.nvim_buf_set_lines(o, 0, 1, false, { "password = hunter2 for the staging database" })
+      edits.flush(o)
+      edits.ring_add(o, 0, api.nvim_buf_get_lines(o, 0, 3, false))
+      assert.equal(1, #edits.events())
+      assert.equal(1, #edits.ring())
+      -- :saveas / :file .env: what was recorded under the old name must not be sent any more
+      vim.cmd("silent file " .. vim.fn.fnameescape(dir .. "/.env"))
+      api.nvim_buf_set_lines(o, 1, 2, false, { "token = hunter3 for production" })
+      edits.flush(o)
+      local b = file_buf(dir .. "/main.lua", { "x", "" }, "lua")
+      local c = ctx.fim(b, 1, 0, { neighbors = false })
+      assert.falsy(c.prompt:find("hunter", 1, true))
+      -- grown past max_buffer_bytes (e.g. :r of a big log): no longer diffed, a multi-MB diff freezes the editor
+      edits.opts.max_buffer_bytes = 300
+      local g = file_buf(dir .. "/grow.lua", { "local x = 1" }, "lua")
+      edits.snapshot(g, true)
+      local n = #edits.events()
+      local big = {}
+      for i = 1, 20 do
+        big[i] = ("local v%d = %s"):format(i, string.rep("y", 40))
+      end
+      api.nvim_buf_set_lines(g, 0, -1, false, big)
+      edits.flush(g)
+      assert.equal(n, #edits.events())
     end)
 
     it("ring chunks (e.g. yanked text) from other buffers are added as snippets", function()
@@ -406,6 +449,24 @@ describe("services.ai.context", function()
       vim.cmd.enew()
       assert.equal("#!/bin/sh\n", ctx.file("tls/server", { root = dir }).text)
       assert.equal("disk foo\n", ctx.file("foo.lua", { root = dir }).text)
+    end)
+
+    it("file() / rules() refuse a symlink to a blocked file and redact with the target's rules", function()
+      local dir = h.tmpdir("symlink")
+      h.write(dir .. "/.env", "DB_PASSWORD=hunter2\n")
+      h.write(dir .. "/notes.txt", "token SECRET77 here\n")
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/settings.txt"))
+      assert(vim.uv.fs_symlink(dir .. "/.env", dir .. "/AGENTS.md"))
+      assert(vim.uv.fs_symlink(dir .. "/notes.txt", dir .. "/alias.txt"))
+      local fc, err = ctx.file("settings.txt", { root = dir })
+      assert.is_nil(fc and fc.text)
+      assert.matches("blocked", err)
+      assert.are.same({}, ctx.rules(dir, { "AGENTS.md" }))
+      -- a link to an ordinary file is read (redacted), from the target's live buffer too
+      assert.equal("token <redacted> here\n", ctx.file("alias.txt", { root = dir }).text)
+      vim.cmd.edit(vim.fn.fnameescape(dir .. "/notes.txt"))
+      api.nvim_buf_set_lines(0, 0, -1, false, { "unsaved" })
+      assert.equal("unsaved", ctx.file("alias.txt", { root = dir }).text)
     end)
 
     it("files() never blocks on a slow git: bounded first call, git's list replaces the walk later", function()
