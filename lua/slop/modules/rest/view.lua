@@ -180,14 +180,15 @@ end
 local function open()
   local c = cfg()
   local scratch = require("slop.core.ui.scratch")
-  local fresh = scratch.find(M.NAME) == nil
   local buf, win = scratch.open(M.NAME, {
     layout = c.result.layout,
     enter = c.result.focus == true,
     size = c.result.size,
   })
-  if fresh then
+  -- not only for a new buffer: :bdelete keeps the buffer but clears its mappings (and variables)
+  if not vim.b[buf].slop_rest_keys then
     pcall(require("slop.core.keymaps").apply_buf, "rest", buf)
+    vim.b[buf].slop_rest_keys = true
   end
   return buf, win
 end

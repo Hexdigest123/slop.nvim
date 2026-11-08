@@ -387,23 +387,31 @@ end
 
 -- Entry points ------------------------------------------------------------------------------------
 
---- Request under the cursor of an http buffer.
----@param buf? integer
----@return slop.rest.Request?
-function M.request_at_cursor(buf)
-  buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
+--- Parse a buffer (unsaved edits count).
+---@param buf integer
+---@return slop.rest.File
+local function parse_buf(buf)
   local name = api.nvim_buf_get_name(buf)
   local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
   local parsed = require("slop.modules.rest.parser").parse(lines, name ~= "" and vim.fs.normalize(name) or nil)
-  -- bufwinid() is the FIRST window showing the buffer, not necessarily the one the user is in
-  local win = buf == api.nvim_get_current_buf() and api.nvim_get_current_win() or vim.fn.bufwinid(buf)
-  local lnum = win ~= -1 and api.nvim_win_get_cursor(win)[1] or 1
   if name == "" then
     -- no file to re-read later: the buffer's variables and requests (dependencies) travel with each request
     for _, r in ipairs(parsed.requests) do
       r._vars, r._requests = parsed.vars, parsed.requests
     end
   end
+  return parsed
+end
+
+--- Request under the cursor of an http buffer.
+---@param buf? integer
+---@return slop.rest.Request?
+function M.request_at_cursor(buf)
+  buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
+  local parsed = parse_buf(buf)
+  -- bufwinid() is the FIRST window showing the buffer, not necessarily the one the user is in
+  local win = buf == api.nvim_get_current_buf() and api.nvim_get_current_win() or vim.fn.bufwinid(buf)
+  local lnum = win ~= -1 and api.nvim_win_get_cursor(win)[1] or 1
   return require("slop.modules.rest.parser").at(parsed, lnum)
 end
 
@@ -417,14 +425,18 @@ function M.run_cursor()
   M.run(req)
 end
 
---- Find a request by name (current buffer's file first, then the whole root).
+--- Find a request by name (the current http buffer first, wherever its cursor is, then the whole root).
 ---@param name string
 ---@return slop.rest.Request?
 function M.find(name)
   local root = M.root()
-  local cur = M.request_at_cursor(0)
-  local r = lookup(name, cur or {}, root)
-  return r
+  local from = {}
+  -- only an http buffer has requests of its own: "### Login" + "GET https://..." in a README are not one
+  if vim.bo.filetype == "http" then
+    local parsed = parse_buf(api.nvim_get_current_buf())
+    from = { file = parsed.file, _requests = not parsed.file and parsed.requests or nil }
+  end
+  return lookup(name, from, root)
 end
 
 --- <leader>rr: in http buffers the request under the cursor, else the picker.
@@ -519,7 +531,14 @@ function M.pick()
   local function pad(s, w)
     local d = vim.fn.strdisplaywidth(s)
     if d > w then
-      return vim.fn.strcharpart(s, 0, w - 1) .. "…"
+      -- cut by display cells, not characters: a CJK character takes two
+      local n = vim.fn.strchars(s)
+      repeat
+        n = n - 1
+        s = vim.fn.strcharpart(s, 0, n)
+      until n <= 0 or vim.fn.strdisplaywidth(s) <= w - 1
+      s = s .. "…"
+      d = vim.fn.strdisplaywidth(s)
     end
     return s .. string.rep(" ", w - d)
   end
@@ -550,7 +569,8 @@ function M.pick()
           )
         )
       end
-      return { lines = lines, filetype = "http" }
+      -- path: cloak masks the preview like the file the lines come from (Authorization:/Cookie: values)
+      return { lines = lines, filetype = "http", path = it.req.file }
     end,
     actions = { ["<C-e>"] = "edit", ["<C-v>"] = "vsplit" },
     on_select = function(it, action)

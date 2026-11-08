@@ -161,6 +161,22 @@ describe("rest runner", function()
       assert.equal("/jar", out.cookie_jar)
     end)
 
+    it("a variable has one value per request: a {{$uuid}} inside a file variable is generated once", function()
+      local r = req('PUT /orders/{{id}}\nX-Id: {{id}}\n\n{"id": "{{id}}", "other": "{{$uuid}}"}')
+      local out = assert(runner.resolve(r, opts({ file = { id = "{{$uuid}}", ref = "{{id}}" }, process = false })))
+      local id = out.url:match("/orders/(.+)$")
+      assert.matches("^%x+%-%x+%-4", id)
+      assert.are.same({ { "X-Id", id } }, out.headers)
+      local body = vim.json.decode(out.body)
+      assert.equal(id, body.id)
+      assert.not_equal(id, body.other) -- a {{$uuid}} written in the request itself is new at each place
+      -- a file variable referencing it sees the same value too
+      local r2 = req("GET /a/{{id}}/{{ref}}")
+      local o2 = assert(runner.resolve(r2, opts({ file = { id = "{{$uuid}}", ref = "{{id}}" }, process = false })))
+      local a, b = o2.url:match("^/a/(.-)/(.-)$")
+      assert.equal(a, b)
+    end)
+
     it("@no-cookie-jar and cookies=false drop the jar", function()
       assert.is_nil(runner.resolve(req("# @no-cookie-jar\nGET /a"), opts()).cookie_jar)
       assert.is_nil(runner.resolve(req("GET /a"), opts(nil, { cookie_jar = false })).cookie_jar)
@@ -259,6 +275,21 @@ describe("rest runner", function()
       assert.equal(#res.body, res.size)
     end)
 
+    it("HEAD has an empty body (curl --head also writes the headers to the body file)", function()
+      srv = mock.start(function(_, res)
+        res.send(200, "", { ["Content-Type"] = "application/json", ["X-Head"] = "yes" })
+      end)
+      local res, err = run(base({ method = "HEAD", url = srv.url .. "/h" }))
+      assert.is_nil(err)
+      assert.equal("HEAD", srv.requests[1].method)
+      assert.equal(200, res.status)
+      assert.equal("", res.body)
+      assert.equal(0, res.size)
+      assert.truthy(vim.iter(res.headers):any(function(hd)
+        return hd[1] == "X-Head" and hd[2] == "yes"
+      end))
+    end)
+
     it("uses the cookie jar across requests", function()
       srv = mock.start(function(req, res)
         if req.path == "/login" then
@@ -331,6 +362,91 @@ describe("rest runner", function()
       run(base({ url = srv.url .. "/login", cookie_jar = jar }))
       assert.equal(384, vim.uv.fs_stat(jar).mode % 512)
     end)
+  end)
+
+  it(
+    "config: default headers map names to strings, dynamic maps names to functions (else every run crashed)",
+    function()
+      local config = require("slop.config")
+      for _, bad in ipairs({ { headers = { "X-Api: 1" } }, { headers = { ["X-Retry"] = 3 } } }) do
+        require("slop").setup({ rest = bad })
+        local errs = config.errors("rest")
+        assert.equal(1, #errs, vim.inspect(errs))
+        assert.matches("^rest%.headers: expected table of name = string", errs[1])
+      end
+      require("slop").setup({ rest = { dynamic = { now = "x" } } })
+      assert.matches("^rest%.dynamic: expected table of name = function", config.errors("rest")[1])
+      require("slop").setup({
+        rest = {
+          headers = { ["X-Api"] = "1" },
+          dynamic = {
+            now = function()
+              return "x"
+            end,
+          },
+        },
+      })
+      assert.are.same({}, config.errors("rest"))
+    end
+  )
+
+  it("execute() keeps the URL (query strings carry API keys) off the argv of the curl it runs", function()
+    -- a stand-in curl on $PATH records its argv and the config files (-K) it was given
+    local dir = h.tmpdir("fakecurl")
+    local out = dir .. "/argv"
+    h.write(
+      dir .. "/curl",
+      table.concat({
+        "#!/bin/sh",
+        'printf "%s\\n" "$@" > "' .. out .. '"',
+        'while [ $# -gt 0 ]; do [ "$1" = "-K" ] && cat "$2" >> "' .. out .. '.k"; shift; done',
+        "exit 7",
+      }, "\n")
+    )
+    vim.fn.setfperm(dir .. "/curl", "rwx------")
+    local path = vim.env.PATH
+    vim.env.PATH = dir .. ":" .. path
+    local got
+    local ok, err = pcall(runner.execute, base({ url = "http://x.test/a?api_key=SECRET" }), function(res, e)
+      got = { res = res, err = e }
+    end)
+    vim.env.PATH = path
+    assert(ok, err)
+    assert.truthy(vim.wait(5000, function()
+      return got ~= nil
+    end))
+    assert.truthy(got.err, "the stand-in curl fails the request")
+    local argv = assert(h.read(out))
+    assert.falsy(argv:find("SECRET", 1, true), argv)
+    assert.matches('url = "http://x.test/a%?api_key=SECRET"', assert(h.read(out .. ".k")))
+  end)
+
+  it("execute(): curl killed by a signal (luv reports code 0) is an error, not a status-0 success", function()
+    local real = package.loaded["slop.core.http"]
+    package.loaded["slop.core.http"] = {
+      curl = function(_, o)
+        vim.schedule(function()
+          o.on_exit(0, "", "", 9)
+        end)
+        return {
+          cancel = function() end,
+          is_active = function()
+            return true
+          end,
+        }
+      end,
+    }
+    local got
+    runner.execute(base(), function(res, err)
+      got = { res = res, err = err }
+    end)
+    package.loaded["slop.core.http"] = real
+    assert.is_true(vim.wait(1000, function()
+      return got ~= nil
+    end))
+    assert.is_nil(got.res)
+    assert.equal("curl", got.err.kind)
+    assert.matches("killed by signal 9", got.err.message)
   end)
 
   it("@timeout 0 runs curl without the backstop timeout", function()

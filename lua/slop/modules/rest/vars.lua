@@ -49,7 +49,8 @@ function M.chain_ref(ref)
   return nil
 end
 
---- Pure JSONPath-lite: "$", ".key", "['key']", '["key"]', "[n]" (0-based) on decoded JSON.
+--- Pure JSONPath-lite: "$", ".key", "['key']", '["key"]', "[n]" (0-based) on decoded JSON (JSON null = vim.NIL:
+--- found, but it has no members).
 ---@param data any
 ---@param path string
 ---@return any value, boolean found
@@ -76,7 +77,7 @@ function M.jsonpath(data, path)
     else
       cur = cur[key]
     end
-    if cur == nil or cur == vim.NIL then
+    if cur == nil then
       return nil, false
     end
     p = rest
@@ -89,7 +90,7 @@ end
 local function stringify(v)
   if type(v) == "string" then
     return v
-  elseif v == nil or v == vim.NIL then -- a found JSON null (luanil decodes a top-level null to nil)
+  elseif v == nil or v == vim.NIL then -- a found JSON null
     return "null"
   elseif type(v) == "number" then
     -- tostring() is %.14g: 100000000000001 -> "1e+14", 3.141592653589793 -> "3.1415926535898"
@@ -121,7 +122,8 @@ function M.from_response(res, kind, path)
   if path == "" or path == "*" then
     return res.body or ""
   end
-  local ok, data = pcall(vim.json.decode, res.body or "", { luanil = { object = true, array = true } })
+  -- nulls stay vim.NIL: {"deletedAt": null} has a deletedAt (null), and objects re-encode with their null members
+  local ok, data = pcall(vim.json.decode, res.body or "")
   if not ok then
     return nil
   end
@@ -227,8 +229,9 @@ end
 ---@param depth integer
 ---@param missing string[]
 ---@param seen_missing table<string, boolean>
+---@param memo table<string, string>
 ---@return string
-local function expand(text, ctx, stack, depth, missing, seen_missing)
+local function expand(text, ctx, stack, depth, missing, seen_missing, memo)
   return (
     text:gsub("{{(.-)}}", function(inner)
       local ref = vim.trim(inner)
@@ -263,10 +266,13 @@ local function expand(text, ctx, stack, depth, missing, seen_missing)
         return miss()
       end
       if nested and raw:find("{{", 1, true) then
-        stack[ref] = true
-        local v = expand(raw, ctx, stack, depth + 1, missing, seen_missing)
-        stack[ref] = nil
-        return v
+        -- one value per variable: `@id = {{$uuid}}` is the same id in the url, the headers and the body
+        if memo[ref] == nil then
+          stack[ref] = true
+          memo[ref] = expand(raw, ctx, stack, depth + 1, missing, seen_missing, memo)
+          stack[ref] = nil
+        end
+        return memo[ref]
       end
       return raw
     end)
@@ -276,13 +282,15 @@ end
 --- Expand every {{...}} in `text`.
 ---@param text string?
 ---@param ctx slop.rest.VarCtx
+---@param memo? table<string, string>  values of variables already expanded: pass the same table for every text of
+---  one request, so that a variable (e.g. `@id = {{$uuid}}`) has one value in all of them
 ---@return string? text, string[] unresolved
-function M.expand(text, ctx)
+function M.expand(text, ctx, memo)
   if text == nil then
     return nil, {}
   end
   local missing = {}
-  local out = expand(text, ctx, {}, 0, missing, {})
+  local out = expand(text, ctx, {}, 0, missing, {}, memo or {})
   return out, missing
 end
 

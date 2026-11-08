@@ -164,6 +164,28 @@ describe("rest vars", function()
       assert.equal("/orders/8080", (vars.expand("/orders/{{port}}", { env = { port = 8080 }, process = false })))
     end)
 
+    it("a JSON null inside the body is null (not unresolved); objects and arrays keep their nulls", function()
+      local body = '{"deletedAt": null, "list": [1, null, 3], "o": {"x": null, "y": 1}}'
+      local nctx = {
+        response = function()
+          return { status = 200, headers = {}, body = body }
+        end,
+        process = false,
+      }
+      local function get(path)
+        return vars.expand("{{r.response.body." .. path .. "}}", nctx)
+      end
+      local out, missing = get("$.deletedAt")
+      assert.are.same({}, missing)
+      assert.equal("null", out)
+      assert.equal("null", (get("$.list[1]")))
+      assert.equal("[1,null,3]", (get("$.list")))
+      assert.are.same({ x = vim.NIL, y = 1 }, vim.json.decode((get("$.o"))))
+      -- a null has no members: walking into it is unresolved
+      local _, m = get("$.deletedAt.x")
+      assert.are.same({ "r.response.body.$.deletedAt.x" }, m)
+    end)
+
     it("chain_ref() and refs()", function()
       assert.are.same({ "a.b", "login", "body", "$.x" }, {
         "a.b",
@@ -222,6 +244,18 @@ describe("rest env files", function()
     local none = env.load(root .. "/api/x.http", root, nil)
     assert.are.same({ s = "root-shared", a = "shared" }, none)
     assert.are.same({ "dev", "prod" }, env.names(files))
+  end)
+
+  it("$shared stays below the named env, also when it comes from the private file", function()
+    local root = h.tmpdir("sharedroot")
+    h.write(root .. "/http-client.env.json", vim.json.encode({ dev = { host = "dev-host" } }))
+    h.write(
+      root .. "/http-client.private.env.json",
+      vim.json.encode({ ["$shared"] = { host = "shared-host", token = "t" }, dev = { secret = "s" } })
+    )
+    h.write(root .. "/x.http", "GET /")
+    assert.are.same({ host = "dev-host", token = "t", secret = "s" }, (env.load(root .. "/x.http", root, "dev")))
+    assert.are.same({ host = "shared-host", token = "t" }, (env.load(root .. "/x.http", root, nil)))
   end)
 
   it("reports an env file with invalid JSON once (instead of silently ignoring it)", function()

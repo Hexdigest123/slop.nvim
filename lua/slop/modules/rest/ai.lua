@@ -171,6 +171,45 @@ function M.redact(text, src)
   return M.mask_text(out)
 end
 
+--- Values that never reach the AI, even when a response echoes them (an echo endpoint, a validation error quoting
+--- the raw body, a debug page dumping the environment): every value of the http-client.private.env.json files and
+--- of the nearest .env that `file` sees. Longest first. Skipped: values under 3 characters, and .env values under 6
+--- characters of names that are not sensitive (`DEBUG=true`, `PORT=3000`: no secrets, and replacing every `true`
+--- would garble the context).
+---@param file string
+---@param root string
+---@return string[]
+function M.secret_values(file, root)
+  local env = require("slop.modules.rest.env")
+  local seen, out = {}, {}
+  local function add(v, min)
+    if type(v) == "number" and v == math.floor(v) then
+      v = ("%d"):format(v)
+    end
+    if type(v) == "string" and #v >= min and not seen[v] then
+      seen[v] = true
+      out[#out + 1] = v
+    end
+  end
+  for k, v in pairs((env.dotenv(file, root, cfg().env_file))) do
+    add(v, M.sensitive(k) and 3 or 6)
+  end
+  local _, files = env.load(file, root, nil)
+  for _, path in ipairs(files) do
+    if vim.fs.basename(path) == env.PRIVATE then
+      for _, vars in pairs(require("slop.core.project").read_json(path) or {}) do
+        for _, v in pairs(type(vars) == "table" and vars or {}) do
+          add(v, 3)
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    return #a > #b
+  end)
+  return out
+end
+
 -- Context -------------------------------------------------------------------------------------------
 
 --- Framework route hint from a file path (SvelteKit, Next.js).
@@ -381,20 +420,21 @@ end
 
 --- Target buffer for generated requests: the current http buffer, else <root>/<cfg.ai.target>.
 ---@param root string
----@return integer buf
+---@return integer buf, boolean created  created: a new buffer for a file that does not exist (yet)
 function M.target_buf(root)
   local cur = api.nvim_get_current_buf()
   if vim.bo[cur].filetype == "http" then
-    return cur
+    return cur, false
   end
   local path = vim.fs.joinpath(root, cfg().ai.target)
+  local created = vim.fn.bufexists(path) == 0 and not vim.uv.fs_stat(path)
   local buf = vim.fn.bufadd(path)
   vim.fn.bufload(buf)
   vim.bo[buf].buflisted = true
   if vim.bo[buf].filetype ~= "http" then
     vim.bo[buf].filetype = "http"
   end
-  return buf
+  return buf, created
 end
 
 ---@param buf integer
@@ -548,21 +588,37 @@ function M.gen(opts)
       M.gen(opts)
     end)
   end
-  local target = M.target_buf(root)
+  local target, created = M.target_buf(root)
+  -- nothing generated: the buffer made for a missing target file goes again (unless the user started using it)
+  local function discard()
+    if
+      created
+      and api.nvim_buf_is_valid(target)
+      and not vim.bo[target].modified
+      and vim.fn.bufwinid(target) == -1
+      and api.nvim_buf_line_count(target) == 1
+      and api.nvim_buf_get_lines(target, 0, 1, false)[1] == ""
+    then
+      pcall(api.nvim_buf_delete, target, { force = true })
+    end
+  end
   local user, err = M.gen_message(opts, src, target, root)
   if not user then
+    discard()
     log().notify(err --[[@as string]], vim.log.levels.ERROR)
     return
   end
   local system = "You write .http request files.\n" .. M.SYNTAX .. "\n" .. M.RULES
   M.ask(system, user, root, function(text, aerr)
     if aerr then
+      discard()
       log().notify("AI request failed: " .. aerr, vim.log.levels.ERROR)
       return
     end
     local lines = M.extract(text or "")
     local parsed = require("slop.modules.rest.parser").parse(lines)
     if #parsed.requests == 0 then
+      discard()
       return raw_output(vim.split(text or "", "\n", { plain = true }), "gen")
     end
     if not api.nvim_buf_is_valid(target) then
@@ -611,8 +667,9 @@ end
 --- Build the user message for fix from a result entry. Pure apart from reading the block / secrets.
 ---@param entry table {req, res?, err?}
 ---@param block string[]
+---@param values? string[]  replaced by the placeholder wherever they appear (see secret_values())
 ---@return string
-function M.fix_message(entry, block)
+function M.fix_message(entry, block, values)
   local req = entry.req
   local parts = {}
   parts[#parts + 1] = "This request failed. Return the corrected request block (same title and @name)."
@@ -636,7 +693,11 @@ function M.fix_message(entry, block)
       parts[#parts + 1] = "Response body:\n" .. M.redact(body, nil)
     end
   end
-  return table.concat(parts, "\n\n")
+  local text = table.concat(parts, "\n\n")
+  for _, v in ipairs(values or {}) do
+    text = text:gsub(vim.pesc(v), PLACEHOLDER)
+  end
+  return text
 end
 
 --- Fix the last failed request (or the request under the cursor using its last result).
@@ -669,6 +730,11 @@ function M.fix()
     log().notify("fix needs a request saved in a file", vim.log.levels.WARN)
     return
   end
+  if require("slop.core.secrets").is_blocked(req.file) then
+    -- the block would be sent as one <redacted> line and replaced with whatever the AI makes up
+    log().notify("this file is blocked by core.secrets; refusing to send it", vim.log.levels.ERROR)
+    return
+  end
   -- re-locate the block in its (possibly edited) file
   local parsed = require("slop.modules.rest.discover").parse(req.file)
   for _, r in ipairs(parsed.requests) do
@@ -680,8 +746,8 @@ function M.fix()
   local buf = vim.fn.bufadd(req.file)
   vim.fn.bufload(buf)
   local block = api.nvim_buf_get_lines(buf, req.start - 1, req.stop, false)
-  local user = M.fix_message(vim.tbl_extend("force", entry, { req = req }), block)
   local root = require("slop.core.project").root(buf)
+  local user = M.fix_message(vim.tbl_extend("force", entry, { req = req }), block, M.secret_values(req.file, root))
   local system = "You fix .http requests.\n" .. M.SYNTAX .. "\n" .. M.RULES
   -- the buffer may be edited while the AI answers: track the block instead of trusting its line numbers
   local ns = require("slop.core.util").ns("rest.fix")

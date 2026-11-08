@@ -46,7 +46,7 @@ local function chain(dir, root)
 end
 
 --- Variables of env `name` for an .http file: root-most files first, so the closest file wins; in each
---- directory the public file, then the private one; "$shared" below the named env.
+--- directory "$shared" (public file, then private) below the named env (public file, then private).
 ---@param http_file string
 ---@param root string
 ---@param name? string|false
@@ -54,16 +54,20 @@ end
 function M.load(http_file, root, name)
   local vars, files = {}, {}
   for _, dir in ipairs(chain(vim.fs.dirname(http_file), root)) do
+    local datas = {}
     for _, fname in ipairs({ M.PUBLIC, M.PRIVATE }) do
       local path = vim.fs.joinpath(dir, fname)
       local data = vim.uv.fs_stat(path) and read_json(path)
       if data then
         files[#files + 1] = path
-        if type(data["$shared"]) == "table" then
-          vars = vim.tbl_extend("force", vars, data["$shared"])
-        end
-        if name and type(data[name]) == "table" then
-          vars = vim.tbl_extend("force", vars, data[name])
+        datas[#datas + 1] = data
+      end
+    end
+    -- the private file's "$shared" must not override the public file's named env
+    for _, key in ipairs({ "$shared", name or nil }) do
+      for _, data in ipairs(datas) do
+        if type(data[key]) == "table" then
+          vars = vim.tbl_extend("force", vars, data[key])
         end
       end
     end

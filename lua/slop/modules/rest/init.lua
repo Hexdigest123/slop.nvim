@@ -49,6 +49,23 @@ local api = {
 
 local GEN_MODES = { "desc", "code", "openapi" }
 
+--- Validator: a table whose keys are strings and whose values pass `ok`.
+---@param ok fun(v: any): boolean
+---@return fun(t: any): boolean
+local function map_of(ok)
+  return function(t)
+    if type(t) ~= "table" then
+      return false
+    end
+    for k, v in pairs(t) do
+      if type(k) ~= "string" or not ok(v) then
+        return false
+      end
+    end
+    return true
+  end
+end
+
 ---@param cfg table
 local function setup(cfg)
   local util = require("slop.core.util")
@@ -179,8 +196,16 @@ return {
     end, false, "positive number (ms)")
     check("extensions", cfg.extensions, "table")
     check("skip", cfg.skip, "table")
-    check("headers", cfg.headers, "table")
-    check("dynamic", cfg.dynamic, "table")
+    check(
+      "headers",
+      cfg.headers,
+      map_of(function(v)
+        return type(v) == "string"
+      end),
+      false,
+      "table of name = string"
+    )
+    check("dynamic", cfg.dynamic, map_of(vim.is_callable), false, "table of name = function")
     check("result", cfg.result, "table")
     check("result.layout", cfg.result.layout, function(v)
       return v == "vsplit" or v == "split" or v == "float" or v == "tab" or v == "current"

@@ -185,13 +185,23 @@ describe("rest parser", function()
     assert.is_nil(parser.parse_duration("x"))
   end)
 
-  it("at() finds the request containing a line (or the closest above)", function()
+  it("at() finds the request whose block contains a line (trailing blank lines included)", function()
     local out = parse("@a = 1\n\n### one\nGET /1\n\n### two\nGET /2\nAccept: x\n")
     assert.equal("/1", parser.at(out, 3).url)
     assert.equal("/1", parser.at(out, 5).url)
     assert.equal("/2", parser.at(out, 6).url)
     assert.equal("/2", parser.at(out, 9).url)
     assert.is_nil(parser.at(out, 1))
+  end)
+
+  it("at() never crosses a ### separator: a block without a request line has no request", function()
+    local out = parse("### one\nDELETE /1\n\n### draft\n# TODO\n\n### three\nGET /3")
+    assert.equal("/1", parser.at(out, 3).url) -- trailing blank line of block one
+    for lnum = 4, 6 do
+      assert.is_nil(parser.at(out, lnum), "line " .. lnum)
+    end
+    assert.equal("/3", parser.at(out, 7).url)
+    assert.is_nil(parser.at(out, 99))
   end)
 
   it("is pure: no vim.api use", function()

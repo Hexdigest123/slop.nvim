@@ -104,7 +104,9 @@ A JetBrains / VS Code compatible subset: >http
 Supported:
 
 - `###` separates requests; the rest of the line is the title (shown in the
-  picker, and the request name when there is no `@name`).
+  picker, and the request name when there is no `@name`). The request under
+  the cursor is the one of the `###` block the cursor is in: in a block
+  without a request line (a draft) `<CR>` runs nothing.
 - Directives in `#` or `//` comments before (or among) the headers:
     `# @name x`              name used for chaining and `:Slop rest run x`
     `# @depends a, b`        run `a` and `b` first when they have no successful
@@ -142,11 +144,15 @@ body is sent as written).
 
   1. `@prompt` answers (the last answer is offered as the default)
   2. file variables: the last declaration above the request, else the first
-     one below; values may reference other variables
+     one below; values may reference other variables. A variable has one
+     value per request: with `@id = {{$uuid}}`, every `{{id}}` of the request
+     is the same id (a `{{$uuid}}` written in the request itself is new at
+     each place)
   3. the selected env from `http-client.env.json` and
-     `http-client.private.env.json` (JetBrains format, `$shared` included);
-     files are looked up from the `.http` file's directory up to the root and
-     the closest file wins
+     `http-client.private.env.json` (JetBrains format: `$shared` holds
+     defaults that the selected env overrides, in either file; the private
+     file wins over the public one); files are looked up from the `.http`
+     file's directory up to the root and the closest file wins
   4. the nearest `.env` (option `env_file`) from the `.http` file up to the
      root
   5. the process environment (option `process_env`)
@@ -189,7 +195,9 @@ cycles are reported ("dependency cycle: a -> b -> a") and nothing is sent. A
 dependency that fails (curl error or status >= 400) stops the run: the request
 itself is not sent and the dependency's response is shown ("dependency 'login'
 failed: HTTP 401 Unauthorized"); it runs again the next time. Names are looked
-up in the same file (or unnamed buffer) first, then anywhere under the root.
+up in the same file (or unnamed buffer) first, then anywhere under the root
+(`:Slop rest run {name}`: the current `.http` buffer first; other buffers
+have no requests of their own).
 Responses are kept in memory only (per Neovim session).
 
 Cookies: curl's own jar at `<root>/.nvim/state/rest/cookies.txt` (`-b`/`-c`),
@@ -204,8 +212,10 @@ Each request is ONE curl process. Its first argument is `-q`, so
 `~/.curlrc` is ignored: proxy and CA settings come from the environment
 (`https_proxy`, `no_proxy`, `CURL_CA_BUNDLE`, ...); `insecure = true` adds
 `-k`. Request header values (Authorization, cookies, API keys) are passed in a
-private 0600 temp file (`-H @file`) and the body on stdin: neither ever
-appears on curl's command line. curl also gets `--globoff`; the response
+private 0600 temp file (`-H @file`), the URL (query strings and
+`user:password@` carry secrets too) in a private 0600 curl config file (`-K`)
+and the body on stdin: none of them ever appears on curl's command line
+(`ps`). curl also gets `--globoff`; the response
 headers and body go to temp files; status and timings come from
 `-w '%{json}'`.
 Redirects (`follow_redirects`, unless `# @no-redirect`) are followed like a
@@ -223,7 +233,8 @@ is reused too). It holds only the body, with a filetype from Content-Type
 (json, xml (also `image/svg+xml` and other `+xml` types), html, javascript,
 css, yaml, else text), pretty-printed with `jq` or `vim.json` (sorted keys)
 for JSON and `xmllint` for XML. CRLF line endings are shown as plain lines.
-Bodies over 1 MiB are not formatted; binary bodies are summarised.
+Bodies over 1 MiB are not formatted; binary bodies are summarised. A HEAD
+response has no body (`H` shows its headers).
 
 The winbar shows `✓ 200 OK · POST /users · 43 ms · 1.2 KiB · [env]`, or the
 curl error (or "request cancelled" after `:Slop rest cancel`). `H` shows the
@@ -271,7 +282,13 @@ signature, or have a part (split at `-`, `_`, `.` and camelCase) equal to
 auth, pass, pwd, pw, pin, otp or key (`X-Auth`, `db_pass`, `userPin`; not
 `author` or `keyboard`). `{{variable}}`-only values are kept: they reveal
 nothing. Env files contribute variable NAMES only; `.env` values are never
-sent.
+sent. `fix` also replaces every value of the `http-client.private.env.json`
+files and of the nearest `.env` that the request's file sees by `<redacted>`,
+wherever it appears (a response may echo it: an echo endpoint, a validation
+error quoting the body, a debug page). Kept: values under 3 characters, and
+`.env` values under 6 characters of names that are not sensitive
+(`DEBUG=true`, `PORT=3000`). A request file blocked by |slop-secrets| is
+refused, as by `gen`.
 
 ==============================================================================
 9. CONFIGURATION                                             *slop-rest-config*
@@ -290,7 +307,8 @@ Defaults: >lua
     timeout = 30000,            -- ms; per request: # @timeout
     extensions = { "http", "rest" },
     skip = {},                  -- extra directory names to skip
-    headers = {},               -- default headers when a request lacks them
+    headers = {},               -- { ["X-Name"] = "value" }: added when a
+                                -- request lacks them
     dynamic = {},               -- { name = function(args) ... end }
     result = { layout = "vsplit", format = true, focus = false, size = 0.5 },
     keymaps = { run = "<leader>rr", pick = "<leader>rp", last = "<leader>rl",
@@ -341,7 +359,9 @@ Events (|User| autocmds, data in `ev.data`):
 Backend from `ui.picker`: "auto" (fzf-lua when installed, else builtin),
 "fzf", "builtin", "select" (|vim.ui.select()|). Options: `prompt`, `title`,
 `format(item)` (string or `{ {text, hl}, ... }`), `preview(item)` (`{ lines,
-filetype }` or `{ path, lnum }`), `actions` (`{ ["<C-v>"] = "vsplit" }`),
+path?, filetype? }` or `{ path, lnum }`; with `lines`, `path` names the file
+they come from, so cloak masks the preview like that file), `actions`
+(`{ ["<C-v>"] = "vsplit" }`),
 `multi`, `initial`, `on_select(item_or_nil, action)` (called exactly once).
 `items` may be a function `fun(cb)` that delivers the list later.
 

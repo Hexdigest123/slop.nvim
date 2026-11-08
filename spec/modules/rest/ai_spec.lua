@@ -194,6 +194,39 @@ describe("rest ai gen/fix", function()
     assert.equal(d.buf, vim.api.nvim_get_current_buf())
   end)
 
+  it("a failed gen leaves no empty requests.http buffer behind (an existing one stays)", function()
+    local registry = require("slop.core.registry")
+    registry.service = function()
+      return {
+        chat = function(req)
+          vim.schedule(function()
+            req.on_done(nil, { message = "boom" })
+          end)
+          return { cancel = function() end }
+        end,
+      }
+    end
+    local path = root .. "/src/api.ts"
+    h.write(path, "export async function GET() {\n  return 1\n}\n")
+    vim.cmd.edit(path)
+    local target = root .. "/requests.http"
+    local function failed_gen()
+      notes = {}
+      require("slop").rest.gen({ mode = "code" })
+      assert.is_true(vim.wait(2000, function()
+        return vim.iter(notes):any(function(n)
+          return n.msg:find("boom", 1, true) ~= nil
+        end)
+      end))
+    end
+    failed_gen()
+    assert.equal(-1, vim.fn.bufnr(target), "the buffer made for the missing file is gone")
+    -- an existing file's buffer is the user's: it stays
+    h.write(target, "GET http://x/\n")
+    failed_gen()
+    assert.truthy(vim.fn.bufnr(target) > 0)
+  end)
+
   it("gen refuses blocked files", function()
     h.write(root .. "/.env.local", "A=1\n")
     vim.cmd.edit(root .. "/.env.local")
@@ -268,6 +301,36 @@ describe("rest ai gen/fix", function()
     answer = FIX_ANSWER
   end
 
+  it("fix never sends .env / private env values, also when the response echoes them", function()
+    h.write(root .. "/.env", "DB_PASS=hunter2\nAPI_BASE=http://dotenv-host:9000\nPORT=400\nDEBUG=true\n")
+    h.write(root .. "/http-client.private.env.json", vim.json.encode({ dev = { apiKey = "private-env-key" } }))
+    local f = root .. "/echo.http"
+    h.write(f, '### Create\n# @name create\nPOST {{API_BASE}}/items?k={{apiKey}}\n\n{"p": "{{DB_PASS}}",}\n')
+    local req = require("slop.modules.rest.discover").parse(f).requests[1]
+    require("slop.modules.rest.api")._state.failed[root] = {
+      req = req,
+      res = {
+        status = 400,
+        reason = "Bad Request",
+        headers = { { "X-Echo", "private-env-key" } },
+        -- a validation error quoting the raw body, the query and the host
+        body = '{"error": "invalid json", "body": "{\\"p\\": \\"hunter2\\",}", "query": "k=private-env-key", '
+          .. '"host": "http://dotenv-host:9000", "debug": true}',
+      },
+    }
+    answer = FIX_ANSWER
+    require("slop").rest.fix()
+    wait_diff()
+    local msg = chat_reqs[1].messages[1].content
+    assert.matches("invalid json", msg)
+    for _, secret in ipairs({ "hunter2", "private-env-key", "dotenv-host" }) do
+      assert.falsy(msg:find(secret, 1, true), secret .. " leaked:\n" .. msg)
+    end
+    -- short values of names that are not sensitive (true, 400) are not secrets: the context stays readable
+    assert.matches("400 Bad Request", msg)
+    assert.matches('"debug": true', msg)
+  end)
+
   it("fix keeps targeting the block when lines are added above it while the AI answers", function()
     local f = root .. "/moved.http"
     fail_create(f)
@@ -292,6 +355,17 @@ describe("rest ai gen/fix", function()
     end, 10))
     assert.equal(0, #diff_calls)
     assert.truthy(require("slop.core.ui.scratch").find("rest/ai-output"))
+  end)
+
+  it("fix refuses a request file blocked by core.secrets (like gen)", function()
+    fail_create(root .. "/credentials.http") -- default block glob *credential*
+    require("slop").rest.fix()
+    vim.wait(100)
+    assert.equal(0, #chat_reqs)
+    assert.equal(0, #diff_calls)
+    assert.truthy(vim.iter(notes):any(function(n)
+      return n.msg:find("blocked by core.secrets", 1, true) ~= nil
+    end))
   end)
 
   it("fix with untitled requests fixes the one under the cursor, not the last failed one", function()

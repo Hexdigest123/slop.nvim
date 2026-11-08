@@ -52,9 +52,9 @@ end
 ---@param opts slop.rest.ResolveOpts
 ---@return slop.rest.Resolved? resolved, string? err, string[]? unresolved
 function M.resolve(req, opts)
-  local missing, seen = {}, {}
+  local missing, seen, memo = {}, {}, {}
   local function exp(text)
-    local out, miss = vars.expand(text, opts.ctx)
+    local out, miss = vars.expand(text, opts.ctx, memo)
     for _, m in ipairs(miss) do
       if not seen[m] then
         seen[m] = true
@@ -197,8 +197,9 @@ function M.build_args(r, files, opts)
     args[#args + 1] = "--http3"
   end
   vim.list_extend(args, { "-D", files.headers, "-o", files.body, "-w", "%{json}" })
-  args[#args + 1] = "--url"
-  args[#args + 1] = r.url
+  -- core.http.curl() passes the URL to curl through a private file, never on its argv (query strings and
+  -- user:password@ carry secrets)
+  vim.list_extend(args, { "--url", r.url })
   return args, stdin
 end
 
@@ -277,7 +278,7 @@ function M.execute(r, on_done)
     stdin = stdin,
     -- backstop in case curl hangs past --max-time; `# @timeout 0` means no limit at all
     timeout = limit > 0 and limit + 5000 or nil,
-    on_exit = function(code, stdout, stderr)
+    on_exit = function(code, stdout, stderr, signal)
       if done then
         return
       end
@@ -289,8 +290,15 @@ function M.execute(r, on_done)
       local ok_meta, meta = pcall(vim.json.decode, stdout or "", { luanil = { object = true, array = true } })
       meta = ok_meta and type(meta) == "table" and meta or {}
       local hdr = project.read_file(files.headers) or ""
-      local body = project.read_file(files.body) or ""
+      -- a HEAD response has no body: what `curl --head` writes to the -o file is the header dump again
+      local body = r.method ~= "HEAD" and project.read_file(files.body) or ""
       cleanup()
+      if (signal or 0) ~= 0 and code ~= 124 then
+        -- killed by a signal that is not our backstop timeout (OOM killer, pkill): luv reports code 0 for it, and
+        -- whatever curl wrote until then must not pass as a response ("✓ 0", a satisfied dependency)
+        local msg = ("curl was killed by signal %d"):format(signal)
+        return on_done(nil, { kind = "curl", message = msg, code = code })
+      end
       local status, reason, version, headers = M.parse_headers(hdr)
       if code ~= 0 and status == 0 then
         local msg = meta.errormsg or vim.trim(stderr or "")

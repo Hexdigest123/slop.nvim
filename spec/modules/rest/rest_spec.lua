@@ -313,6 +313,9 @@ describe("rest module", function()
     local pv = captured.opts.preview(captured.items[2])
     assert.equal("http", pv.filetype)
     assert.are.same({ "### Second", "GET " .. srv.url .. "/me" }, pv.lines)
+    -- the file the lines come from: cloak masks the preview like that file (Authorization: values)
+    assert.equal(captured.items[2].req.file, pv.path)
+    assert.matches("a%.http$", pv.path)
     run_and_wait(function()
       captured.opts.on_select(captured.items[3])
     end)
@@ -329,6 +332,25 @@ describe("rest module", function()
     captured.opts.on_select(second, "edit")
     assert.equal(root .. "/a.http", vim.api.nvim_buf_get_name(0))
     assert.equal(6, vim.api.nvim_win_get_cursor(0)[1])
+  end)
+
+  it("picker columns stay aligned with wide (CJK) titles", function()
+    http_file("w.http", ("### %s\nGET http://x/a\n### short\nGET http://x/b"):format(string.rep("漢字", 30)))
+    local captured
+    package.loaded["slop.core.ui.picker"] = {
+      pick = function(items, opts)
+        captured = { items = items, opts = opts }
+      end,
+    }
+    rest.pick()
+    local widths = vim.tbl_map(function(it)
+      local chunks = captured.opts.format(it)
+      return vim.fn.strdisplaywidth(chunks[1][1] .. chunks[2][1] .. chunks[3][1])
+    end, captured.items)
+    assert.equal(widths[1], widths[2])
+    local title = captured.opts.format(captured.items[1])[3][1]
+    assert.equal(48, vim.fn.strdisplaywidth(title))
+    assert.matches("…%s*$", title)
   end)
 
   it("works with the real builtin picker (filter + <CR> runs)", function()
@@ -385,6 +407,40 @@ describe("rest module", function()
     assert.truthy(vim.uv.fs_stat(root .. "/.nvim/state/rest/cookies.txt"))
     vim.cmd("Slop rest cookies clear")
     assert.falsy(vim.uv.fs_stat(root .. "/.nvim/state/rest/cookies.txt"))
+  end)
+
+  it(":Slop rest run <name> in a non-http buffer does not run request-like lines of that buffer", function()
+    http_file("n.http", ('### Login\nPOST %s/login\n\n{"user": "real"}'):format(srv.url))
+    -- API docs in Markdown: same heading, a request-like line below it
+    h.write(root .. "/README.md", ("### Login\nGET %s/me\n"):format(srv.url))
+    vim.cmd.edit(root .. "/README.md")
+    run_and_wait(function()
+      vim.cmd("Slop rest run Login")
+    end)
+    assert.equal("/login", srv.requests[1].path)
+  end)
+
+  it(":Slop rest run <name> prefers the current http file, wherever its cursor is", function()
+    http_file("a_other.http", ("### x\n# @name dup\nGET %s/fail"):format(srv.url))
+    local f = http_file("b_mine.http", ("@v = 1\n\n### x\n# @name dup\nGET %s/me"):format(srv.url))
+    vim.cmd.edit(f)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 }) -- on the file variables, outside every request block
+    run_and_wait(function()
+      vim.cmd("Slop rest run dup")
+    end)
+    assert.equal("/me", srv.requests[1].path)
+  end)
+
+  it("<CR> in a block without a request line runs nothing (not the request above it)", function()
+    local f = http_file("draft.http", ("### Delete\nDELETE %s/me\n\n### Draft\n# TODO\n"):format(srv.url))
+    vim.cmd.edit(f)
+    vim.api.nvim_win_set_cursor(0, { 5, 0 })
+    h.feed("<CR>")
+    vim.wait(100)
+    assert.equal(0, #srv.requests)
+    assert.truthy(vim.iter(notes):any(function(n)
+      return n.msg:find("no request under the cursor", 1, true) ~= nil
+    end))
   end)
 
   it("lints parser warnings as diagnostics", function()
@@ -643,6 +699,29 @@ describe("rest module", function()
     pending() -- the old pretty-printer finishes last
     local buf = assert(result_buf())
     assert.equal("GET /b: unresolved variable: {{id}}", vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1])
+  end)
+
+  it("the result keys (H, q, r) are back after the result buffer was :bdelete'd", function()
+    local view = require("slop.modules.rest.view")
+    local function show()
+      local shown
+      local res = { status = 200, headers = {}, body = "hi", content_type = "text/plain" }
+      view.show({ req = { method = "GET", url = "/x" }, res = res }, function(b)
+        shown = b
+      end)
+      wait_for(function()
+        return shown ~= nil
+      end)
+      return shown
+    end
+    vim.cmd("bdelete! " .. show()) -- clears the buffer's mappings (the buffer itself stays)
+    local buf = show()
+    local lhs = vim.tbl_map(function(m)
+      return m.lhs
+    end, vim.api.nvim_buf_get_keymap(buf, "n"))
+    for _, key in ipairs({ "H", "q", "r" }) do
+      assert.truthy(vim.tbl_contains(lhs, key), key .. " not mapped: " .. vim.inspect(lhs))
+    end
   end)
 
   it("shows CRLF text bodies without CRs and SVG as XML", function()

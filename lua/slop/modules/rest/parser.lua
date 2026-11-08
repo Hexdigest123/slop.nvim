@@ -33,7 +33,8 @@ M.METHODS = {
 ---@field file? string
 ---@field line integer                    1-based line of the request line
 ---@field start integer                   1-based first line of the block (the "###" line, or 1)
----@field stop integer                    1-based last line of the block
+---@field stop integer                    1-based last non-blank line of the block
+---@field block_end integer               1-based last line before the next "###" (or the end of the file)
 ---@field name? string                    @name, else the title
 ---@field title? string
 ---@field method string
@@ -182,6 +183,7 @@ function M.parse(lines, file)
         stop = stop - 1
       end
       block.stop = stop
+      block.block_end = last
       block.name = block._directives.name or block.title
       block.file = file
       block._body, block._directives = nil, nil
@@ -307,21 +309,18 @@ function M.parse(lines, file)
   return out
 end
 
---- The request whose block contains `lnum` (1-based). Falls back to the closest request above.
+--- The request whose block (up to the next "###", trailing blank lines included) contains `lnum` (1-based). nil in
+--- a block without a request line: never the request of another block (<CR> in a draft must not run the one above).
 ---@param parsed slop.rest.File
 ---@param lnum integer
 ---@return slop.rest.Request?
 function M.at(parsed, lnum)
-  local best
   for _, r in ipairs(parsed.requests) do
-    if lnum >= r.start and lnum <= r.stop then
+    if lnum >= r.start and lnum <= (r.block_end or r.stop) then
       return r
     end
-    if r.start <= lnum then
-      best = r
-    end
   end
-  return best
+  return nil
 end
 
 --- File variables visible to `req`: the last declaration above its request line wins, else the first below.
