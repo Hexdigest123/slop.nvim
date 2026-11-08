@@ -13,6 +13,7 @@ local function sources()
 end
 
 local CLEAR = { "items", "history", "all" }
+local BORDERS = { "", "none", "single", "double", "rounded", "solid", "shadow", "bold" }
 local au_config ---@type integer?
 
 local api = {}
@@ -117,7 +118,10 @@ return {
     end
     check("window", cfg.window, "table")
     local w = cfg.window or {}
-    check("window.border", w.border, { "string", "table" })
+    -- what nvim_open_win() takes (not 'winborder''s comma list): anything else fails every render, silently
+    check("window.border", w.border, function(v)
+      return type(v) == "table" or vim.tbl_contains(BORDERS, v)
+    end, false, "a border style (" .. table.concat(BORDERS, "|", 2) .. ") or a list of border chars")
     check("window.winblend", w.winblend, function(v)
       return type(v) == "number" and v >= 0 and v <= 100
     end, false, "number 0-100")
@@ -136,8 +140,11 @@ return {
       view().render()
     end)
     au_config = require("slop.core.events").on(nil, "ConfigChanged", function()
-      if require("slop.core.registry").is_loaded("progress") then
-        configure(require("slop.config").get("progress"))
+      local config = require("slop.config")
+      -- an invalid config is reported by config.get(); applying it would break the window (keep the last one)
+      local new = config.get("progress")
+      if require("slop.core.registry").is_loaded("progress") and #config.errors("progress") == 0 then
+        configure(new)
         view().render()
       end
     end, { desc = "slop: progress reconfigure" })

@@ -65,8 +65,9 @@ local function apply(item, fields)
     end
     if type(v) == want then
       if want == "string" then
-        -- one window line per item: multi-line LSP/AI messages are flattened
-        v = vim.trim((v:gsub("%s*[\r\n]+%s*", " ")))
+        -- one window line per item: multi-line LSP/AI messages are flattened; tabs become spaces (a tab is drawn
+        -- up to 'tabstop' cells wide wherever it lands, which the right-aligned lines cannot measure)
+        v = vim.trim((v:gsub("%s*[\r\n]+%s*", " "):gsub("%s", " ")))
       end
       item[f] = v
     end

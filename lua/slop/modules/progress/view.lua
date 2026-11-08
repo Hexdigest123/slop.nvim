@@ -88,49 +88,54 @@ end
 
 ---@alias slop.progress.Chunk {[1]: string, [2]: string?}
 
---- The chunks of one item line: "<message> (<p>%)  <title> <icon>", the message truncated to fit `width`.
+--- The chunks of one item line: "<message> (<p>%)  <title> <icon>", cut to fit `width`: the icon always shows, the
+--- message and the title share the rest (the message keeps at least half of it).
 ---@param item slop.progress.Item
 ---@param frame string
 ---@param width integer
 ---@return slop.progress.Chunk[]
 function M.item_chunks(item, frame, width)
   local icon, icon_hl = M.icon(item, frame)
-  local tail = {} ---@type slop.progress.Chunk[]
   local msg = item.message or ""
   local title = item.title or ""
   if title == msg then
     title = ""
   end
-  if title ~= "" then
-    tail[#tail + 1] = { (msg ~= "" and "  " or "") .. title, "SlopProgressTitle" }
-  end
-  tail[#tail + 1] = { " " .. icon, icon_hl }
   local pct = ""
   if item.status == "running" and item.percent then
     pct = ("%s(%d%%)"):format(msg ~= "" and " " or "", item.percent)
   end
-  local used = fn.strdisplaywidth(pct)
-  for _, c in ipairs(tail) do
-    used = used + fn.strdisplaywidth(c[1])
+  local mark = (msg ~= "" or pct ~= "" or title ~= "") and " " .. icon or icon -- icon only: no separator
+  local sep = (msg ~= "" or pct ~= "") and title ~= "" and "  " or ""
+  local room = width - fn.strdisplaywidth(mark) - fn.strdisplaywidth(pct) - #sep
+  if title ~= "" then
+    local keep = msg ~= "" and math.min(fn.strdisplaywidth(msg), math.ceil(room / 2)) or 0
+    title = truncate(title, math.max(1, room - keep))
   end
   local out = {} ---@type slop.progress.Chunk[]
   if msg ~= "" then
-    out[1] = { truncate(msg, math.max(1, width - used)), "SlopProgressMessage" }
-  elseif title == "" and #tail == 1 then
-    tail[1][1] = icon -- icon only: drop the separator
+    out[#out + 1] = { truncate(msg, math.max(1, room - fn.strdisplaywidth(title))), "SlopProgressMessage" }
   end
   if pct ~= "" then
     out[#out + 1] = { pct, "SlopProgressPercent" }
   end
-  vim.list_extend(out, tail)
+  if title ~= "" then
+    out[#out + 1] = { sep .. title, "SlopProgressTitle" }
+  end
+  out[#out + 1] = { mark, icon_hl }
   return out
+end
+
+---@return boolean
+local function bordered()
+  return cfg.window.border ~= "none" and cfg.window.border ~= "" -- "" draws none too
 end
 
 ---@param width integer
 ---@return integer
 local function max_width(width)
   local mw = cfg.window.max_width
-  local cols = vim.o.columns - cfg.window.x_padding - (cfg.window.border == "none" and 0 or 2)
+  local cols = vim.o.columns - cfg.window.x_padding - (bordered() and 2 or 0)
   local limit = mw <= 1 and math.floor(vim.o.columns * mw) or math.floor(mw)
   return math.max(1, math.min(width, limit, cols))
 end
@@ -186,9 +191,8 @@ end
 ---@return vim.api.keyset.win_config
 function M.win_config(width, height)
   local w = cfg.window
-  local bordered = w.border ~= "none"
   local bottom = vim.o.lines - vim.o.cmdheight - statusline_height() - w.y_padding
-  local room = math.max(1, bottom - (bordered and 2 or 0) - (vim.o.showtabline > 0 and 1 or 0))
+  local room = math.max(1, bottom - (bordered() and 2 or 0) - (vim.o.showtabline > 0 and 1 or 0))
   return {
     relative = "editor",
     anchor = "SE",
@@ -402,7 +406,10 @@ function M.show_history()
   local h = require("slop.core.ui.float").open({
     title = "slop progress history",
     width = 0.7,
-    height = math.max(1, math.min(#lines, math.floor(vim.o.lines * 0.6))),
+    -- a function: float reads a plain 1 as a fraction (the whole screen), not one row
+    height = function(_, total)
+      return math.max(1, math.min(#lines, math.floor(total * 0.6)))
+    end,
     close_keys = { "q", "<Esc>" },
     bo = { filetype = "slopprogresshistory" },
     wo = { wrap = false, cursorline = true },

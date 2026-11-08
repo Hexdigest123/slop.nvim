@@ -330,6 +330,26 @@ describe("progress module", function()
     assert.matches("…", shows("…"))
   end)
 
+  it("a title too long for the window is cut: lines fit the window and keep their spinner / mark", function()
+    setup()
+    local frames = require("slop.core.ui.spinner").frames()
+    local long = "Indexing the workspace symbols of a project with a really very long name"
+    echo("12/40 files", { status = "running", title = long, source = "long" })
+    echo("", { status = "running", percent = 40, title = "", source = "pct" })
+    local win = assert(view.win())
+    local width = api.nvim_win_get_config(win).width
+    assert.equal(50, width, "max_width 0.5 of 100 columns")
+    local lines = vim.split(shows("…"), "\n")
+    local item = assert(lines[2])
+    for _, l in ipairs(lines) do
+      assert.equal(width, vim.fn.strdisplaywidth(l), l)
+    end
+    local last = vim.fn.strcharpart(item, vim.fn.strchars(item) - 1)
+    assert.truthy(vim.tbl_contains(frames, last), "spinner at the end of: " .. item)
+    assert.matches("12/40 files  Indexing the workspace", item, "the message keeps its room")
+    assert.matches("%(40%%%) ", lines[4], "a percentage alone is spaced from the spinner")
+  end)
+
   it("window follows the current tabpage and honours a configured border", function()
     setup({ window = { border = "rounded" } })
     echo("working", { status = "running", title = "t" })
@@ -376,6 +396,20 @@ describe("progress module", function()
     assert.matches("✓  myplug  a  first", lines[2])
     h.feed("q")
     assert.not_equal(buf, api.nvim_get_current_buf())
+  end)
+
+  it("the history float is as high as its lines (one line is one row, not the whole screen)", function()
+    setup()
+    vim.cmd("Slop progress history") -- nothing finished yet: one line
+    local win = api.nvim_get_current_win()
+    assert.equal("slopprogresshistory", vim.bo[api.nvim_win_get_buf(win)].filetype)
+    assert.equal(1, api.nvim_win_get_height(win))
+    h.feed("q")
+    echo("first", { status = "success", title = "a" })
+    echo("second", { status = "failed", title = "b" })
+    vim.cmd("Slop progress history")
+    assert.equal(2, api.nvim_win_get_height(api.nvim_get_current_win()))
+    h.feed("q")
   end)
 
   it("suppress_echo empties the progress: item of 'messagesopt'; teardown restores it", function()
@@ -431,11 +465,38 @@ describe("progress module", function()
     assert.equal("hit-enter,progress:", s.with_progress("hit-enter", ""))
   end)
 
+  it("a later setup() with invalid options keeps the last valid config (no error from the autocmd)", function()
+    setup({ history_size = 5 })
+    echo("working", { status = "running", title = "t" })
+    assert.matches("working", shows("working"))
+    vim.v.errmsg = ""
+    local ok, err = pcall(slop.setup, { progress = { history_size = "lots", window = { max_width = "wide" } } })
+    assert.is_true(ok, err)
+    assert.equal("", vim.v.errmsg)
+    assert.matches("progress.history_size", table.concat(require("slop.config").errors("progress"), "\n"))
+    echo("second", { status = "running", title = "u", source = "other" })
+    assert.matches("second", shows("second"))
+    for i = 1, 7 do
+      echo("done " .. i, { status = "success", title = "v", source = "other" })
+    end
+    assert.equal(5, #p.history(), "the valid history_size still applies")
+    -- a valid config applies again
+    slop.setup({ progress = { history_size = 2 } })
+    assert.equal(2, #p.history())
+  end)
+
   it("schema rejects bad values; health runs without setup", function()
     require("slop.config").setup({ progress = { linger = "x", window = { winblend = 200 } } })
     local errs = table.concat(require("slop.config").errors("progress"), "\n")
     assert.matches("progress.linger", errs)
     assert.matches("progress.window.winblend", errs)
+    -- a style nvim_open_win() rejects would make every render fail silently (no window, ever)
+    require("slop.config").setup({ progress = { window = { border = "fancy" } } })
+    assert.matches("progress.window.border", table.concat(require("slop.config").errors("progress"), "\n"))
+    for _, b in ipairs({ "", "bold", "shadow", "solid", { "+", "-", "+", "|", "+", "-", "+", "|" } }) do
+      require("slop.config").setup({ progress = { window = { border = b } } })
+      assert.are.same({}, require("slop.config").errors("progress"), vim.inspect(b))
+    end
     require("slop.config").setup({})
     local spec = require("slop.core.registry").spec("progress")
     local out = {}

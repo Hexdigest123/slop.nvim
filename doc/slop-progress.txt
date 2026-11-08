@@ -25,7 +25,9 @@ running tasks grouped by source:
 <
 - running tasks show a spinner (|slop| `ui.spinner` style), finished ones a
   mark: `✓` success, `✗` failed, `⊘` cancelled,
-- title, message and percentage per task, lines right-aligned,
+- title, message and percentage per task, lines right-aligned; a line
+  longer than `window.max_width` is cut with `…` (the spinner or mark
+  always shows, the message keeps at least half of the room),
 - finished tasks linger for `linger` ms (2000), then disappear; the window
   closes when it is empty,
 - no border, `winblend` 100, not focusable: it never takes the cursor, is
@@ -114,7 +116,8 @@ Defaults: >lua
       interval = 100,                -- ms per spinner frame / redraw
       icons = { success = "✓", failed = "✗", cancel = "⊘" },
       window = {
-        border = "none",             -- any 'winborder' style or a list
+        border = "none",             -- none|single|double|rounded|solid|
+                                     -- shadow|bold, or a list of chars
         winblend = 100,
         zindex = 45,
         max_width = 0.5,             -- (0, 1] fraction of the editor, > 1 cells

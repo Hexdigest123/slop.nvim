@@ -19,6 +19,8 @@ describe("progress store", function()
     assert.equal("one two", item.message)
     store.finish("m", "failed", { message = "boom\nstack" })
     assert.equal("boom stack", store.history()[1].message)
+    -- a tab is drawn up to 'tabstop' cells wide wherever it lands: the right-aligned lines cannot measure it
+    assert.equal("col1 col2", store.update("t", { origin = "native", group = "g", message = "col1\tcol2" }).message)
   end)
 
   it("ignores fields of the wrong type (LSP JSON null = vim.NIL, tables, booleans); numbers become text", function()
