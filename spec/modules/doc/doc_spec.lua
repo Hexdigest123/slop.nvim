@@ -150,6 +150,16 @@ describe("doc module", function()
     assert.is_true(noted("blocked"))
   end)
 
+  it("a buffer that is not modifiable is refused before anything is sent", function()
+    open("m.lua")
+    vim.bo.modifiable = false
+    vim.api.nvim_win_set_cursor(0, { 5, 2 })
+    assert.is_false(require("slop").doc.generate())
+    vim.wait(50)
+    assert.equal(0, #chat_reqs)
+    assert.is_true(noted("not modifiable"))
+  end)
+
   it("non-comment answers are an error, nothing is inserted", function()
     open("m.lua")
     answer = { "function M.add(a, b)", "  return a + b", "end" }
@@ -216,6 +226,17 @@ describe("doc module", function()
   end)
 
   it("an edited doc range discards the answer", function()
+    local spinner = require("slop.core.ui.spinner")
+    local progress, finished = spinner.progress, {}
+    spinner.progress = function(o)
+      local p = progress(o)
+      local finish = p.finish
+      p.finish = function(self, status, msg)
+        finished[#finished + 1] = status
+        return finish(self, status, msg)
+      end
+      return p
+    end
     local buf = open("m.lua")
     hold = true
     vim.api.nvim_win_set_cursor(0, { 5, 2 })
@@ -223,8 +244,11 @@ describe("doc module", function()
     vim.api.nvim_buf_set_lines(buf, 2, 3, false, { "---Edited meanwhile." })
     chat_reqs[1].on_done("---New.", nil)
     vim.wait(50)
+    spinner.progress = progress
     assert.equal(0, #diff_calls)
     assert.is_true(noted("changed while waiting"))
+    -- nothing was inserted: the progress message does not report success
+    assert.are.same({ "failed" }, finished)
   end)
 
   it("lines added above while waiting move the target", function()
@@ -236,6 +260,25 @@ describe("doc module", function()
     chat_reqs[1].on_done("---New.", nil)
     wait_diff()
     assert.are.same({ 9, 9 }, diff_calls[1].range)
+  end)
+
+  it("a line added right above the item or its doc while waiting is fine", function()
+    local buf = open("m.lua")
+    hold = true
+    -- M.sub (row 7) has no doc: the comment is inserted right above it
+    vim.api.nvim_win_set_cursor(0, { 9, 2 })
+    require("slop").doc.generate()
+    vim.api.nvim_buf_set_lines(buf, 7, 7, false, { "-- added" })
+    chat_reqs[1].on_done("---New.", nil)
+    wait_diff()
+    assert.are.same({ 8, 8 }, diff_calls[1].range)
+    -- M.add (row 3) has a doc at row 2: it is replaced
+    vim.api.nvim_win_set_cursor(0, { 5, 2 })
+    require("slop").doc.generate()
+    vim.api.nvim_buf_set_lines(buf, 2, 2, false, { "-- added" })
+    chat_reqs[2].on_done("---New.", nil)
+    wait_diff(2)
+    assert.are.same({ 3, 4 }, diff_calls[2].range)
   end)
 
   it("never writes the secret placeholder over a redacted value of the existing doc", function()
@@ -262,6 +305,21 @@ describe("doc module", function()
     assert.falsy(chat_reqs[1].messages[1].content:find("sk-live-abc123", 1, true))
     assert.equal(0, #diff_calls)
     assert.is_false(require("slop").doc.is_running())
+  end)
+
+  it("documents code embedded in another language with that language's style and comment syntax", function()
+    h.write(root .. "/r.md", "# Readme\n\n```lua\nlocal function f(a)\n  return a\nend\n```\n")
+    vim.cmd.edit(root .. "/r.md")
+    vim.bo.filetype = "markdown"
+    vim.api.nvim_win_set_cursor(0, { 5, 2 })
+    assert.is_true(require("slop").doc.generate())
+    wait_diff()
+    assert.matches("LuaLS", chat_reqs[1].system)
+    local msg = chat_reqs[1].messages[1].content
+    assert.matches("filetype markdown, the item is embedded lua code", msg)
+    assert.matches("```lua\nlocal function f%(a%)", msg)
+    assert.are.same({ 3, 3 }, diff_calls[1].range)
+    assert.are.same({ "---Adds numbers.", "---@param a number" }, diff_calls[1].lines)
   end)
 
   it("styles and instructions come from the config", function()
@@ -343,6 +401,22 @@ describe("doc health", function()
     assert.matches("MISTRAL_API_KEY is set", text)
     assert.falsy(text:find("super-secret-value", 1, true))
     assert.matches("generate <leader>nd", text)
+  end)
+
+  it("never prints an api_key value that is not an env var name (a key pasted into the config)", function()
+    for _, pasted in ipairs({ "sk-live-PASTED0123456789abcdef", "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY" }) do
+      require("slop").setup({
+        ai = {
+          providers = {
+            p = { kind = "chat", service = "mistral", url = "http://127.0.0.1:9", model = "m", api_key = pasted },
+          },
+        },
+        doc = { provider = "p" },
+      })
+      local text = run()
+      assert.is_nil(text:find(pasted, 1, true), text)
+      assert.matches(pasted:find("-", 1, true) and "environment variable NAME" or "named by api_key", text)
+    end
   end)
 
   it("unknown provider is an error", function()

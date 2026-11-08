@@ -96,18 +96,19 @@ end
 --- Apply a parsed answer: re-check the tracked region, then open the inline diff.
 ---@param job slop.doc.Job
 ---@param lines string[]
+---@return boolean shown
 local function apply(job, lines)
   local buf = job.buf
   local r = require("slop.core.util").mark_range(buf, ns(), job.mark)
   if not r then
     log().notify("the buffer changed while waiting; doc comment discarded", vim.log.levels.WARN)
-    return
+    return false
   end
   local s, e = r[1], r[3]
   local cur = api.nvim_buf_get_lines(buf, s, e, false)
   if not vim.deep_equal(cur, job.old) or (line(buf, e) or "") ~= job.next_line then
     log().notify("the target changed while waiting; doc comment discarded", vim.log.levels.WARN)
-    return
+    return false
   end
   local ok, handle = pcall(
     require("slop.core.ui.diff").show,
@@ -118,11 +119,12 @@ local function apply(job, lines)
   )
   if not ok then
     log().notify("diff preview failed: " .. tostring(handle), vim.log.levels.ERROR)
-    return
+    return false
   end
   if vim.fn.bufwinid(buf) == -1 then
     log().notify(("doc comment ready for review in %s"):format(vim.fn.bufname(buf)), vim.log.levels.INFO)
   end
+  return true
 end
 
 ---@class slop.doc.GenerateOpts
@@ -142,6 +144,10 @@ function M.generate(kind, opts)
     log().notify("this file is blocked by core.secrets; refusing to send it", vim.log.levels.ERROR)
     return false
   end
+  if not vim.bo[buf].modifiable then
+    log().notify("the buffer is not modifiable: a doc comment could not be inserted", vim.log.levels.WARN)
+    return false
+  end
   local target, terr = require("slop.modules.doc.target").find(buf, opts.pos, kind)
   if not target then
     log().notify(terr or "nothing to document here", vim.log.levels.WARN)
@@ -149,7 +155,9 @@ function M.generate(kind, opts)
   end
   local langs = require("slop.modules.doc.langs")
   local prompt = require("slop.modules.doc.prompt")
-  local ft, cs = vim.bo[buf].filetype, vim.bo[buf].commentstring
+  -- the item's language: embedded code (a <script> of a svelte file) has its own comment syntax and style
+  local ft = target.filetype or vim.bo[buf].filetype
+  local cs = langs.commentstring(buf, ft)
   local syntax = langs.syntax_for(ft, cs)
   if not syntax and not target.docstring then
     log().notify(("no comment syntax known for filetype '%s' (set 'commentstring')"):format(ft), vim.log.levels.WARN)
@@ -165,7 +173,9 @@ function M.generate(kind, opts)
   local job = {
     buf = buf,
     target = target,
-    mark = require("slop.core.util").region_mark(buf, ns(), { s, 0, e, 0 }),
+    -- right gravity at the start too: a line opened right above the doc range (or above the item when there is no
+    -- doc) moves it down instead of becoming part of it
+    mark = require("slop.core.util").region_mark(buf, ns(), { s, 0, e, 0 }, { right_gravity = true }),
     old = api.nvim_buf_get_lines(buf, s, e, false),
     next_line = line(buf, e) or "",
   }
@@ -234,8 +244,11 @@ function M.generate(kind, opts)
           )
           return
         end
-        apply(job, lines)
-        finish(job, "success", "done")
+        if apply(job, lines) then
+          finish(job, "success", "done")
+        else
+          finish(job, "failed", "discarded")
+        end
       end,
     })
   end)

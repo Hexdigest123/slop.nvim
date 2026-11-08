@@ -152,10 +152,14 @@ return {
       h.error(("provider `%s` has kind `%s`; doc needs a chat provider"):format(c.provider, tostring(p.kind)))
     else
       local src, var = ai.api_key_source(p)
-      if src ~= "env" or (os.getenv(var or "") or "") ~= "" then
-        h.ok(("provider `%s` (%s)%s"):format(c.provider, p.model, src == "env" and (", $" .. var .. " is set") or ""))
+      if src == "env" and not ai.valid_var(var) then
+        -- never echo the value: it is most likely the key itself
+        h.error(("provider `%s`: %s"):format(c.provider, ai.NOT_A_NAME))
+      elseif src ~= "env" or (os.getenv(var) or "") ~= "" then
+        local shown = src == "env" and (", %s is set"):format(ai.var_label(var --[[@as string]])) or ""
+        h.ok(("provider `%s` (%s)%s"):format(c.provider, p.model, shown))
       else
-        h.warn(("provider `%s`: $%s is NOT set"):format(c.provider, var))
+        h.warn(("provider `%s`: %s is NOT set"):format(c.provider, ai.var_label(var --[[@as string]])))
       end
     end
     local keys = {}

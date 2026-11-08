@@ -40,6 +40,10 @@ treesitter parser for the buffer.
    of the line.
    - A cursor on a doc comment, a decorator or an attribute targets the item
      below it.
+   - Code embedded in another language (a `<script>` block of a Svelte, Vue
+     or HTML file, a fenced code block in Markdown) is searched in its own
+     language first, then in the language around it. Its doc comment uses
+     the style and comment syntax of the embedded language.
    - An anonymous function or table counts only as the value of a
      declaration, for example `local f = function() end`,
      `const f = () => {}` or `M.x = {}`. A callback passed as an argument
@@ -84,8 +88,9 @@ treesitter parser for the buffer.
    accept the hunk, `gr` reject it, `gA` / `gR` all, `]h` / `[h` next /
    previous hunk. The whole review is one undo step. If
    the lines being replaced changed while the request ran, the answer is
-   discarded with a warning. Lines added above the item are fine: the target
-   is tracked with an extmark.
+   discarded with a warning (and the progress message reports it as
+   failed). Lines added above the item (or above its doc comment) are fine:
+   the target is tracked with an extmark.
 
 ==============================================================================
 3. KEYMAPS                                                  *slop-doc-keymaps*
@@ -180,7 +185,8 @@ Example: document TypeScript like Java >lua
 The style only steers the prompt. Whatever the style, the answer is checked
 against the language's comment syntax: line leaders (`--`, `//`, `#`, ...)
 and block delimiters (`/* */`, `--[[ ]]`). Unknown filetypes use
-'commentstring'.
+'commentstring'. Embedded code uses its own language's filetype here: a
+`<script lang="ts">` block of a Svelte file is documented as TypeScript.
 
 ==============================================================================
 7. LANGUAGES                                              *slop-doc-languages*
@@ -227,7 +233,8 @@ doc.generate({kind}, {opts})                             *slop-doc.generate()*
         `"type"`, or nil for the innermost item of any kind. {opts}:
         `buf` (default current), `pos` (0-based `{row, col}`, default
         cursor). Returns `true` when a request was sent. Otherwise it
-        notifies (nothing found, blocked file, ...) and returns `false`.
+        notifies (nothing found, blocked file, buffer not 'modifiable',
+        ...) and returns `false`.
 
 doc.cancel({buf})                                          *slop-doc.cancel()*
         Cancel the running request. Returns `false` if none was running.
@@ -236,8 +243,10 @@ doc.is_running({buf})                                  *slop-doc.is_running()*
 
 doc.find({buf}, {pos}, {kind})                               *slop-doc.find()*
         The target `generate()` would use, without sending anything:
-        `{ kind, type, lang, name?, signature, rows, range, indent, doc,
-        docstring }`. `rows` are the item's 0-based rows (inclusive),
+        `{ kind, type, lang, filetype, name?, signature, rows, range,
+        indent, doc, docstring }`. `filetype` is the filetype of the item's
+        code (for embedded code that of its language, not the buffer's).
+        `rows` are the item's 0-based rows (inclusive),
         `range` the 0-based rows `[s, e)` the comment replaces (`s == e`
         inserts) and `doc` the existing doc lines. Returns `nil, err` when
         nothing is found.

@@ -106,6 +106,9 @@ local js = {
   anon = JS_ANON,
   decl = JS_DECL,
   wrap = JS_WRAP,
+  -- `@Component({...})` above `export class X`: the decorators belong to the export statement, which then starts
+  -- rows above the class
+  wrap_any = set({ "export_statement" }),
 }
 
 local ts = vim.tbl_extend("force", js, {
@@ -116,6 +119,8 @@ local ts = vim.tbl_extend("force", js, {
   }),
   class = { "class_declaration", "abstract_class_declaration", "class" },
   type = { "interface_declaration", "type_alias_declaration", "enum_declaration" },
+  -- the decorators of a class member are its preceding siblings in the class body (in JS they are its children)
+  attrs = set({ "decorator" }),
 })
 
 local c = {
@@ -351,6 +356,19 @@ M.syntax = {
   haskell = { line = { "--" }, block = { "{-", "-}" } },
   sql = { line = { "--" }, block = { "/*", "*/" } },
 }
+
+--- 'commentstring' for code of filetype `ft` in `buf`: the buffer's own, or the filetype's default for code
+--- embedded in another language (a <script> in a svelte file).
+---@param buf integer
+---@param ft string
+---@return string
+function M.commentstring(buf, ft)
+  if ft == vim.bo[buf].filetype then
+    return vim.bo[buf].commentstring
+  end
+  local ok, cs = pcall(vim.filetype.get_option, ft, "commentstring")
+  return ok and type(cs) == "string" and cs or ""
+end
 
 --- Comment syntax of a buffer: the table above by filetype, else derived from 'commentstring'.
 ---@param ft string

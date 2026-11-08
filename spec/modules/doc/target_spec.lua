@@ -290,6 +290,55 @@ describe("doc target (other)", function()
     assert.equal("    ", t.indent)
   end)
 
+  it("code embedded in another language: a markdown code block, the function around an injected string", function()
+    local buf =
+      scratch({ "# Title", "", "```lua", "---Old.", "local function f(a)", "  return a", "end", "```" }, "markdown")
+    local t = assert(require("slop").doc.find(buf, { 5, 2 }))
+    assert.equal("f", t.name)
+    assert.equal("lua", t.lang)
+    assert.equal("lua", t.filetype)
+    assert.are.same({ 3, 4 }, t.range)
+    assert.are.same({ "---Old." }, t.doc)
+    assert.is_nil((require("slop").doc.find(buf, { 0, 0 })))
+    -- a cursor in an injected string (vim.cmd -> vim) finds the Lua function around it
+    buf = scratch({ "local function g()", "  vim.cmd('echo 1')", "end" }, "lua")
+    t = assert(require("slop").doc.find(buf, { 1, 13 }))
+    assert.equal("g", t.name)
+    assert.equal("lua", t.filetype)
+  end)
+
+  it("typescript: decorators of a class member are its siblings, a decorated export starts at its decorator", function()
+    -- Nvim bundles no typescript parser: use an installed one, else skip
+    vim.opt.rtp:append(vim.fn.expand("~/.local/share/nvim/site"))
+    if not pcall(vim.treesitter.language.add, "typescript") then
+      return pending("no typescript parser installed")
+    end
+    local buf = scratch({
+      "/** Class doc. */", --  0
+      "@Component({", --  1
+      '  selector: "x",', --  2
+      "})", --  3
+      "export class Comp {", --  4
+      "  /** Old. */", --  5
+      '  @HostListener("click")', --  6
+      "  @Other()", --  7
+      "  onClick(): void {}", --  8
+      "}", --  9
+    }, "typescript")
+    for _, pos in ipairs({ { 8, 2 }, { 6, 4 }, { 5, 4 } }) do
+      local t = assert(require("slop").doc.find(buf, pos))
+      assert.equal("onClick", t.name)
+      assert.are.same({ 6, 8 }, t.rows)
+      assert.are.same({ 5, 6 }, t.range)
+    end
+    for _, pos in ipairs({ { 4, 7 }, { 2, 2 }, { 0, 0 } }) do
+      local t = assert(require("slop").doc.find(buf, pos))
+      assert.equal("Comp", t.name)
+      assert.are.same({ 1, 9 }, t.rows)
+      assert.are.same({ 0, 1 }, t.range)
+    end
+  end)
+
   it("syntax_for() falls back to 'commentstring'", function()
     local langs = require("slop.modules.doc.langs")
     assert.are.same({ "--" }, langs.syntax_for("lua").line)

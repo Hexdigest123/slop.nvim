@@ -9,6 +9,7 @@ local api = vim.api
 ---@field kind slop.doc.Kind
 ---@field type string                       treesitter node type of the documented node
 ---@field lang string                       parser language
+---@field filetype string                   filetype of the item's code (differs from the buffer's for embedded code)
 ---@field name? string                      name of the item, when the grammar has one
 ---@field signature string                  first line of the item (trimmed)
 ---@field rows {[1]: integer, [2]: integer} 0-based rows of the item (attributes/decorators included), end inclusive
@@ -19,6 +20,8 @@ local api = vim.api
 
 -- filetypes whose parser has another name, when nothing registered it
 local FT_LANG = { sh = "bash", zsh = "bash", javascriptreact = "javascript", typescriptreact = "tsx" }
+-- filetype of code embedded in another language, when vim.treesitter.language.get_filetypes() has no better name
+local LANG_FT = { tsx = "typescriptreact" }
 
 local function line(buf, row)
   return api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
@@ -315,36 +318,17 @@ local function search(tree, row, col, lang, kind)
   return nil
 end
 
---- Find the documentable item at `pos` (0-based {row, col}; default cursor) of `kind` (nil: innermost of any).
----@param buf? integer
----@param pos? {[1]: integer, [2]: integer}
+--- The documentable item at (row, col) in one language tree: nil, nil when there is none.
+---@param buf integer
+---@param tree vim.treesitter.LanguageTree
+---@param row integer
+---@param col integer
 ---@param kind? slop.doc.Kind
+---@param ft string  filetype of the tree's code
 ---@return slop.doc.Target? target, string? err
-function M.find(buf, pos, kind)
-  buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
-  local ft = vim.bo[buf].filetype
-  local ok, tree = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
-  if (not ok or not tree) and FT_LANG[ft] then
-    ok, tree = pcall(vim.treesitter.get_parser, buf, FT_LANG[ft], { error = false })
-  end
-  if not ok or not tree then
-    return nil, ("no treesitter parser for filetype '%s'"):format(vim.bo[buf].filetype)
-  end
-  if not pcall(tree.parse, tree) then
-    return nil, "treesitter parse failed"
-  end
-  local langs = require("slop.modules.doc.langs")
+local function find_in(buf, tree, row, col, kind, ft)
   local lname = tree:lang()
-  local lang = langs.langs[lname]
-  local row, col
-  if pos then
-    row, col = pos[1], pos[2]
-  elseif api.nvim_win_get_buf(0) == buf then
-    local c = api.nvim_win_get_cursor(0)
-    row, col = c[1] - 1, c[2]
-  else
-    row, col = 0, 0
-  end
+  local lang = require("slop.modules.doc.langs").langs[lname]
   row, col = probe(buf, tree, row, col)
   -- probe at the cursor column and at the end of the line (`local M = {}` with the cursor on `local`); both
   -- results contain the cursor row, the innermost one wins
@@ -357,7 +341,56 @@ function M.find(buf, pos, kind)
     end
   end
   if best_node then
-    return M.build(buf, best_node[1], best_node[2], best, lname, lang)
+    return M.build(buf, best_node[1], best_node[2], best, lname, lang, ft)
+  end
+  return nil, nil
+end
+
+--- Find the documentable item at `pos` (0-based {row, col}; default cursor) of `kind` (nil: innermost of any).
+---@param buf? integer
+---@param pos? {[1]: integer, [2]: integer}
+---@param kind? slop.doc.Kind
+---@return slop.doc.Target? target, string? err
+function M.find(buf, pos, kind)
+  buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
+  local ft = vim.bo[buf].filetype
+  local ok, parser = pcall(vim.treesitter.get_parser, buf, nil, { error = false })
+  if (not ok or not parser) and FT_LANG[ft] then
+    ok, parser = pcall(vim.treesitter.get_parser, buf, FT_LANG[ft], { error = false })
+  end
+  if not ok or not parser then
+    return nil, ("no treesitter parser for filetype '%s'"):format(vim.bo[buf].filetype)
+  end
+  local row, col
+  if pos then
+    row, col = pos[1], pos[2]
+  elseif api.nvim_win_get_buf(0) == buf then
+    local c = api.nvim_win_get_cursor(0)
+    row, col = c[1] - 1, c[2]
+  else
+    row, col = 0, 0
+  end
+  local pcol = math.max(col, #indent_of(line(buf, row)))
+  -- the root tree plus the injections at the cursor (a full parse would parse every injection of the buffer)
+  if not pcall(parser.parse, parser, { row, pcol, row, pcol + 1 }) then
+    return nil, "treesitter parse failed"
+  end
+  -- code embedded in another language (a <script> of a svelte/vue/html file, a markdown code block) is searched in
+  -- its own tree first, then in the trees around it (a function around a string of injected code). Only languages
+  -- with a node table: the generic classification must not find "items" in injected doc comments or patterns
+  local langs = require("slop.modules.doc.langs").langs
+  local lok, tree = pcall(parser.language_for_range, parser, { row, pcol, row, pcol })
+  tree = lok and tree or parser
+  while tree do
+    local lname = tree:lang()
+    if tree == parser or langs[lname] then
+      local tft = tree == parser and ft or (LANG_FT[lname] or vim.treesitter.language.get_filetypes(lname)[1] or lname)
+      local t, err = find_in(buf, tree, row, col, kind, tft)
+      if t or err then
+        return t, err
+      end
+    end
+    tree = tree:parent()
   end
   local what = kind and ({ func = "function", class = "class", type = "type" })[kind] or "documentable item"
   return nil, ("no %s at the cursor"):format(what)
@@ -370,9 +403,12 @@ end
 ---@param kind slop.doc.Kind
 ---@param lname string
 ---@param lang? slop.doc.Lang
+---@param ft? string  filetype of the item's code (default: the buffer's)
 ---@return slop.doc.Target? target, string? err
-function M.build(buf, node, anchor, kind, lname, lang)
-  local syntax = require("slop.modules.doc.langs").syntax_for(vim.bo[buf].filetype, vim.bo[buf].commentstring)
+function M.build(buf, node, anchor, kind, lname, lang, ft)
+  local langs = require("slop.modules.doc.langs")
+  ft = ft or vim.bo[buf].filetype
+  local syntax = langs.syntax_for(ft, langs.commentstring(buf, ft))
   local first = anchor
   local attrs = lang and lang.attrs or {}
   local prev = first:prev_named_sibling()
@@ -397,6 +433,7 @@ function M.build(buf, node, anchor, kind, lname, lang)
     kind = kind,
     type = node:type(),
     lang = lname,
+    filetype = ft,
     name = name,
     signature = vim.trim(line(buf, anchor:range())),
     rows = { srow, erow },

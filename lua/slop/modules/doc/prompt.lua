@@ -155,11 +155,16 @@ end
 function M.message(target, opts)
   local secrets = require("slop.core.secrets")
   local buf = target.buf
-  local ft = vim.bo[buf].filetype
+  local bft = vim.bo[buf].filetype
+  local ft = target.filetype or bft
   local fence = ft ~= "" and ft or "text"
   local path = api.nvim_buf_get_name(buf)
   local root = require("slop.core.project").root(buf)
   local rel = path ~= "" and require("slop.core.project").relpath(path, root) or "[No Name]"
+  local filetype = bft ~= "" and bft or "none"
+  if ft ~= bft then
+    filetype = ("%s, the item is embedded %s code"):format(filetype, ft)
+  end
   local function get(s, e)
     return (secrets.redact_lines(buf, api.nvim_buf_get_lines(buf, s, e, false), s))
   end
@@ -169,7 +174,7 @@ function M.message(target, opts)
   local s, e = target.rows[1], target.rows[2]
   local lc = api.nvim_buf_line_count(buf)
   local parts = {
-    ("File: %s (filetype %s)"):format(rel, ft ~= "" and ft or "none"),
+    ("File: %s (filetype %s)"):format(rel, filetype),
     ("Document the %s%s (lines %d-%d)."):format(
       KIND_LABEL[target.kind] or target.kind,
       target.name and (" `" .. target.name .. "`") or "",
@@ -433,7 +438,10 @@ function M.parse(text, target, code, syntax)
     return M.reindent(vim.list_slice(lines, 1, n), target.indent, true)
   end
   if not syntax then
-    return nil, ("no comment syntax known for filetype '%s' (set 'commentstring')"):format(vim.bo[target.buf].filetype)
+    return nil,
+      ("no comment syntax known for filetype '%s' (set 'commentstring')"):format(
+        target.filetype or vim.bo[target.buf].filetype
+      )
   end
   local n = comment_prefix(lines, syntax)
   if n == 0 then
