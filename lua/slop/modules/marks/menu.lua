@@ -111,6 +111,12 @@ function M.is_open()
   return sess ~= nil and not sess.done and sess.handle:is_valid()
 end
 
+--- Is the menu open and the current buffer?
+---@return boolean
+function M.focused()
+  return M.is_open() and api.nvim_get_current_buf() == sess.buf
+end
+
 --- Close the menu (saving it).
 function M.close()
   local s = sess

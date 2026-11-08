@@ -10,7 +10,8 @@ local log = require("slop.core.log").scope("marks")
 
 local OPEN = { edit = "edit", split = "split", vsplit = "vsplit", tab = "tabedit" }
 
-local last = nil ---@type integer?  index of the last selected mark (for next/prev from unmarked buffers)
+--- list file -> index of its last selected mark (next/prev from unmarked buffers)
+local last = {} ---@type table<string, integer>
 
 local function cfg()
   return require("slop.config").get("marks")
@@ -155,10 +156,20 @@ function M.open(file, row, col, cmd)
   return true
 end
 
+--- A mark opened while the quick menu is focused (a select key, :Slop marks next) opens in the window the menu came
+--- from, not in the menu float: the menu is closed (and saved) first, so an index means what the menu showed.
+local function leave_menu()
+  local menu = package.loaded["slop.modules.marks.menu"]
+  if menu and menu.focused() then
+    menu.close()
+  end
+end
+
 ---@param i integer
 ---@param opts? {cmd?: slop.marks.OpenCmd}
 ---@return boolean ok
 function M.select(i, opts)
+  leave_menu()
   local list = store.current()
   i = tonumber(i)
   i = i and i == math.floor(i) and i or nil
@@ -172,7 +183,7 @@ function M.select(i, opts)
     return false
   end
   ---@cast i integer
-  last = i
+  last[list.file] = i
   return M.open(store.abs(list, item.path), item.row, item.col, opts and opts.cmd)
 end
 
@@ -187,7 +198,7 @@ function M.select_path(list, path, opts)
   local i = store.index(list, path)
   local item = i and list.items[i]
   if i then
-    last = i
+    last[list.file] = i
   end
   return M.open(store.abs(list, path), item and item.row or 1, item and item.col or 0, opts and opts.cmd)
 end
@@ -195,6 +206,7 @@ end
 ---@param step integer  1 or -1
 ---@return boolean ok
 local function cycle(step)
+  leave_menu()
   local list = store.current()
   local n = #list.items
   if n == 0 then
@@ -202,7 +214,7 @@ local function cycle(step)
     return false
   end
   local file = buf_file(api.nvim_get_current_buf())
-  local cur = file and store.index(list, store.rel(list, file)) or last
+  local cur = file and store.index(list, store.rel(list, file)) or last[list.file]
   local i
   if not cur then
     i = step > 0 and 1 or n

@@ -195,6 +195,29 @@ describe("marks module", function()
     assert.equal(root .. "/c.lua", api.nvim_buf_get_name(0))
   end)
 
+  it("next/prev from an unmarked buffer use the last selected mark of THIS project", function()
+    for _, f in ipairs({ "a.lua", "b.lua", "c.lua" }) do
+      slop.marks.add(f)
+    end
+    slop.marks.select(2)
+    local other = h.tmpdir("other")
+    vim.fn.mkdir(other .. "/.git", "p")
+    for _, f in ipairs({ "x.lua", "y.lua", "z.lua" }) do
+      h.write(other .. "/" .. f, "x")
+    end
+    vim.cmd.cd(other)
+    for _, f in ipairs({ "x.lua", "y.lua", "z.lua" }) do
+      slop.marks.add(f)
+    end
+    vim.cmd("enew")
+    assert.is_true(slop.marks.next())
+    assert.equal(other .. "/x.lua", api.nvim_buf_get_name(0), "starts at the first mark")
+    vim.cmd.cd(root)
+    vim.cmd("enew")
+    assert.is_true(slop.marks.next())
+    assert.equal(root .. "/c.lua", api.nvim_buf_get_name(0), "after the mark last selected here")
+  end)
+
   it("reads a missing file as empty without creating .nvim; tolerates a corrupt file", function()
     assert.are.same({}, slop.marks.list())
     assert.is_nil(vim.uv.fs_stat(root .. "/.nvim"))
@@ -424,6 +447,25 @@ describe("marks module", function()
       assert.are.same({ "c.lua", "a.lua" }, stored())
     end)
 
+    it("select / next pressed in the menu close it first and open the mark in the window it came from", function()
+      local main = api.nvim_get_current_win()
+      slop.marks.toggle_menu()
+      assert.not_equal(main, api.nvim_get_current_win())
+      -- an edit made in the menu is saved first, so the index means what the menu shows
+      api.nvim_buf_set_lines(0, 0, -1, false, { "c.lua", "a.lua", "b.lua" })
+      h.feed(" 1")
+      assert.is_nil(menu_win())
+      assert.equal(main, api.nvim_get_current_win())
+      assert.equal(root .. "/c.lua", api.nvim_buf_get_name(0))
+      assert.are.same({ "c.lua", "a.lua", "b.lua" }, stored())
+      assert.equal(1, #api.nvim_list_wins())
+      slop.marks.toggle_menu()
+      assert.is_true(slop.marks.next()) -- relative to the file of the window the menu came from
+      assert.is_nil(menu_win())
+      assert.equal(main, api.nvim_get_current_win())
+      assert.equal(root .. "/a.lua", api.nvim_buf_get_name(0))
+    end)
+
     it("is saved on VimLeavePre while open", function()
       slop.marks.toggle_menu()
       api.nvim_buf_set_lines(0, 0, -1, false, { "a.lua" })
@@ -465,6 +507,19 @@ describe("marks module", function()
       assert.truthy(vim.iter(notes):any(function(n)
         return n.msg:find("usage") ~= nil
       end))
+    end)
+
+    it("completes paths with spaces escaped, so the accepted completion is one path", function()
+      local complete = require("slop.core.commands").complete
+      h.write(root .. "/my file.lua", "x")
+      local items = complete("my", "Slop marks add my")
+      assert.are.same({ [[my\ file.lua]] }, items)
+      vim.cmd("Slop marks add " .. items[1])
+      assert.are.same({ "my file.lua" }, stored())
+      items = complete("my", "Slop marks remove my")
+      assert.are.same({ [[my\ file.lua]] }, items)
+      vim.cmd("Slop marks remove " .. items[1])
+      assert.are.same({}, stored())
     end)
 
     it("maps the harpoon keys once loaded; next/prev unmapped", function()

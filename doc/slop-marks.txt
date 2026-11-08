@@ -100,7 +100,10 @@ Keys in the menu (normal mode, buffer-local):
 
 The menu is saved first, so the opened mark is the one you see, in the
 edited order (the entry is looked up by path, so it stays right when another
-instance changed the list meanwhile). The buffer has 'filetype' `slopmarks`.
+instance changed the list meanwhile). A select key (`<leader>1` ...) or
+next / prev used in the menu works the same way: the menu is saved and
+closed, and the mark opens in the window the menu was opened from. The
+buffer has 'filetype' `slopmarks`.
 
 ==============================================================================
 4. COMMANDS                                               *slop-marks-commands*
@@ -110,7 +113,8 @@ instance changed the list meanwhile). The buffer has 'filetype' `slopmarks`.
 
 :Slop marks add [path]                                      *:Slop-marks-add*
         Mark the current file, or [path] (relative to the cwd or absolute).
-        Completes file names.
+        Completes file names. Escape blanks in [path] with a backslash
+        (`my\ file.lua`), as completion does.
 
 :Slop marks remove [path]                                *:Slop-marks-remove*
         Unmark the current file, or [path]. Completes marked paths.

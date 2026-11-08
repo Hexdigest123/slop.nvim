@@ -132,12 +132,22 @@ defaults_keys.menu_vsplit = "<C-v>"
 defaults_keys.menu_split = "<C-x>"
 defaults_keys.menu_tab = "<C-t>"
 
+--- Completion items that each stay one argument: the command's arguments are split at unescaped blanks, so an accepted
+--- "my file.lua" would become the two paths "my" and "file.lua".
+---@param items string[]
+---@return string[]
+local function escaped(items)
+  return vim.tbl_map(function(s)
+    return vim.fn.escape(s, "\\ ")
+  end, items)
+end
+
 local function complete_paths(lead)
   local ok, list = pcall(api.list)
   return require("slop.core.util").complete_prefix(
-    vim.tbl_map(function(e)
+    escaped(vim.tbl_map(function(e)
       return e.path
-    end, ok and list or {}),
+    end, ok and list or {})),
     lead
   )
 end
@@ -158,7 +168,7 @@ local commands = {
       api.add(args[1])
     end,
     complete = function(lead, args)
-      return #args <= 1 and vim.fn.getcompletion(lead, "file") or {}
+      return #args <= 1 and escaped(vim.fn.getcompletion(lead, "file")) or {}
     end,
   },
   remove = {
