@@ -290,6 +290,7 @@ end
 ---@param t slop.Term
 ---@param code integer
 local function on_exit(t, code)
+  local buf, job = t.buf, t.job
   t.exit_code = code
   emit(t, "Exit", { code = code })
   if t.spec.on_exit then
@@ -302,8 +303,16 @@ local function on_exit(t, code)
   if coe == nil then
     coe = true
   end
+  if t.job ~= job then
+    -- started again by on_exit / an Exit handler (kill() + show()): the new run stays, only the old buffer goes
+    if coe == true or (coe == "success" and code == 0) then
+      if buf and buf ~= t.buf and api.nvim_buf_is_valid(buf) then
+        pcall(api.nvim_buf_delete, buf, { force = true })
+      end
+    end
+    return
+  end
   if coe == true or (coe == "success" and code == 0) then
-    local buf = t.buf
     local wins = t:windows()
     local was_current = vim.tbl_contains(wins, api.nvim_get_current_win())
     for _, win in ipairs(wins) do
@@ -442,6 +451,19 @@ local function shell_argv()
   return argv
 end
 
+--- A job of `t` started (spawn(), or a restart by show()/send() after the buffer was wiped or killed): fire Open and
+--- run `spec.on_open`, which sets up the new buffer (e.g. the term module's buffer-local keymaps).
+---@param t slop.Term
+local function opened(t)
+  emit(t, "Open")
+  if t.spec.on_open then
+    local ok, e = pcall(t.spec.on_open, t)
+    if not ok then
+      log().error("on_open: %s", e)
+    end
+  end
+end
+
 --- Spawn a terminal job in a hidden buffer (not shown).
 ---@param spec? slop.term.Spec
 ---@return slop.Term? term, string? err   nil + error message when the command cannot be started
@@ -486,13 +508,7 @@ function M.spawn(spec)
     return nil, err
   end
   terms[t.id] = t
-  emit(t, "Open")
-  if spec.on_open then
-    local ok2, e = pcall(spec.on_open, t)
-    if not ok2 then
-      log().error("on_open: %s", e)
-    end
-  end
+  opened(t)
   return t
 end
 
@@ -595,6 +611,7 @@ function M.show(term, opts)
       return nil
     end
     terms[t.id] = t
+    opened(t)
   end
   opts = opts or {}
   local layout = opts.layout or t.layout
@@ -776,6 +793,7 @@ function M.send(term, data, opts)
       return false
     end
     terms[t.id] = t
+    opened(t)
   end
   if not t:is_running() then
     log().warn("terminal %s has exited", t.name)

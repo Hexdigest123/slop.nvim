@@ -253,6 +253,71 @@ describe("core.term", function()
     assert.are.same({}, exits)
   end)
 
+  it("a restart (kill() + show() / send()) runs on_open and fires Open for the new buffer, like spawn()", function()
+    local opened, events_seen = {}, 0
+    events.on("term", "Open", function(d)
+      if d.name == "reopen" then
+        events_seen = events_seen + 1
+      end
+    end)
+    local t = assert(term.spawn({
+      cmd = { "sh" },
+      name = "reopen",
+      on_open = function(tt)
+        opened[#opened + 1] = tt.buf -- e.g. the term module's buffer-local keymaps
+      end,
+    }))
+    assert.are.same({ t.buf }, opened)
+    t:kill()
+    t:show({ enter = false })
+    assert.equal(2, #opened, "on_open for the restarted run")
+    assert.equal(t.buf, opened[2])
+    t:kill()
+    assert.is_true(t:send("true"))
+    assert.equal(3, #opened, "send() restarting it too")
+    assert.equal(t.buf, opened[3])
+    assert.truthy(wait(function()
+      return events_seen == 3
+    end))
+    -- let the sent text reach the shell first: Neovim 0.12 hangs for good when a terminal job with an unflushed
+    -- write is stopped and its buffer deleted in the same tick (chan_send + jobstop + nvim_buf_delete)
+    vim.wait(100)
+    t:kill()
+  end)
+
+  it("a terminal restarted by its on_exit (kill() + show()) keeps running; close_on_exit does not undo it", function()
+    local marker = vim.fn.shellescape(h.tmpdir("restart") .. "/ran")
+    local runs = 0
+    local t = assert(term.spawn({
+      -- the first run exits at once, the restarted one keeps running
+      cmd = { "sh", "-c", ("test -e %s && exec sleep 30; touch %s; exit 1"):format(marker, marker) },
+      on_exit = function(tt)
+        runs = runs + 1
+        if runs == 1 then
+          tt:kill() -- restart once
+          tt:show({ layout = "split", enter = false })
+        end
+      end,
+    }))
+    local first = t.buf
+    assert.truthy(wait(function()
+      return runs >= 1
+    end))
+    vim.wait(100)
+    assert.equal(1, runs)
+    assert.is_false(api.nvim_buf_is_valid(first), "the exited run's buffer is wiped (close_on_exit)")
+    assert.truthy(t.buf and api.nvim_buf_is_valid(t.buf), "the restarted run keeps its buffer")
+    assert.equal(t, term.get(t.id), "and stays registered")
+    assert.is_true(t:is_running())
+    assert.is_true(t:is_visible())
+    -- when the restarted run exits, it is closed as usual
+    vim.fn.jobstop(t.job)
+    assert.truthy(wait(function()
+      return runs == 2 and term.get(t.id) == nil
+    end))
+    assert.is_false(t:is_visible())
+  end)
+
   it("a restarted terminal whose id was taken meanwhile gets a new id", function()
     local a = assert(term.spawn({ cmd = { "sh", "-c", "exit 0" }, name = "task" }))
     assert.truthy(wait(function()
