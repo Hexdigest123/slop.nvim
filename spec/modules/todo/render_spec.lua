@@ -82,6 +82,34 @@ describe("todo render", function()
     }, items(buf, 0, 7))
   end)
 
+  it("a doc-comment language injected into a comment (jsdoc, luadoc, doxygen) still counts as the comment", function()
+    -- stand-in for jsdoc/luadoc/doxygen (not bundled): markdown injected into `---` comments; its trees have no
+    -- comment node at the keyword, the host tree's comment does
+    vim.treesitter.query.set(
+      "lua",
+      "injections",
+      [[
+(comment content: (_) @injection.content
+  (#lua-match? @injection.content "^%-")
+  (#set! injection.language "markdown"))
+]]
+    )
+    local ok, res = pcall(function()
+      local buf = open("doc.lua", '--- TODO: in a doc comment\nlocal s = "--- TODO: not a comment"\n')
+      local parser = vim.treesitter.get_parser(buf)
+      parser:parse(true)
+      assert.equal("markdown_inline", parser:language_for_range({ 0, 4, 0, 5 }):lang(), "keyword in the injected tree")
+      api.nvim_win_set_cursor(0, { 2, 0 })
+      return { items(buf, 0, 1), todo.jump_next({ wrap = false }), todo.jump_prev(), api.nvim_win_get_cursor(0) }
+    end)
+    vim.treesitter.query.set("lua", "injections", nil)
+    assert.is_true(ok, res)
+    assert.are.same({ [0] = { "3-10:SlopTodoTodo!", "10-26:SlopTodoTodoText" } }, res[1])
+    assert.is_false(res[2], "the string is no comment")
+    assert.is_true(res[3])
+    assert.are.same({ 1, 4 }, res[4])
+  end)
+
   it("keyword styles bg / fg / false and after = false", function()
     local buf = open("a.lua", "-- TODO: x\n", { highlight = { keyword = "bg" } })
     assert.are.same({ [0] = { "3-8:SlopTodoTodo!", "8-10:SlopTodoTodoText" } }, items(buf, 0, 0))
@@ -181,6 +209,38 @@ describe("todo render", function()
     assert.truthy(cached < 100, "only visible rows computed: " .. cached)
   end)
 
+  it("a closed fold costs one row: the rows inside it are neither matched nor signed", function()
+    local lines = {}
+    for i = 1, 3000 do
+      lines[i] = ("-- TODO: item %d"):format(i)
+    end
+    local buf = open("fold.lua", table.concat(lines, "\n") .. "\n")
+    vim.wo.foldmethod = "manual"
+    vim.cmd("2,2990fold") -- closed: rows 1-2989 are one screen row
+    vim.cmd("redraw!")
+    vim.wait(20)
+    local K = require("slop.modules.todo.keywords")
+    local orig, n = K.match, 0
+    K.match = function(...)
+      n = n + 1
+      return orig(...)
+    end
+    local ok, err = pcall(function()
+      api.nvim_buf_set_text(buf, 0, 0, 0, 0, { " " }) -- a new changedtick: every drawn row is computed again
+      vim.cmd("redraw")
+      vim.wait(20) -- the sign update after the redraw
+    end)
+    K.match = orig
+    assert.is_true(ok, err)
+    assert.truthy(n < 200, "rows matched for one redraw: " .. n)
+    local rows = {}
+    for _, s in ipairs(signs(buf)) do
+      rows[s[1]] = true
+    end
+    assert.truthy(rows[0] and rows[1] and rows[2990], "the drawn rows keep their signs")
+    assert.is_nil(rows[1500], "no sign placed inside the fold")
+  end)
+
   it("places signs for visible rows after the redraw; toggle clears and restores them", function()
     local buf = open("a.lua", LUA)
     assert.are.same({ { 0, "SlopTodoTodo" }, { 1, "SlopTodoFix" }, { 6, "SlopTodoHack" } }, signs(buf))
@@ -250,6 +310,16 @@ describe("todo render", function()
     assert.are.same({}, signs(buf))
   end)
 
+  it("a module disabled and enabled again starts drawing again, even after `:Slop todo disable`", function()
+    local buf = open("a.lua", LUA)
+    vim.cmd("Slop todo disable")
+    require("slop.core.registry").disable("todo")
+    require("slop.core.registry").enable("todo")
+    assert.is_true(require("slop").todo.is_enabled())
+    vim.cmd("redraw!")
+    assert.equal(3, #signs(buf))
+  end)
+
   it("jump_next / jump_prev skip non-comments, filter keywords, wrap, count", function()
     open("a.lua", LUA)
     api.nvim_win_set_cursor(0, { 1, 0 })
@@ -277,6 +347,29 @@ describe("todo render", function()
     assert.are.same({ 2, 3 }, pos())
     vim.cmd("Slop todo prev")
     assert.are.same({ 1, 15 }, pos())
+  end)
+
+  it("a long jump over many non-comment matches parses a few times, and still sees injected comments", function()
+    local L = { "local M = {}" }
+    for i = 1, 3000 do
+      L[#L + 1] = ('local s%d = "TODO: not a comment"'):format(i)
+    end
+    vim.list_extend(L, { "vim.cmd([[", '" TODO: in an injected vim comment', "]])", "return M" })
+    open("far.lua", table.concat(L, "\n") .. "\n")
+    api.nvim_win_set_cursor(0, { 1, 0 })
+    local parser = vim.treesitter.get_parser(0)
+    local LT = getmetatable(parser).__index
+    local orig, n = LT.parse, 0
+    LT.parse = function(self, ...)
+      n = n + (self == parser and 1 or 0)
+      return orig(self, ...)
+    end
+    local ok, res = pcall(todo.jump_next, { wrap = false })
+    LT.parse = orig
+    assert.is_true(ok, res)
+    assert.is_true(res)
+    assert.are.same({ 3003, 2 }, api.nvim_win_get_cursor(0), "the TODO in the vim.cmd() string's vim comment")
+    assert.truthy(n < 50, "parses for one jump: " .. n)
   end)
 
   it("next/prev are unmapped by default; mapped keys take a count", function()
@@ -364,5 +457,22 @@ describe("todo render", function()
     assert.are.same({}, require("slop.config").unknown("todo"))
     require("slop").setup({ todo = { keywords = { MINE = {} }, colors = { mine = "#000000" }, typo = 1 } })
     assert.are.same({ "todo.typo" }, require("slop.config").unknown("todo"))
+  end)
+
+  it('a color that is not "#rrggbb" is a config error, not a failing setup()', function()
+    require("slop").setup({ todo = { keywords = { TODO = { color = "#abc" } }, colors = { mine = "#1234" } } })
+    local errs = table.concat(require("slop.config").errors("todo"), "\n")
+    assert.matches("todo.keywords.TODO.color", errs)
+    assert.matches("todo.colors.mine", errs)
+    local _, err = require("slop.core.registry").load("todo")
+    assert.matches("^invalid config", tostring(err))
+    -- loaded with a valid config, a later invalid one is reported and not applied
+    require("slop").setup({ todo = {} })
+    todo = assert(require("slop").load("todo"))
+    vim.v.errmsg = ""
+    local ok, e = pcall(require("slop").setup, { todo = { keywords = { TODO = { color = "#abc" } } } })
+    assert.is_true(ok, e)
+    assert.equal("", vim.v.errmsg)
+    assert.equal("DiagnosticInfo", api.nvim_get_hl(0, { name = "SlopTodoTodo" }).link)
   end)
 end)

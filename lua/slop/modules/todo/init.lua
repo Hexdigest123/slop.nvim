@@ -103,7 +103,14 @@ end
 local function open(r, action)
   local cmd = ({ vsplit = "vsplit", split = "split", tab = "tabedit" })[action or ""] or "edit"
   if vim.fs.normalize(vim.api.nvim_buf_get_name(0)) ~= r.path or cmd ~= "edit" then
-    vim.cmd(cmd .. " " .. vim.fn.fnameescape(r.path))
+    -- E37 ('nohidden' + modified buffer), E325 (swap file, "Abort"): an error message, not an exception from the
+    -- picker's scheduled callback
+    local ok, err = pcall(vim.cmd, cmd .. " " .. vim.fn.fnameescape(r.path))
+    if not ok then
+      local msg = tostring(err)
+      log().notify(msg:match("E%d+: .*$") or msg, vim.log.levels.ERROR)
+      return
+    end
   end
   vim.cmd("normal! m'")
   pcall(vim.api.nvim_win_set_cursor, 0, { r.lnum, r.col - 1 })
@@ -320,7 +327,7 @@ return {
       return v == "auto" or v == "rg" or v == "git" or v == "lua"
     end, false, "'auto'|'rg'|'git'|'lua'")
     check("search.args", sc.args, "table")
-    local errs = keywords.validate(cfg.keywords)
+    local errs = vim.list_extend(keywords.validate(cfg.keywords), keywords.validate_colors(cfg.colors))
     if #errs > 0 then
       error("todo." .. table.concat(errs, "\n  todo."), 0)
     end

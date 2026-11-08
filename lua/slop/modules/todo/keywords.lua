@@ -69,6 +69,32 @@ end
 local forced = {} ---@type table<string, boolean>  built-in groups whose configured color replaced the link
 local custom = {} ---@type table<string, vim.api.keyset.highlight>  user groups: definition last applied
 
+local HEX_ERR = 'expected "#rrggbb", a highlight group or a colors name'
+
+--- A string meant as a hex color that nvim_set_hl() rejects ("#abc", "#12345"): only "#rrggbb" is accepted.
+---@param c any
+---@return boolean
+local function bad_hex(c)
+  return type(c) == "string" and c:sub(1, 1) == "#" and not c:match("^#%x%x%x%x%x%x$")
+end
+
+--- Validation errors of a user `colors` table: hex colors must be "#rrggbb" (paths relative to the module).
+---@param colors any
+---@return string[]
+function M.validate_colors(colors)
+  local errs = {}
+  for name, spec in pairs(type(colors) == "table" and colors or {}) do
+    for _, c in ipairs(type(spec) == "table" and spec or { spec }) do
+      if bad_hex(c) then
+        errs[#errs + 1] = "colors." .. tostring(name) .. ": " .. HEX_ERR
+        break
+      end
+    end
+  end
+  table.sort(errs)
+  return errs
+end
+
 --- Validation errors of a user `keywords` table (paths relative to the module).
 ---@param keywords any
 ---@return string[]
@@ -93,6 +119,8 @@ function M.validate(keywords)
         end
         if kw.color ~= nil and type(kw.color) ~= "string" then
           errs[#errs + 1] = p .. ".color: expected string, got " .. type(kw.color)
+        elseif bad_hex(kw.color) then
+          errs[#errs + 1] = p .. ".color: " .. HEX_ERR
         end
         if kw.signs ~= nil and type(kw.signs) ~= "boolean" then
           errs[#errs + 1] = p .. ".signs: expected boolean, got " .. type(kw.signs)
@@ -156,7 +184,7 @@ function M.color_def(color, colors)
   local list = type(spec) == "table" and spec or { spec }
   for _, c in ipairs(list) do
     if type(c) == "string" then
-      if c:match("^#%x+$") then
+      if c:match("^#%x%x%x%x%x%x$") then
         return { fg = c }
       elseif vim.fn.hlexists(c) == 1 then
         return { link = c }

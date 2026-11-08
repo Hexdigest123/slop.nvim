@@ -147,6 +147,39 @@ describe("todo search", function()
     seen.opts.on_select(nil)
   end)
 
+  it("a pick that cannot open the file (E37, 'nohidden') reports the error instead of raising it", function()
+    local seen
+    package.loaded["slop.core.ui.picker"] = {
+      pick = function(items, opts)
+        items(function(list)
+          seen = { list = list, opts = opts }
+        end)
+      end,
+    }
+    local notes = {}
+    vim.notify = function(msg, level)
+      notes[#notes + 1] = { msg = tostring(msg), level = level }
+    end
+    require("slop").setup({ todo = { search = { backend = "lua" } } })
+    todo.list({ root = root })
+    assert.is_true(vim.wait(5000, function()
+      return seen ~= nil
+    end))
+    vim.cmd.enew()
+    local buf = api.nvim_get_current_buf()
+    api.nvim_buf_set_lines(buf, 0, -1, false, { "unsaved" })
+    vim.o.hidden = false
+    local ok, err = pcall(seen.opts.on_select, seen.list[4], "edit")
+    vim.o.hidden = true
+    vim.bo[buf].modified = false
+    assert.is_true(ok, err)
+    assert.equal(buf, api.nvim_get_current_buf(), "stayed in the modified buffer")
+    assert.are.same({ 1, 0 }, api.nvim_win_get_cursor(0))
+    local last = notes[#notes]
+    assert.matches("^slop: todo: E37: ", last.msg)
+    assert.equal(vim.log.levels.ERROR, last.level)
+  end)
+
   it("qf and the picker show secrets of cloaked / blocked files redacted", function()
     require("slop").setup({
       todo = { search = { backend = "lua" } },

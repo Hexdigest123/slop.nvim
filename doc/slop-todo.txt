@@ -171,7 +171,9 @@ that exists wins, then the hex):
 Comment check (`highlight.comments_only = true`):
 - With a treesitter parser (no need for treesitter highlighting to be on),
   the keyword must be inside a node whose type contains "comment" (`comment`,
-  `line_comment`, `comment_content`, ...), injected languages included. The
+  `line_comment`, `comment_content`, ...), injected languages included. A
+  language injected into a comment (`comment`, jsdoc, luadoc, doxygen, ...)
+  counts as that comment. The
   comment text highlight stops where the comment node ends, e.g. after the
   `*/` of `/* TODO: x */ code` (`code` is not highlighted). Only the rows the
   treesitter highlighter parses anyway are parsed, so todo highlighting
@@ -189,8 +191,8 @@ text starts past that column:
   -- unrelated comment             <- not highlighted
 <
 Signs are persistent extmarks, updated for the rows each window shows right
-after it is drawn. A change in rows that are not visible updates their signs
-when they scroll into view.
+after it is drawn. A change in rows that are not visible (scrolled away or
+inside a closed fold) updates their signs when they come into view.
 
 ==============================================================================
 7. PROJECT SEARCH                                           *slop-todo-search*

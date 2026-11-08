@@ -1,8 +1,8 @@
 --- todo: highlights and signs via a decoration provider (visible rows only, the cloak approach).
 ---
---- Highlights are ephemeral marks created in on_win for the rows being drawn, from per-row results cached per
+--- Highlights are ephemeral marks created in on_line for the rows being drawn, from per-row results cached per
 --- changedtick. Signs are persistent marks (ephemeral ones do not size 'signcolumn'), reconciled for the visible
---- rows in a vim.schedule after on_win, so nothing is written to the buffer during a redraw.
+--- rows (a closed fold is one) in a vim.schedule after on_win, so nothing is written to the buffer during a redraw.
 ---
 --- A todo only counts inside a comment: the treesitter node (or injected tree) at the keyword when the buffer has
 --- a parser, else a 'commentstring' heuristic.
@@ -11,6 +11,7 @@ local M = {}
 local api = vim.api
 
 local PRIORITY = 150 -- above treesitter (100), below cloak masks (200)
+local FIND_CHUNK = 500 -- rows a jump parses at once
 
 ---@class slop.todo.Hit: slop.todo.Match
 ---@field stop integer   0-based exclusive end of the comment on this row (EOL when the comment goes on)
@@ -28,6 +29,7 @@ local PRIORITY = 150 -- above treesitter (100), below cloak masks (200)
 ---@field cont table<integer, {hit: slop.todo.Hit, col: integer, stop: integer}|false>  multiline continuations
 ---@field items table<integer, slop.todo.DrawItem[]>
 ---@field signed table<integer, integer>              row -> changedtick its sign was reconciled at
+---@field wins table<integer, string>                 window -> "top:bot" its signs were queued for (this tick)
 
 local S = {
   cfg = nil, ---@type table?
@@ -86,18 +88,19 @@ local function ts_comment(parser, row, col)
   if not ok or not tree then
     return false
   end
-  -- the `comment` parser (TODO tags) is injected into host comments: ask the host tree
-  if tree:lang() == "comment" and tree:parent() then
-    tree = tree:parent() --[[@as vim.treesitter.LanguageTree]]
-  end
-  local nok, node = pcall(tree.named_node_for_range, tree, range, { ignore_injections = true })
-  node = nok and node or nil
-  while node do
-    if node:type():find("comment", 1, true) then
-      local _, _, erow, ecol = node:range()
-      return true, erow == row and ecol or nil
+  -- `comment` (TODO tags), jsdoc, luadoc, doxygen, ... are injected into host comments and have no comment node
+  -- of their own: when the innermost tree has none at the keyword, ask the tree it is injected into
+  while tree do
+    local nok, node = pcall(tree.named_node_for_range, tree, range, { ignore_injections = true })
+    node = nok and node or nil
+    while node do
+      if node:type():find("comment", 1, true) then
+        local _, _, erow, ecol = node:range()
+        return true, erow == row and ecol or nil
+      end
+      node = node:parent()
     end
-    node = node:parent()
+    tree = tree:parent()
   end
   return false
 end
@@ -206,7 +209,15 @@ function M.buf_state(buf)
   if st and st.tick == tick then
     return st
   end
-  st = { tick = tick, ok = attachable(buf), base = {}, cont = {}, items = {}, signed = st and st.signed or {} }
+  st = {
+    tick = tick,
+    ok = attachable(buf),
+    base = {},
+    cont = {},
+    items = {},
+    signed = st and st.signed or {},
+    wins = {},
+  }
   S.bufs[buf] = st
   return st
 end
@@ -340,19 +351,19 @@ local function row_items(st, ctx, row, get)
   return items
 end
 
---- Line getter over rows first..last fetched once, on demand.
+--- Line getter, each row fetched once on demand (a window's row range spans its closed folds: 100k rows that are
+--- never drawn must not be fetched).
 ---@param buf integer
----@param first integer
----@param last integer
 ---@return fun(row: integer): string
-local function lines_getter(buf, first, last)
-  local lines
+local function lines_getter(buf)
+  local lines = {} ---@type table<integer, string>
   return function(row)
-    if row < first or row > last then
-      return api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
+    local l = lines[row]
+    if not l then
+      l = api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
+      lines[row] = l
     end
-    lines = lines or api.nvim_buf_get_lines(buf, first, last + 1, false)
-    return lines[row - first + 1] or ""
+    return l
   end
 end
 
@@ -382,21 +393,39 @@ local function sign_group(hits)
   return nil
 end
 
----@param buf integer
----@param st slop.todo.BufState
+--- Rows of top..bot that `win` draws: a closed fold is one row (its first).
+---@param win integer
 ---@param top integer
 ---@param bot integer
-local function reconcile_signs(buf, st, top, bot)
+---@return integer[]
+local function drawn_rows(win, top, bot)
+  local rows, r = {}, top
+  while r <= bot do
+    rows[#rows + 1] = r
+    -- the next screen row starts the next drawn buffer row (after a fold, a wrapped line, filler lines)
+    local ok, h = pcall(api.nvim_win_text_height, win, { start_row = r, end_row = bot, max_height = 2 })
+    if not ok or h.all < 2 then
+      break
+    end
+    r = math.max(h.end_row, r + 1)
+  end
+  return rows
+end
+
+---@param buf integer
+---@param st slop.todo.BufState
+---@param rows integer[]  sorted
+local function reconcile_signs(buf, st, rows)
+  local top, bot = rows[1], rows[#rows]
   local nss = ns_sign()
   local have = {} ---@type table<integer, {id: integer, hl: string?, invalid: boolean?}[]>
   for _, m in ipairs(api.nvim_buf_get_extmarks(buf, nss, { top, 0 }, { bot, -1 }, { details = true })) do
     have[m[2]] = have[m[2]] or {}
     table.insert(have[m[2]], { id = m[1], hl = m[4].sign_hl_group, invalid = m[4].invalid })
   end
-  local first = first_row(top)
-  local ctx = { buf = buf, first = first, last = bot, top = top, bot = bot }
-  local get = lines_getter(buf, first, bot)
-  for row = top, bot do
+  local ctx = { buf = buf, first = first_row(top), last = bot, top = top, bot = bot }
+  local get = lines_getter(buf)
+  for _, row in ipairs(rows) do
     if st.signed[row] ~= st.tick then
       st.signed[row] = st.tick
       local g = sign_group(base(st, ctx, row, get(row)))
@@ -437,9 +466,9 @@ local function flush_signs(buf)
     return
   end
   local last = api.nvim_buf_line_count(buf) - 1
-  for _, r in pairs(ranges) do
-    if r[1] <= last then
-      reconcile_signs(buf, st, r[1], math.min(r[2], last))
+  for win, r in pairs(ranges) do
+    if r[1] <= last and api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf then
+      reconcile_signs(buf, st, drawn_rows(win, r[1], math.min(r[2], last)))
     end
   end
 end
@@ -451,16 +480,13 @@ end
 ---@param top integer
 ---@param bot integer
 local function schedule_signs(win, buf, st, top, bot)
-  local need = false
-  for row = top, bot do
-    if st.signed[row] ~= st.tick then
-      need = true
-      break
-    end
-  end
-  if not need then
+  -- once per window range and changedtick (st is per changedtick): the range spans closed folds, so it is not
+  -- scanned row by row on every redraw
+  local key = top .. ":" .. bot
+  if st.wins[win] == key then
     return
   end
+  st.wins[win] = key
   local p = S.pending[buf]
   if p then
     p[win] = { top, bot }
@@ -474,7 +500,11 @@ end
 
 -- Decoration provider -------------------------------------------------------------------------
 
+---@type table<integer, {st: slop.todo.BufState, ctx: slop.todo.Ctx, get: fun(row: integer): string}>
+local drawing = {} -- window -> what on_line draws from, for the current redraw
+
 local function on_win(_, win, buf, top, bot)
+  drawing[win] = nil
   if not S.enabled or not S.kw then
     return false
   end
@@ -482,35 +512,40 @@ local function on_win(_, win, buf, top, bot)
   if not st.ok then
     return false
   end
-  local first = first_row(top)
-  local ctx = { buf = buf, first = first, last = bot, top = top, bot = bot }
-  local get = lines_getter(buf, first, bot)
-  local nsh = ns()
-  for row = top, bot do
-    for _, it in ipairs(row_items(st, ctx, row, get)) do
-      pcall(api.nvim_buf_set_extmark, buf, nsh, row, it.col, {
-        end_col = it.end_col,
-        hl_group = it.hl,
-        ephemeral = true,
-        priority = PRIORITY,
-      })
-      if it.badge then
-        pcall(api.nvim_buf_set_extmark, buf, nsh, row, it.col, {
-          end_col = it.end_col,
-          hl_group = "SlopTodoKeyword",
-          ephemeral = true,
-          priority = PRIORITY + 1,
-        })
-      end
-    end
-  end
+  drawing[win] =
+    { st = st, ctx = { buf = buf, first = first_row(top), last = bot, top = top, bot = bot }, get = lines_getter(buf) }
   if S.cfg.signs then
     schedule_signs(win, buf, st, top, bot)
   end
-  return false
+  -- on_line: only the rows Neovim draws (top..bot spans closed folds, e.g. 100k rows after `zM`)
+  return true
 end
 
---- Draw items of rows srow..erow (exactly what on_win draws; used by the specs).
+local function on_line(_, win, buf, row)
+  local d = drawing[win]
+  if not d or d.ctx.buf ~= buf then
+    return
+  end
+  local nsh = ns()
+  for _, it in ipairs(row_items(d.st, d.ctx, row, d.get)) do
+    pcall(api.nvim_buf_set_extmark, buf, nsh, row, it.col, {
+      end_col = it.end_col,
+      hl_group = it.hl,
+      ephemeral = true,
+      priority = PRIORITY,
+    })
+    if it.badge then
+      pcall(api.nvim_buf_set_extmark, buf, nsh, row, it.col, {
+        end_col = it.end_col,
+        hl_group = "SlopTodoKeyword",
+        ephemeral = true,
+        priority = PRIORITY + 1,
+      })
+    end
+  end
+end
+
+--- Draw items of rows srow..erow (exactly what on_line draws; used by the specs).
 ---@param buf integer
 ---@param srow integer
 ---@param erow integer
@@ -521,9 +556,8 @@ function M.items(buf, srow, erow)
   if not st.ok or not S.kw then
     return out
   end
-  local first = first_row(srow)
-  local ctx = { buf = buf, first = first, last = erow, top = srow, bot = erow }
-  local get = lines_getter(buf, first, erow)
+  local ctx = { buf = buf, first = first_row(srow), last = erow, top = srow, bot = erow }
+  local get = lines_getter(buf)
   for row = srow, erow do
     local items = row_items(st, ctx, row, get)
     if #items > 0 then
@@ -546,6 +580,9 @@ function M.find(buf, pos, dir, words, wrap)
   local st = M.buf_state(buf)
   local n = api.nvim_buf_line_count(buf)
   local row, col = pos[1], pos[2]
+  -- the comment check parses the rows of its ctx (injections) once: a ctx per FIND_CHUNK rows in the scan
+  -- direction, not one per row (100k matches outside comments took seconds)
+  local ctx ---@type slop.todo.Ctx?
   -- the cursor row (past the cursor), the other rows, then (wrapping) the cursor row again
   for step = 0, wrap and n or n - 1 do
     local r = row + dir * step
@@ -555,7 +592,15 @@ function M.find(buf, pos, dir, words, wrap)
       return nil
     end
     local line = api.nvim_buf_get_lines(buf, r, r + 1, false)[1] or ""
-    local hits = line:find("[:(]") and base(st, { buf = buf, first = r, last = r }, r, line) or {}
+    local hits = {}
+    if line:find("[:(]") then
+      if not ctx or r < ctx.first or r > ctx.last then
+        local s = dir > 0 and r or math.max(r - FIND_CHUNK + 1, 0)
+        local e = math.min(s + FIND_CHUNK - 1, n - 1)
+        ctx = { buf = buf, first = s, last = e }
+      end
+      hits = base(st, ctx, r, line) or {}
+    end
     local from, to = 1, #hits
     if dir < 0 then
       from, to = #hits, 1
@@ -608,7 +653,13 @@ end
 ---@param kw slop.todo.Keywords
 function M.start(cfg, kw)
   S.cfg, S.kw, S.active = cfg, kw, true
-  api.nvim_set_decoration_provider(ns(), { on_win = on_win })
+  api.nvim_set_decoration_provider(ns(), {
+    on_win = on_win,
+    on_line = on_line,
+    on_end = function()
+      drawing = {}
+    end,
+  })
   local group = require("slop.core.util").augroup("todo")
   api.nvim_create_autocmd({ "FileType", "BufFilePost" }, {
     group = group,
@@ -635,10 +686,10 @@ function M.reconfigure(cfg, kw)
 end
 
 function M.stop()
-  S.active = false
+  S.active, S.enabled = false, true -- a later setup() starts drawing again, whatever was toggled before
   pcall(api.nvim_set_decoration_provider, ns(), {})
   M.invalidate()
-  S.pending = {}
+  S.pending, drawing = {}, {}
   for _, win in ipairs(api.nvim_list_wins()) do
     pcall(api.nvim__redraw, { win = win, valid = false, flush = false })
   end
